@@ -1,0 +1,38 @@
+[package]
+name = "wtl-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+description = "win-test-lab host side in Rust: lab runner, run-config parser, ISO writer, QMP client"
+license = "MIT"
+publish = false
+
+# A few small, well-known crates for the generic parts (JSON, command line, errors,
+# base64, local time, Ctrl-C, process calls); the win-test-lab logic itself (ISO writer,
+# QMP client, serial protocol, lab runner) is in-tree.
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3", features = ["termination"] }
+percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
+# preserve_order: objects keep insertion order, like Python dicts (outputs' summary)
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[[bin]]
+name = "wtl-rs"
+path = "src/main.rs"
+
+# tests/fake_lab.rs has its own main(): it is both the test driver and the fake
+# qemu-system-x86_64 / qemu-img that `wtl-rs lab` is pointed at.
+[[test]]
+name = "fake_lab"
+harness = false
