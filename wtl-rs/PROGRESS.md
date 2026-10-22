@@ -86,6 +86,20 @@ run), alongside the existing 2-machine `.conf` path. Host: <=3 VMs at once (1 DC
   build bakes the new labsvc.ps1 (Register-LabSvc copies it from the CD), so the multi-machine
   school lab gets the new worker; existing 2012/2016/2019 single labs keep their old baked worker.
 
+- **Part 5 (tests) done**: `tests/fake_lab.rs` now has 16 scenarios (was 13). The fake QEMU
+  understands `fmt=multi` (run_multi / run_multi_steps: DC promote, member join/logon, per-machine
+  steps with machine= tags, as_=system|logon|user). New fixtures: `labs/tri.json` (2019 DC + 2019
+  member + win11 UEFI member) and base images 2019-/win11-. Three scenarios: a full 3-machine
+  build+run (checks 0 state, per-VM disks, UEFI vars only on the win11 member, per-machine results
+  folders, control-disc lab.json shape incl. as_ collapse of the logon user + explicit `as` user
+  with creds, multicast argv, per-VM cpus, DC isolation), a failing step (expect_exit mismatch ->
+  exit 1) + unknown-machine rejection before boot, and an unknown-field rejection. Added the real
+  `labs/school.json` and `examples/configs/school-smoke.json`. All tests green (42 lib, 16
+  fake_lab, 13 labconf); ps_lint clean.
+- **Part 6 remaining**: a real `lab run examples/configs/school-smoke.json` (2019 DC + 2012 + 2016)
+  on KVM. Base images exist; the JSON runner builds the 3-machine 0 state fresh (bakes the new
+  labsvc), then runs. Not yet done in this session.
+
 ## Next
 
 - The user tries it and switches `~/.local/bin/lab` to target/release/wtl-rs. Until then the

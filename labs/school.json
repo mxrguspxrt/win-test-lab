@@ -1,0 +1,16 @@
+{
+  "domain": "lab.local",
+  "netbios": "LAB",
+  "admin_password": "WinTest!2026",
+  "network": { "subnet": "10.77.30", "lan_port": 47030 },
+  "machines": {
+    "DC1": { "os": "2019", "role": "dc" },
+    "CL1": { "os": "2012", "logon": "student1" },
+    "CL2": { "os": "2016", "logon": "student2" }
+  },
+  "users": {
+    "student1": { "password": "Pupil!2026", "groups": ["Students"] },
+    "student2": { "password": "Pupil!2026", "groups": ["Students"] },
+    "teacher":  { "password": "Teach!2026", "groups": ["Teachers"] }
+  }
+}

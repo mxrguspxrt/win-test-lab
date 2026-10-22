@@ -386,6 +386,9 @@ impl Guest {
             return Err("lab.json is not pure ASCII (PowerShell 4 would misread it)".into());
         }
         let cfg: Value = serde_json::from_slice(cfg).map_err(|e| e.to_string())?;
+        if s(&cfg, "fmt") == "multi" {
+            return self.run_multi(m, &cfg);
+        }
         let role = s(&cfg, "role").to_string();
         let user = format!("{}%5C{}", s(&cfg, "netbios"), s(&cfg, "logon_user"));
         self.emit("WTL AGENT_START os=Microsoft%20Windows%20Server%202019%20(fake) build=17763");
@@ -484,6 +487,108 @@ impl Guest {
         self.emit(&format!("WTL LAB_RUN_DONE admin={} student={}", na, ns));
         Ok(())
     }
+
+    /// Simulate a multi-machine (fmt=multi) guest: DC promotes, a member joins/logs on, then
+    /// each machine with a run runs its steps and reports LAB_STEP machine=.. .
+    fn run_multi(&mut self, m: &Machine, cfg: &Value) -> Result<(), String> {
+        let role = s(cfg, "role").to_string();
+        let machine = s(cfg, "machine").to_string();
+        let user = format!("{}%5C{}", s(cfg, "netbios"), s(cfg, "logon_user"));
+        self.emit(&format!("WTL AGENT_START os=fake build=17763 machine={}", machine));
+        if role == "dc" {
+            self.emit(&format!("WTL LAB_START role=dc machine={} phase=ready user=LAB%5CAdministrator", machine));
+            self.emit(&format!("WTL LAB_DC_READY domain={} dc={} | {}", s(cfg, "domain"), machine, self.name));
+            if cfg.get("run").map(|r| !r.is_null()).unwrap_or(false) {
+                return self.run_multi_steps(m, cfg, &machine);
+            }
+            return Ok(());
+        }
+        if role != "member" {
+            return Err(format!("unknown role {}", role));
+        }
+        if cfg.get("shutdown_when_ready").and_then(Value::as_bool) == Some(true) {
+            // 0-state build: join, reboot, autologon, ready, idle
+            self.emit(&format!("WTL LAB_START role=member machine={} phase=join user={}%5CAdministrator", machine, s(cfg, "netbios")));
+            self.emit(&format!("WTL LAB_JOINED domain={} machine={}", s(cfg, "domain"), machine));
+            self.emit("WTL LAB_REBOOT | after the join");
+            self.raw("garbage after reboot \u{0}\r\n");
+            self.emit(&format!("WTL AGENT_START os=fake build=17763 machine={}", machine));
+            self.emit(&format!("WTL LAB_START role=member machine={} phase=ready user={}", machine, user));
+            self.emit(&format!("WTL LAB_CLIENT_READY user={} machine={}", user, machine));
+            self.emit("WTL LAB_IDLE");
+            return Ok(());
+        }
+        self.emit(&format!("WTL LAB_START role=member machine={} phase=ready user={}", machine, user));
+        self.emit(&format!("WTL LAB_CLIENT_READY user={} machine={}", user, machine));
+        if cfg.get("run").map(|r| !r.is_null()).unwrap_or(false) {
+            return self.run_multi_steps(m, cfg, &machine);
+        }
+        Ok(())
+    }
+
+    /// Run this machine's steps (fmt=multi): mount each disc, run each step, report the exit
+    /// the step's script asks for (FAKE_EXIT=N, else 0), with machine= on every event.
+    fn run_multi_steps(&mut self, m: &Machine, cfg: &Value, machine: &str) -> Result<(), String> {
+        let run = cfg.get("run").cloned().unwrap_or(Value::Null);
+        // mounts: each needs a disc labelled WTL<LETTER> (indices > 0)
+        let mut discs: BTreeMap<String, IsoReader> = BTreeMap::new();
+        for (idx, p) in &m.cds {
+            if *idx == 0 {
+                continue;
+            }
+            let r = IsoReader::open(p, true).map_err(|e| e.to_string())?;
+            discs.insert(r.volid.clone(), r);
+        }
+        for mnt in run.get("mounts").and_then(Value::as_array).into_iter().flatten() {
+            let letter = s(mnt, "letter");
+            if !discs.contains_key(&format!("WTL{}", letter)) {
+                return Err(format!("{}: mount {}: no disc labelled WTL{}", machine, letter, letter));
+            }
+            self.emit(&format!("WTL LAB_MOUNT machine={} letter={} host={}", machine, letter, wtl_value(s(mnt, "host"))));
+        }
+        let steps = run.get("steps").and_then(Value::as_array).cloned().unwrap_or_default();
+        for st in steps {
+            let n = st.get("n").and_then(Value::as_i64).unwrap_or(0);
+            // the host writes the key as "as_" (serde rename) -> fall back to "as"
+            let who = if !s(&st, "as_").is_empty() { s(&st, "as_") } else { s(&st, "as") }.to_string();
+            let path = s(&st, "path").to_string();
+            let script = wtl_value(&path);
+            let letter = &path[..1];
+            let content: Option<Vec<u8>> = if letter == "C" {
+                Some(b"(a C: program)".to_vec())
+            } else {
+                discs.get(&format!("WTL{}", letter)).and_then(|d| d.read(&path[3..].replace('\\', "/")).map(<[u8]>::to_vec))
+            };
+            let Some(content) = content else {
+                self.emit(&format!("WTL LAB_STEP machine={} as={} n={} script={} exit=launchfail | The system cannot find the file specified", machine, who, n, script));
+                continue;
+            };
+            let text = String::from_utf8_lossy(&content).into_owned();
+            if text.contains("FAKE_HANG") {
+                return Ok(());
+            }
+            if text.contains("FAKE_CRASH") {
+                std::thread::sleep(Duration::from_millis(1500));
+                fake_exit(1);
+            }
+            if text.contains("FAKE_LAB_FAIL") {
+                return Err(format!("{}: step {} blew up (line 42)", machine, n));
+            }
+            let code = text
+                .split("FAKE_EXIT=")
+                .nth(1)
+                .map(|r| r.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect::<String>())
+                .unwrap_or_else(|| "0".into());
+            let out = format!("ran {} as {} on {}\r\n{}", path, who, machine, text).into_bytes();
+            for (seq, chunk) in out.chunks(768).enumerate() {
+                self.emit(&format!("WTL OUTPUT stream=step{}out seq={} | {}", n, seq, b64encode(chunk)));
+            }
+            self.emit(&format!("WTL OUTPUT_END stream=step{}out bytes={} sent={} truncated=0", n, out.len(), out.len()));
+            self.emit(&format!("WTL LAB_STEP machine={} as={} n={} script={} exit={} secs=0.4", machine, who, n, script, code));
+        }
+        self.emit(&format!("WTL LAB_RUN_DONE machine={} steps={}", machine, run.get("steps").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)));
+        Ok(())
+    }
 }
 
 // =====================================================================================
@@ -539,7 +644,27 @@ impl Ctx {
         };
         std::fs::write(root.join("labs/t.conf"), def("t", "2019", "2019")).unwrap();
         std::fs::write(root.join("labs/u.conf"), def("u", "ws2019", "win11")).unwrap();
-        for img in ["t-dc", "t-client", "u-dc", "u-client"] {
+        // a 3-machine JSON lab: 2019 DC + a 2019 member + a win11 (UEFI) member
+        let tri = format!(
+            r#"{{
+  "domain": "lab.local", "netbios": "LAB", "admin_password": "WinTest!2026",
+  "network": {{ "subnet": "10.77.98", "lan_port": {port} }},
+  "machines": {{
+    "DC": {{ "os": "2019", "role": "dc" }},
+    "CL1": {{ "os": "2019", "logon": "student1" }},
+    "CL2": {{ "os": "win11", "logon": "student2", "cpus": 4 }}
+  }},
+  "users": {{
+    "student1": {{ "password": "Pupil!2026", "groups": ["Students"] }},
+    "student2": {{ "password": "Pupil!2026", "groups": ["Students"] }},
+    "teacher":  {{ "password": "Teach!2026", "groups": ["Teachers"] }}
+  }}
+}}
+"#,
+            port = free_port()
+        );
+        std::fs::write(root.join("labs/tri.json"), tri).unwrap();
+        for img in ["t-dc", "t-client", "u-dc", "u-client", "2019-dc", "2019-client", "win11-dc", "win11-client"] {
             std::fs::write(root.join(format!("images/{}.qcow2", img)), "QFI\u{fb} fake base image\n").unwrap();
         }
         std::fs::write(tmp.join("OVMF_CODE.fd"), "code").unwrap();
@@ -1013,6 +1138,112 @@ fn driver(args: &[String]) -> i32 {
         c.ok(o.status.code() == Some(0), format!("exit {:?}", o.status.code()));
         outs.push(("lab status t".into(), Out { code: o.status.code().unwrap_or(-1), text: text.clone() }));
         c.ok(text.contains("0 state: ready"), "status via the symlink");
+    });
+
+    scenario(&mut cx, "JSON 3-machine lab: build the 0 state, run per-machine steps", &|cx, c, outs| {
+        // a run config living next to the app folder; `on`, `as`, args, expect_exit all exercised
+        let conf = cx.cfg(
+            "school.json",
+            "{\n  \"lab\": \"tri\", \"name\": \"tri-smoke\", \"wait\": 30,\n  \"mount\": { \"X\": \"../app\" },\n  \"steps\": [\n    { \"on\": \"all\", \"as\": \"system\", \"run\": \"X:/setup.bat\" },\n    { \"on\": \"CL1\", \"as\": \"student1\", \"run\": \"X:/smoke.exe\" },\n    { \"on\": [\"CL1\", \"CL2\"], \"run\": \"X:/smoke.exe\", \"args\": \"--quiet\" },\n    { \"on\": \"CL1\", \"as\": \"teacher\", \"run\": \"X:/smoke.exe\" },\n    { \"on\": \"DC\", \"as\": \"system\", \"run\": \"C:\\\\Windows\\\\System32\\\\whoami.exe\" }\n  ]\n}\n",
+        );
+        let i = run(cx, outs, &["run", &conf], &[]);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        for needle in [
+            "=== building the 0 state of lab tri (domain lab.local; 3 machines, once) ===",
+            "DC ready: WTL LAB_DC_READY domain=lab.local",
+            "CL1 ready:",
+            "CL2 ready:",
+            "lab tri: booting 3 machines from the 0 state",
+            // per-machine steps, with machine tags
+            "[DC system] C:\\Windows\\System32\\whoami.exe -> exit 0",
+            "[CL1 system] X:\\setup.bat -> exit 0",
+            "[CL2 system] X:\\setup.bat -> exit 0",
+            // step 2 is `as student1` on CL1, whose own logon user is student1 -> runs as "logon"
+            "[CL1 logon] X:\\smoke.exe -> exit 0",
+            "[CL2 logon] X:\\smoke.exe -> exit 0",
+            // step 4 is `as teacher` on CL1 (not its logon user) -> the worker runs it as that user
+            "[CL1 user] X:\\smoke.exe -> exit 0",
+            "[DC] all steps done",
+            "[CL1] all steps done",
+            "[CL2] all steps done",
+            "config: school.json  ->  ALL STEPS OK",
+        ] {
+            c.has(o, needle);
+        }
+        let st = cx.state("tri");
+        c.file(&st.join("0-state.json"));
+        for vm in ["DC", "CL1", "CL2"] {
+            c.file(&st.join(format!("{}-0.qcow2", vm)));
+            c.file(&st.join(format!("{}.qcow2", vm)));
+        }
+        // the win11 member is UEFI -> its own OVMF vars in the state; the others are BIOS
+        c.file(&st.join("CL2-OVMF_VARS.fd"));
+        c.no_file(&st.join("DC-OVMF_VARS.fd"));
+        // per-machine results folders with decoded step output
+        let res = std::fs::canonicalize(st.join("last")).unwrap_or_default();
+        c.content(&res.join("CL1/step1out.txt"), b"ran X:\\setup.bat as system on CL1\r\n@echo off\r\necho installing\r\nFAKE_EXIT=0\r\n");
+        c.file(&res.join("CL1/screen.png"));
+        c.file(&res.join("CL2/serial.log"));
+        c.file(&res.join("config.json"));
+        // the DC's control disc: fmt=multi, role=dc, and only its own step (whoami on C:)
+        let dc_iso = IsoReader::open(&st.join("DC.iso"), true).unwrap();
+        let dj: Value = serde_json::from_slice(dc_iso.read("LAB/lab.json").unwrap()).unwrap();
+        c.ok(s(&dj, "fmt") == "multi" && s(&dj, "role") == "dc" && s(&dj, "ip") == "10.77.98.10", format!("DC lab.json {}", dj));
+        c.ok(dj["run"]["steps"].as_array().map(|a| a.len()) == Some(1), format!("DC should have 1 step: {}", dj["run"]));
+        c.ok(dj["run"]["mounts"].as_array().map(|a| a.len()) == Some(0), "DC mounts only C: -> no mount disc");
+        // CL1's disc: 3 steps (setup, smoke student1, smoke logon), one mount X
+        let cl1_iso = IsoReader::open(&st.join("CL1.iso"), true).unwrap();
+        let cj: Value = serde_json::from_slice(cl1_iso.read("LAB/lab.json").unwrap()).unwrap();
+        c.ok(s(&cj, "role") == "member" && s(&cj, "logon_user") == "student1", format!("CL1 lab.json {}", cj));
+        c.ok(cj["run"]["steps"].as_array().map(|a| a.len()) == Some(4), format!("CL1 steps {}", cj["run"]["steps"]));
+        // the student1 step is its own logon user -> as_=logon; teacher is another user -> as_=user, with creds
+        let step = |st: &Value, n: i64| st["run"]["steps"].as_array().unwrap().iter().find(|x| x["n"] == json!(n)).cloned().unwrap_or(Value::Null);
+        let as_of = |st: &Value, n: i64| step(st, n)["as_"].as_str().unwrap_or("").to_string();
+        c.ok(as_of(&cj, 1) == "system", format!("CL1 step1 as_ {}", as_of(&cj, 1)));
+        c.ok(as_of(&cj, 2) == "logon", format!("CL1 step2 as_ {}", as_of(&cj, 2)));
+        c.ok(as_of(&cj, 4) == "user" && step(&cj, 4)["user"] == json!("teacher") && step(&cj, 4)["password"] == json!("Teach!2026"),
+            format!("CL1 step4 (teacher) {}", step(&cj, 4)));
+        // multicast LAN argv + per-VM cpus; CL2 is UEFI/q35
+        let argv = std::fs::read_to_string(&cx.fake_log).unwrap_or_default();
+        let line = |tag: &str| argv.lines().filter(|l| l.contains(tag)).last().unwrap_or("").replace('\u{1f}', " ");
+        let dc_line = line("lab-tri-DC");
+        c.ok(dc_line.contains("-netdev dgram,id=lan0,remote.type=inet,remote.host=239.") && dc_line.contains("local.port="), format!("dc mcast argv: {}", dc_line));
+        c.ok(!dc_line.contains("user,id=net0"), "dc should be isolated (no user NAT)");
+        let cl2_line = line("lab-tri-CL2");
+        c.ok(cl2_line.contains("user,id=net0"), "members keep user NAT");
+        c.ok(cl2_line.contains("-smp 4") && cl2_line.contains("-machine q35"), format!("CL2 cpus/uefi: {}", cl2_line));
+        c.ok(cx.live_fakes().len() == 3, format!("running VMs: {:?}", cx.live_fakes()));
+        let i = run(cx, outs, &["restore", "tri"], &[]);
+        c.code(&outs[i].1, 0);
+    });
+
+    scenario(&mut cx, "JSON lab: a failing step and a bad target", &|cx, c, outs| {
+        // expect_exit mismatch -> A STEP FAILED
+        let conf = cx.cfg(
+            "fail.json",
+            "{\n  \"lab\": \"tri\", \"mount\": { \"X\": \"../app\" },\n  \"steps\": [\n    { \"on\": \"CL1\", \"as\": \"system\", \"run\": \"X:/fail.bat\" }\n  ]\n}\n",
+        );
+        let i = run(cx, outs, &["run", &conf], &[]);
+        let o = &outs[i].1;
+        c.code(o, 1);
+        c.lacks(o, "building the 0 state"); // already built by the previous scenario? no, tri was restored but kept its 0 state
+        c.has(o, "[CL1 system] X:\\fail.bat -> exit 3 (want 0)");
+        c.has(o, "->  A STEP FAILED");
+        let _ = run(cx, outs, &["restore", "tri"], &[]);
+        // a run naming an unknown machine is rejected before boot
+        let bad = cx.cfg("bad.json", "{ \"lab\": \"tri\", \"mount\": {\"X\":\"../app\"}, \"steps\": [ { \"on\": \"NOPE\", \"as\": \"system\", \"run\": \"X:/setup.bat\" } ] }");
+        let i = run(cx, outs, &["run", &bad], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "is not a machine in lab tri");
+        c.ok(cx.live_fakes().is_empty(), "a VM was started for an invalid config");
+    });
+
+    scenario(&mut cx, "JSON lab: unknown field is rejected before boot", &|cx, c, outs| {
+        let bad = cx.cfg("unk.json", "{ \"lab\": \"tri\", \"frobnicate\": 1, \"steps\": [] }");
+        let i = run(cx, outs, &["run", &bad], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "unknown field");
     });
 
     let leaks = cx.live_fakes();
