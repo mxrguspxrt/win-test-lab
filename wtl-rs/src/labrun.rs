@@ -135,6 +135,33 @@ struct ZeroState {
     machines: Vec<String>,
 }
 
+/// One step's outcome, written into runs/<id>/result.json.
+#[derive(Serialize, Clone)]
+struct StepResult {
+    machine: String,
+    /// who ran it: "system", "logon" (the machine's own user), or a user name
+    user: String,
+    /// per-machine 1-based step index
+    n: i64,
+    script: String,
+    /// the guest's reported exit: a number, or "running"/"timeout"/"launchfail"
+    exit: String,
+    expect_exit: i64,
+    secs: f64,
+    ok: bool,
+}
+
+/// The whole run's summary, written as runs/<id>/result.json.
+#[derive(Serialize)]
+struct RunResult {
+    lab: String,
+    config: String,
+    run_id: String,
+    /// "ok" if every step met its expect_exit, else "failed"
+    status: String,
+    steps: Vec<StepResult>,
+}
+
 pub struct MultiLab {
     root: PathBuf,
     env: Env,
@@ -964,7 +991,7 @@ impl MultiLab {
         let config = self.config.clone().unwrap_or_default();
         let config_name = config.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         log(&format!("running {} (steps on {} machine(s))", config_name, self.vms.iter().filter(|v| v.has_steps()).count()));
-        let status = self.run_steps()?;
+        let (status, step_results) = self.run_steps()?;
 
         // decode each machine's output into runs/<id>/<machine>/
         for v in &self.vms {
@@ -982,21 +1009,33 @@ impl MultiLab {
         if !config.as_os_str().is_empty() {
             let _ = std::fs::copy(&config, res.join("config.json"));
         }
+        // runs/<id>/result.json: every step with machine, user, exit, expect, duration
+        let summary = RunResult {
+            lab: self.name.clone(),
+            config: config_name.clone(),
+            run_id: run_id.clone(),
+            status: if status == 0 { "ok" } else { "failed" }.to_string(),
+            steps: step_results,
+        };
+        if let Ok(j) = serde_json::to_string_pretty(&summary) {
+            let _ = write_file(&res.join("result.json"), format!("{}\n", j));
+        }
         self.summary();
         eprintln!("  config: {}  ->  {}", config_name, if status == 0 { "ALL STEPS OK" } else { "A STEP FAILED" });
-        eprintln!("  results: {} (per machine: <name>/step*.txt, screen.png)", res.display());
+        eprintln!("  results: {} (per machine: <name>/step*.txt, screen.png; result.json = summary)", res.display());
         Ok(status)
     }
 
     /// Wait for every machine-with-steps to reach LAB_RUN_DONE, reporting LAB_STEP lines as
     /// they arrive. The machines run concurrently, so poll each in a short round-robin slice.
-    fn run_steps(&mut self) -> Result<i32> {
+    fn run_steps(&mut self) -> Result<(i32, Vec<StepResult>)> {
         let mut pending: Vec<String> = self.vms.iter().filter(|v| v.has_steps()).map(|v| v.name.clone()).collect();
         if pending.is_empty() {
             ok("no steps");
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
         let mut status = 0;
+        let mut results: Vec<StepResult> = Vec::new();
         while !pending.is_empty() {
             let mut still = Vec::new();
             for vm in pending.clone() {
@@ -1010,7 +1049,7 @@ impl MultiLab {
                     }
                     Outcome::Until(line) => {
                         // a LAB_STEP line: report it, keep waiting on this machine
-                        self.report_step(&vm, &line, &mut status);
+                        results.push(self.report_step(&vm, &line, &mut status));
                         still.push(vm);
                     }
                     Outcome::Timeout => {
@@ -1022,11 +1061,13 @@ impl MultiLab {
             }
             pending = still;
         }
-        Ok(status)
+        // stable order: by machine, then step number
+        results.sort_by(|a, b| a.machine.cmp(&b.machine).then(a.n.cmp(&b.n)));
+        Ok((status, results))
     }
 
-    /// Report one LAB_STEP line; mark the run failed if the step's exit != its expect_exit.
-    fn report_step(&self, vm: &str, line: &str, status: &mut i32) {
+    /// Report one LAB_STEP line and return its record; mark the run failed if exit != expect_exit.
+    fn report_step(&self, vm: &str, line: &str, status: &mut i32) -> StepResult {
         let ev = outputs::parse_event(line);
         let g = |k: &str| ev.as_ref().and_then(|e| e.get(k)).unwrap_or("").to_string();
         let (n, script, exit) = (g("n"), g("script"), g("exit"));
@@ -1042,6 +1083,16 @@ impl MultiLab {
         } else {
             err(&format!("[{} {}] {} -> exit {} (want {})", vm, who, script, exit, expect));
             *status = 1;
+        }
+        StepResult {
+            machine: vm.to_string(),
+            user: who,
+            n: util::py_int(&n).unwrap_or(0),
+            script,
+            exit,
+            expect_exit: expect,
+            secs: g("secs").parse().unwrap_or(0.0),
+            ok: ok_exit,
         }
     }
 

@@ -29,6 +29,20 @@ function Set-LabPhase([string]$Phase) {
 
 function Send-LabPhase([string]$Text) { Send-WtlEvent 'LAB_PHASE' @() $Text }
 
+# multi-machine labs only: rename this Windows box to its lab machine key ($Cfg.machine) and reboot.
+# Returns $true if a rename+reboot was started (caller should stop and let the reboot happen), $false
+# if the name already matches or no machine key is set (the two-machine .conf path leaves it unset).
+function Rename-LabComputer($Cfg) {
+    $want = [string]$Cfg.machine
+    if (-not $want -or $env:COMPUTERNAME -eq $want) { return $false }
+    Set-LabShutdownFriendly
+    Send-LabPhase "renaming this computer $env:COMPUTERNAME -> $want, then reboot"
+    Rename-Computer -NewName $want -Force -ErrorAction Stop
+    Send-WtlEvent 'LAB_REBOOT' @('phase', 'rename')
+    Restart-Computer -Force
+    return $true
+}
+
 function ConvertTo-LabSecure([string]$Text) { return (ConvertTo-SecureString $Text -AsPlainText -Force) }
 
 function Invoke-LabNative([string]$Exe, [string[]]$Arguments) {
@@ -154,6 +168,9 @@ function New-LabUser($Cfg, $U) {
 function Invoke-LabDc($Cfg) {
     $phase = Get-LabPhase
     if ($phase -eq 'new') {
+        # multi-machine lab: the machine key is the Windows computer name. Rename before promoting
+        # (a promoted DC cannot be renamed), then reboot and re-enter 'new' with the name matching.
+        if (Rename-LabComputer $Cfg) { return 'reboot' }
         Set-LabNetwork $Cfg
         Set-LabShutdownFriendly
         Send-LabPhase 'installing the AD DS role'
@@ -241,11 +258,16 @@ function Invoke-LabClient($Cfg, [string]$LabDir) {
         }
         Wait-LabDc $Cfg
         $cred = New-Object System.Management.Automation.PSCredential(([string]$Cfg.netbios + '\Administrator'), (ConvertTo-LabSecure ([string]$Cfg.admin_password)))
+        # multi-machine lab: rename to the machine key as we join (one reboot does both) so the
+        # Windows computer name matches the lab's machine name.
+        $join = @{ DomainName = [string]$Cfg.domain; Credential = $cred; Force = $true; ErrorAction = 'Stop'; WarningAction = 'SilentlyContinue' }
+        $want = [string]$Cfg.machine
+        if ($want -and $env:COMPUTERNAME -ne $want) { $join['NewName'] = $want }
         # DNS answers before the new DC finishes its first boot ("Applying computer settings" takes
         # 5-10 min on 2016/2019): keep trying for 20 min
         for ($i = 1; ; $i++) {
             try {
-                Add-Computer -DomainName ([string]$Cfg.domain) -Credential $cred -Force -ErrorAction Stop -WarningAction SilentlyContinue
+                Add-Computer @join
                 break
             } catch {
                 if ($i -ge 40) { throw "joining $($Cfg.domain) failed: $($_.Exception.Message)" }

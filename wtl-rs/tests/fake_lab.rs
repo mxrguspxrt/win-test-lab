@@ -496,9 +496,19 @@ impl Guest {
         let user = format!("{}%5C{}", s(cfg, "netbios"), s(cfg, "logon_user"));
         self.emit(&format!("WTL AGENT_START os=fake build=17763 machine={}", machine));
         if role == "dc" {
+            let is_run = cfg.get("run").map(|r| !r.is_null()).unwrap_or(false);
+            if !is_run {
+                // 0-state build: rename to the machine key + reboot before promotion (the host's
+                // wait_ev must ride through this extra reboot), then promote and report ready
+                self.emit(&format!("WTL LAB_START role=dc machine={} phase=new user=DC2019%5CAdministrator", machine));
+                self.emit(&format!("WTL LAB_PHASE | renaming this computer DC2019 -> {}, then reboot", machine));
+                self.emit("WTL LAB_REBOOT phase=rename");
+                self.raw("garbage after reboot \u{0}\r\n");
+                self.emit(&format!("WTL AGENT_START os=fake build=17763 machine={}", machine));
+            }
             self.emit(&format!("WTL LAB_START role=dc machine={} phase=ready user=LAB%5CAdministrator", machine));
-            self.emit(&format!("WTL LAB_DC_READY domain={} dc={} | {}", s(cfg, "domain"), machine, self.name));
-            if cfg.get("run").map(|r| !r.is_null()).unwrap_or(false) {
+            self.emit(&format!("WTL LAB_DC_READY domain={} dc={} computer={} | {}", s(cfg, "domain"), machine, machine, self.name));
+            if is_run {
                 return self.run_multi_steps(m, cfg, &machine);
             }
             return Ok(());
@@ -507,19 +517,19 @@ impl Guest {
             return Err(format!("unknown role {}", role));
         }
         if cfg.get("shutdown_when_ready").and_then(Value::as_bool) == Some(true) {
-            // 0-state build: join, reboot, autologon, ready, idle
+            // 0-state build: rename+join in one reboot, autologon, ready, idle
             self.emit(&format!("WTL LAB_START role=member machine={} phase=join user={}%5CAdministrator", machine, s(cfg, "netbios")));
             self.emit(&format!("WTL LAB_JOINED domain={} machine={}", s(cfg, "domain"), machine));
-            self.emit("WTL LAB_REBOOT | after the join");
+            self.emit("WTL LAB_REBOOT | after the join (renamed)");
             self.raw("garbage after reboot \u{0}\r\n");
             self.emit(&format!("WTL AGENT_START os=fake build=17763 machine={}", machine));
             self.emit(&format!("WTL LAB_START role=member machine={} phase=ready user={}", machine, user));
-            self.emit(&format!("WTL LAB_CLIENT_READY user={} machine={}", user, machine));
+            self.emit(&format!("WTL LAB_CLIENT_READY user={} machine={} computer={}", user, machine, machine));
             self.emit("WTL LAB_IDLE");
             return Ok(());
         }
         self.emit(&format!("WTL LAB_START role=member machine={} phase=ready user={}", machine, user));
-        self.emit(&format!("WTL LAB_CLIENT_READY user={} machine={}", user, machine));
+        self.emit(&format!("WTL LAB_CLIENT_READY user={} machine={} computer={}", user, machine, machine));
         if cfg.get("run").map(|r| !r.is_null()).unwrap_or(false) {
             return self.run_multi_steps(m, cfg, &machine);
         }
@@ -1186,6 +1196,21 @@ fn driver(args: &[String]) -> i32 {
         c.file(&res.join("CL1/screen.png"));
         c.file(&res.join("CL2/serial.log"));
         c.file(&res.join("config.json"));
+        // computer names in the serial logs are the machine keys (renamed), not base-image names
+        for vm in ["DC", "CL1", "CL2"] {
+            let log = std::fs::read_to_string(res.join(format!("{}/serial.log", vm))).unwrap_or_default();
+            c.ok(log.contains(&format!("computer={}", vm)), format!("{} serial log should report computer={}", vm, vm));
+        }
+        // result.json: one record per step with machine/user/exit/expect/duration, status ok
+        let rj: Value = serde_json::from_slice(&std::fs::read(res.join("result.json")).unwrap_or_default()).unwrap_or(Value::Null);
+        c.ok(s(&rj, "status") == "ok" && s(&rj, "lab") == "tri" && s(&rj, "config") == "school.json", format!("result.json head {}", rj));
+        let steps = rj["steps"].as_array().cloned().unwrap_or_default();
+        // DC(1) + CL1(4) + CL2(2) = 7 step records
+        c.ok(steps.len() == 7, format!("result.json should have 7 steps, has {}", steps.len()));
+        c.ok(steps.iter().all(|s| s["ok"] == json!(true)), "every step ok");
+        let find = |m: &str, n: i64| steps.iter().find(|s| s["machine"] == json!(m) && s["n"] == json!(n)).cloned().unwrap_or(Value::Null);
+        c.ok(find("CL1", 4)["user"] == json!("user") && find("CL1", 4)["script"] == json!("X:\\smoke.exe"), format!("CL1 step4 {}", find("CL1", 4)));
+        c.ok(find("DC", 1)["machine"] == json!("DC") && find("DC", 1)["exit"] == json!("0"), format!("DC step1 {}", find("DC", 1)));
         // the DC's control disc: fmt=multi, role=dc, and only its own step (whoami on C:)
         let dc_iso = IsoReader::open(&st.join("DC.iso"), true).unwrap();
         let dj: Value = serde_json::from_slice(dc_iso.read("LAB/lab.json").unwrap()).unwrap();
