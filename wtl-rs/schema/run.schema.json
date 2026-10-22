@@ -1,0 +1,136 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RunDef",
+  "description": "A run config file: `<app>.json`.",
+  "type": "object",
+  "required": [
+    "lab"
+  ],
+  "properties": {
+    "lab": {
+      "description": "The lab to boot: `labs/<lab>.json`.",
+      "type": "string"
+    },
+    "name": {
+      "description": "Label for the results folder (default: the run file's stem).",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "wait": {
+      "description": "Seconds a step may run before it counts as \"still running\" (default 60).",
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "timeout_min": {
+      "description": "Give up on the whole run after this many minutes (default 60).",
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "mount": {
+      "description": "Host folder for each drive letter, e.g. `{ \"X\": \"./app\" }` (read-only in the guest).",
+      "default": {},
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "steps": {
+      "description": "Steps, run top to bottom.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/StepDef"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "StepDef": {
+      "description": "One step of a run.",
+      "type": "object",
+      "required": [
+        "run"
+      ],
+      "properties": {
+        "on": {
+          "description": "Where to run: a machine name, a list of names, or `all` (every member, not the DC). Default `all`.",
+          "default": "all",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OnSpec"
+            }
+          ]
+        },
+        "as": {
+          "description": "Who to run as: `system` (full rights) or a user name. Default: that machine's `logon` user.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run": {
+          "description": "The program to run: `.exe .bat .cmd .ps1 .msi`, e.g. `X:/setup.bat`.",
+          "type": "string"
+        },
+        "args": {
+          "description": "Command-line arguments.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expect_exit": {
+          "description": "Exit code that counts as success (default 0).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "wait": {
+          "description": "Seconds this step may run before it counts as \"still running\" (default: the run's `wait`).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "keep_running": {
+          "description": "If true, a program still running at `wait` counts as OK and is left running.",
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OnSpec": {
+      "description": "a machine name, a list of machine names, or \"all\" (every member)",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    }
+  }
+}

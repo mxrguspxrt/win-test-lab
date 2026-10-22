@@ -9,7 +9,7 @@
 //!     wtl-rs outputs SERIAL_LOG RESULTS_DIR
 
 use clap::{Parser, Subcommand};
-use wtl_rs::{lab, labconf, mkiso, outputs, qmp, serialwait, util};
+use wtl_rs::{lab, labconf, mkiso, outputs, qmp, schema, serialwait, util};
 
 #[derive(Parser, Debug)]
 #[command(name = "wtl-rs", version, about = "win-test-lab host tools (Rust port of lab.sh + lib/*.py)")]
@@ -28,6 +28,7 @@ enum Tool {
     Qmp(qmp::Cli),
     Serialwait(serialwait::Cli),
     Outputs(outputs::Cli),
+    Schema(schema::Cli),
 }
 
 /// What runs when the binary is called `lab`.
@@ -78,6 +79,7 @@ fn main() {
             Tool::Qmp(a) => qmp::cli(a),
             Tool::Serialwait(a) => serialwait::cli(a),
             Tool::Outputs(a) => report("outputs", outputs::cli(a)),
+            Tool::Schema(a) => report("schema", schema::cli(a)),
         }
     };
     std::process::exit(code);

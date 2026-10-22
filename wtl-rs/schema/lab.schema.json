@@ -1,0 +1,168 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "LabDef",
+  "description": "A lab definition file: `labs/<name>.json`.",
+  "type": "object",
+  "required": [
+    "admin_password",
+    "domain",
+    "machines",
+    "netbios",
+    "network"
+  ],
+  "properties": {
+    "domain": {
+      "description": "AD forest DNS name, e.g. `lab.local`.",
+      "type": "string"
+    },
+    "netbios": {
+      "description": "NetBIOS domain name, e.g. `LAB` (users log on as `LAB\\student`).",
+      "type": "string"
+    },
+    "admin_password": {
+      "description": "Password of the domain Administrator (also the DSRM password).",
+      "type": "string"
+    },
+    "network": {
+      "$ref": "#/definitions/NetworkDef"
+    },
+    "machines": {
+      "description": "The machines, keyed by computer name. Exactly one must have `role: dc`.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/MachineDef"
+      }
+    },
+    "users": {
+      "description": "Domain users. Each is always in Domain Users; named groups are created if missing.",
+      "default": {},
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/UserDef"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "NetworkDef": {
+      "description": "The private VM-to-VM network.",
+      "type": "object",
+      "required": [
+        "lan_port",
+        "subnet"
+      ],
+      "properties": {
+        "subnet": {
+          "description": "First three octets of the /24, e.g. `10.77.30` (DC gets .10, members .20, .21, ...).",
+          "type": "string"
+        },
+        "lan_port": {
+          "description": "Host loopback UDP port the multicast lab LAN uses (unique per running lab).",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "MachineDef": {
+      "description": "One machine in a lab.",
+      "type": "object",
+      "required": [
+        "os"
+      ],
+      "properties": {
+        "os": {
+          "description": "OS key from `lib/oslist.conf`, e.g. `2019`, `2012`, `win11`.",
+          "type": "string"
+        },
+        "role": {
+          "description": "`dc` or `member` (default `member`).",
+          "default": "member",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Role"
+            }
+          ]
+        },
+        "logon": {
+          "description": "A user (from `users`) this machine logs on as automatically. Members usually set one; the DC does not.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mem": {
+          "description": "RAM in MB (default 4096 for a member, 3072 for the DC).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "cpus": {
+          "description": "vCPUs (default 2).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "ip": {
+          "description": "Static IPv4, either a full `a.b.c.d` or a bare last octet within the subnet. Default: DC `.10`, members `.20`, `.21`, ... in declaration order.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Role": {
+      "description": "What a machine is for.",
+      "oneOf": [
+        {
+          "description": "the domain controller (exactly one per lab)",
+          "type": "string",
+          "enum": [
+            "dc"
+          ]
+        },
+        {
+          "description": "a domain-joined member (the default)",
+          "type": "string",
+          "enum": [
+            "member"
+          ]
+        }
+      ]
+    },
+    "UserDef": {
+      "description": "One domain user.",
+      "type": "object",
+      "required": [
+        "password"
+      ],
+      "properties": {
+        "password": {
+          "type": "string"
+        },
+        "groups": {
+          "description": "Extra groups besides Domain Users; a group that does not exist is created.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

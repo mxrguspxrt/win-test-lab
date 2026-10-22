@@ -16,7 +16,11 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
+# machines/users keep their JSON order (IP defaults .20/.21 follow declaration order)
+indexmap = { version = "2", features = ["serde"] }
 percent-encoding = "2"
+# JSON Schema generated from the typed lab/run structs (wtl-rs/schema/)
+schemars = { version = "0.8", features = ["indexmap2", "preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: objects keep insertion order, like Python dicts (outputs' summary)
 serde_json = { version = "1", features = ["preserve_order"] }

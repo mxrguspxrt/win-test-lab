@@ -39,6 +39,25 @@ after each finished piece. User-facing docs are in README.md.
 Nothing is committed. Another session may be editing lab.sh in the same checkout. Only
 files under wtl-rs/ belong to this work.
 
+## Multi-machine JSON labs (2026-10-23, in progress)
+
+Goal: N-machine labs described by typed JSON (`labs/<name>.json` = the lab, `<app>.json` = a
+run), alongside the existing 2-machine `.conf` path. Host: <=3 VMs at once (1 DC + 2 clients).
+
+- **Part 1 done**: `src/labdef.rs` has the typed serde structs for both files
+  (`deny_unknown_fields`), validation with clear errors before boot (unknown machine/user
+  names, not exactly one DC, duplicate IPs, reserved/duplicate mount letters, bad script
+  extensions, `as`-defaults-to-logon on a machine with no logon user), and defaults
+  (role=member, DC .10 / members .20,.21,... in order, mem 4096/DC 3072, cpus 2).
+  `LabDef`/`RunDef` are the raw shapes; `resolve()` returns `Lab`/`Run` for the runner.
+  `src/schema.rs` + `wtl-rs schema [DIR]` write the JSON Schema (schemars, draft-07) to
+  `wtl-rs/schema/{lab,run}.schema.json`. 9 unit tests. Decision: **two front-ends sharing one
+  set of plumbing** — `.conf` keeps the old `labconf`+`lab.rs` dc/client path byte-for-byte
+  (all 13 fake_lab + 13 labconf tests pass unchanged); JSON routes to a new N-machine runner
+  (next). Verified multicast LAN (`-netdev dgram` one group) joins 3 VMs with no root on this
+  host (target/tmp/mcast-test.sh).
+- New crates: `indexmap` (machines/users keep JSON order for IP defaults), `schemars`.
+
 ## Next
 
 - The user tries it and switches `~/.local/bin/lab` to target/release/wtl-rs. Until then the
