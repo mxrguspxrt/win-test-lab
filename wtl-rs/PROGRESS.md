@@ -57,6 +57,11 @@ run), alongside the existing 2-machine `.conf` path. Host: <=3 VMs at once (1 DC
   (next). Verified multicast LAN (`-netdev dgram` one group) joins 3 VMs with no root on this
   host (target/tmp/mcast-test.sh).
 - New crates: `indexmap` (machines/users keep JSON order for IP defaults), `schemars`.
+- **Part 2 done**: `labdef::lab_from_conf` (bash vars from a `labs/*.conf` -> `LabDef`: DC +
+  one member logged on as LAB_USER, LAB_ADMIN_USER -> a Domain Admins user) and
+  `labdef::run_from_conf` (old `labconf::RunConfig` -> `RunDef`: `run_as_admin` -> `as system`,
+  `run_as_student` -> the member's logon user, every step `on all`). Both feed the same
+  `resolve()`. 2 unit tests. The live `.conf` run still uses labconf + lab.rs unchanged.
 
 ## Next
 
