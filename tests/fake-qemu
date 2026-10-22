@@ -1,0 +1,980 @@
+#!/usr/bin/env python3
+"""fake-qemu - stand-in for qemu-system-x86_64 used by tests/run-tests.sh.
+
+It parses the subset of the qemu command line used by the host scripts, serves a
+minimal QMP, and simulates the guest by inspecting the attached ISOs:
+
+  * WTL_JOB ISO (JOB.JSON + PAYLOAD.ZIP)  -> simulates guest/agent.ps1:
+      AGENT_START, JOB_WAIT, JOB_FOUND, COPIED, EXTRACTED, LAUNCHED, READY/PROC_EXIT
+    and runs a python version of the demo line protocol on each hostfwd host port.
+    A "fake-behavior.json" in the zip changes the program behaviour:
+      {"mode":"crash","code":3}  PROC_EXIT before READY
+      {"mode":"hang"}            never listens (READY never comes)
+      {"mode":"wrong"}           listens, but answers the protocol wrongly
+      {"mode":"normal","delay":S} listen after S extra seconds
+  * WTL_BUILD ISO (autounattend.xml)      -> simulates the unattended build:
+      checks the XML parses and has no @PLACEHOLDER@ left, writes to the disk image,
+      emits WU_ROUND lines (unless build.json updates=false), BUILD_DONE, exits 0.
+  * anything else                         -> silent; runs until killed / quit.
+
+Environment:
+  FAKE_QEMU_SPEED         delay multiplier (default 1 = each step ~0.1-0.5 s; 0 = instant;
+                          10 = ten times slower)
+  FAKE_QEMU_LOG           append one JSON line per invocation {"pid","cwd","argv"}
+  FAKE_QEMU_PIDDIR        write an empty file <pid> there while alive (leak tracking)
+  FAKE_QEMU_MAX_LIFETIME  hard self-exit after N seconds (default 3600)
+  FAKE_QEMU_BUILD_FAIL    if set, the build simulation emits BUILD_FAIL with that text
+Stdlib only, python 3.8+.
+"""
+import json
+import os
+import random
+import re
+import select
+import signal
+import socket
+import struct
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import xml.etree.ElementTree as ET
+import zipfile
+import zlib
+import shutil
+
+PROG = "qemu-system-x86_64"
+SPEED = float(os.environ.get("FAKE_QEMU_SPEED", "1") or "1")
+
+OS_TABLE = {
+    "2012": ("Microsoft Windows Server 2012 R2 Standard Evaluation", 9600),
+    "2016": ("Microsoft Windows Server 2016 Standard Evaluation", 14393),
+    "2019": ("Microsoft Windows Server 2019 Standard Evaluation", 17763),
+    "2022": ("Microsoft Windows Server 2022 Standard Evaluation", 20348),
+    "2025": ("Microsoft Windows Server 2025 Standard Evaluation", 26100),
+}
+
+NO_ARG_OPTS = {
+    "-daemonize", "-enable-kvm", "-no-reboot", "-no-shutdown", "-nographic", "-snapshot",
+    "-S", "-no-hpet", "-no-acpi", "-no-user-config", "-nodefaults", "-full-screen",
+    "-qmp-pretty", "-s", "-old-param", "-usb", "-no-frame", "-alt-grab", "-ctrl-grab",
+    "-no-quit", "-nodefconfig", "-no-kvm", "-no-kvm-irqchip", "-semihosting", "-singlestep",
+    "-preconfig", "-enable-sync-profile", "-msg-timestamp", "-only-migratable", "-no-fd-bootchk", "-win2k-hack",
+}
+
+
+def die(msg, code=1):
+    sys.stderr.write("%s: %s\n" % (PROG, msg))
+    sys.stderr.flush()
+    os._exit(code)
+
+
+def delay(sec):
+    if SPEED > 0 and sec > 0:
+        time.sleep(sec * SPEED)
+
+
+def split_opts(s):
+    """Split a qemu option string on ',' honouring ',,' escapes."""
+    parts, cur, i = [], "", 0
+    while i < len(s):
+        c = s[i]
+        if c == "," and i + 1 < len(s) and s[i + 1] == ",":
+            cur += ","
+            i += 2
+            continue
+        if c == ",":
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += c
+        i += 1
+    parts.append(cur)
+    return parts
+
+
+def kv(s, first_key=None):
+    d = {}
+    for n, p in enumerate(split_opts(s)):
+        if "=" in p:
+            k, v = p.split("=", 1)
+            d[k] = v
+        elif n == 0 and first_key:
+            d[first_key] = p
+        else:
+            d[p] = "on"
+    return d
+
+
+# --------------------------------------------------------------------------- args
+
+class Config:
+    def __init__(self):
+        self.drives = []         # dicts: file, media, format, readonly
+        self.serial = None       # path
+        self.qmp = None          # unix socket path
+        self.hostfwd = []        # (host_addr, host_port, guest_port)
+        self.daemonize = False
+        self.pidfile = None
+        self.name = None
+        self.display = None
+        self.vnc = None
+        self.chardevs = {}       # id -> dict
+        self.serial_chardev = None
+        self.mon_chardevs = []
+        self.boot = None
+
+
+def parse_args(argv):
+    cfg = Config()
+    i = 0
+    args = argv[1:]
+    while i < len(args):
+        a = args[i]
+        if a in ("-version", "--version"):
+            print("QEMU emulator version 8.2.2 (fake-qemu)\nCopyright (c) 2003-2023 Fabrice Bellard and the QEMU Project developers")
+            sys.exit(0)
+        if a in ("-h", "-help", "--help"):
+            print("usage: fake-qemu [options] (test stand-in for qemu-system-x86_64)")
+            sys.exit(0)
+        if not a.startswith("-"):
+            cfg.drives.append({"file": a, "media": "disk"})
+            i += 1
+            continue
+        opt = a if not a.startswith("--") else a[1:]
+        if opt in NO_ARG_OPTS:
+            if opt == "-daemonize":
+                cfg.daemonize = True
+            i += 1
+            continue
+        if i + 1 >= len(args):
+            die("%s: requires an argument" % a)
+        val = args[i + 1]
+        i += 2
+        if val == "help" or val.endswith(",help") or val == "?":
+            print("fake-qemu: help for %s not available" % opt)
+            sys.exit(0)
+        if opt == "-drive":
+            d = kv(val)
+            if "file" in d:
+                cfg.drives.append({"file": d["file"], "media": d.get("media", "disk"),
+                                   "format": d.get("format"), "readonly": d.get("readonly")})
+        elif opt == "-blockdev":
+            d = kv(val)
+            if "filename" in d:
+                cfg.drives.append({"file": d["filename"], "media": "cdrom" if d["filename"].lower().endswith(".iso") else "disk",
+                                   "format": None, "readonly": d.get("read-only")})
+        elif opt == "-cdrom":
+            cfg.drives.append({"file": val, "media": "cdrom"})
+        elif opt in ("-hda", "-hdb", "-hdc", "-hdd"):
+            cfg.drives.append({"file": val, "media": "disk"})
+        elif opt == "-serial":
+            if val.startswith("file:"):
+                cfg.serial = val[5:]
+            elif val.startswith("chardev:"):
+                cfg.serial_chardev = val[8:]
+        elif opt == "-chardev":
+            d = kv(val, first_key="backend")
+            if "id" in d:
+                cfg.chardevs[d["id"]] = d
+        elif opt == "-device":
+            d = kv(val, first_key="driver")
+            if d.get("driver") == "isa-serial" and "chardev" in d:
+                cfg.serial_chardev = d["chardev"]
+        elif opt == "-mon":
+            d = kv(val)
+            if d.get("mode", "readline") == "control" and "chardev" in d:
+                cfg.mon_chardevs.append(d["chardev"])
+        elif opt == "-qmp":
+            if val.startswith("unix:"):
+                cfg.qmp = split_opts(val[5:])[0]
+        elif opt in ("-netdev", "-nic", "-net"):
+            for m in re.finditer(r"hostfwd=tcp:([^:,]*):(\d+)-([^:,]*):(\d+)", val):
+                cfg.hostfwd.append((m.group(1) or "0.0.0.0", int(m.group(2)), int(m.group(4))))
+        elif opt == "-pidfile":
+            cfg.pidfile = val
+        elif opt == "-name":
+            cfg.name = kv(val, first_key="guest").get("guest", val)
+        elif opt == "-display":
+            cfg.display = val
+        elif opt == "-vnc":
+            cfg.vnc = val
+        elif opt == "-boot":
+            cfg.boot = val
+        # everything else (-m, -smp, -machine, -cpu, -rtc, -usb, ...) ignored
+    # resolve chardev forms
+    if cfg.serial is None and cfg.serial_chardev and cfg.serial_chardev in cfg.chardevs:
+        cd = cfg.chardevs[cfg.serial_chardev]
+        if cd.get("backend") == "file" and "path" in cd:
+            cfg.serial = cd["path"]
+    if cfg.qmp is None:
+        for cid in cfg.mon_chardevs:
+            cd = cfg.chardevs.get(cid, {})
+            if cd.get("backend") == "socket" and "path" in cd:
+                cfg.qmp = cd["path"]
+                break
+    return cfg
+
+
+# --------------------------------------------------------------------------- ISO9660 / Joliet
+
+class IsoReader:
+    """Tiny ISO9660 + Joliet reader (no UDF; enough for mkiso.py output)."""
+
+    def __init__(self, path):
+        self.path = path
+        self.f = open(path, "rb")
+        self.volid = ""
+        self.files = {}   # lowercase path -> (lba, size, real path)
+        pvd = joliet = None
+        for sec in range(16, 64):
+            self.f.seek(sec * 2048)
+            vd = self.f.read(2048)
+            if len(vd) < 2048 or vd[1:6] != b"CD001":
+                break
+            t = vd[0]
+            if t == 1 and pvd is None:
+                pvd = vd
+            elif t == 2 and vd[88:91] in (b"%/@", b"%/C", b"%/E"):
+                joliet = vd
+            elif t == 255:
+                break
+        if pvd is None and joliet is None:
+            raise ValueError("not an ISO9660 image")
+        if pvd is not None:
+            self.volid = pvd[40:72].decode("ascii", "replace").strip()
+        use = joliet if joliet is not None else pvd
+        if not self.volid and joliet is not None:
+            self.volid = joliet[40:72].decode("utf-16-be", "replace").strip()
+        self._walk(use[156:190], joliet is not None, "", 0, set())
+
+    def _walk(self, rec, joliet, prefix, depth, seen):
+        lba = struct.unpack("<I", rec[2:6])[0]
+        size = struct.unpack("<I", rec[10:14])[0]
+        if depth > 16 or lba in seen:
+            return
+        seen.add(lba)
+        self.f.seek(lba * 2048)
+        data = self.f.read(size)
+        pos = 0
+        while pos < len(data):
+            ln = data[pos]
+            if ln == 0:
+                pos = (pos // 2048 + 1) * 2048
+                continue
+            r = data[pos:pos + ln]
+            pos += ln
+            if len(r) < 34:
+                break
+            nl = r[32]
+            raw = r[33:33 + nl]
+            if raw in (b"\x00", b"\x01"):
+                continue
+            name = raw.decode("utf-16-be" if joliet else "ascii", "replace")
+            name = name.split(";")[0]
+            if not joliet:
+                name = name.rstrip(".")
+            full = prefix + name
+            if r[25] & 2:
+                self._walk(r, joliet, full + "/", depth + 1, seen)
+            else:
+                self.files[full.lower()] = (struct.unpack("<I", r[2:6])[0],
+                                            struct.unpack("<I", r[10:14])[0], full)
+
+    def has(self, path):
+        return path.lower().strip("/") in self.files
+
+    def read(self, path):
+        lba, size, _ = self.files[path.lower().strip("/")]
+        self.f.seek(lba * 2048)
+        return self.f.read(size)
+
+
+def classify_iso(path):
+    """-> ('job'|'build'|'install'|'unknown', IsoReader or None)"""
+    try:
+        iso = IsoReader(path)
+    except Exception:
+        # fallback: raw scan (cannot extract, just classify for the log)
+        try:
+            with open(path, "rb") as f:
+                blob = f.read(8 * 1024 * 1024)
+        except OSError:
+            return "unknown", None
+        if b"JOB.JSON" in blob or b"WTL_JOB" in blob:
+            log("job-like ISO %s is not readable as ISO9660; no simulation" % path)
+        return "unknown", None
+    vol = iso.volid.upper()
+    if iso.has("JOB.JSON") and iso.has("PAYLOAD.ZIP"):
+        return "job", iso
+    if iso.has("autounattend.xml"):
+        return "build", iso
+    if iso.has("sources/install.wim") or iso.has("sources/install.esd"):
+        return "install", iso
+    if vol in ("WTL_JOB", "WTL_BUILD"):
+        log("ISO %s has volid %s but lacks expected files: %s" % (path, vol, sorted(iso.files)))
+    return "unknown", iso
+
+
+# --------------------------------------------------------------------------- misc helpers
+
+_log_lock = threading.Lock()
+
+
+def log(msg):
+    p = os.environ.get("FAKE_QEMU_LOG")
+    if not p:
+        return
+    try:
+        with _log_lock, open(p, "a") as f:
+            f.write(json.dumps({"pid": os.getpid(), "t": round(time.time(), 3), "msg": msg}) + "\n")
+    except OSError:
+        pass
+
+
+def png_bytes(w=64, h=48):
+    rows = b""
+    for y in range(h):
+        row = b"\x00"
+        for x in range(w):
+            row += bytes((0, 0x5a + y, 0x9e + (x // 2))) if y > 6 else b"\xc0\xc0\xc0"
+        rows += row
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+def ppm_bytes(w=64, h=48):
+    return b"P6\n%d %d\n255\n" % (w, h) + bytes((0, 0x5a, 0x9e)) * (w * h)
+
+
+def qcow2_backing(path):
+    try:
+        with open(path, "rb") as f:
+            hdr = f.read(32)
+            if hdr[:4] != b"QFI\xfb":
+                return None
+            off = struct.unpack(">Q", hdr[8:16])[0]
+            ln = struct.unpack(">I", hdr[16:20])[0]
+            if off == 0 or ln == 0 or ln > 4096:
+                return None
+            f.seek(off)
+            return f.read(ln).decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
+def rst_close(c):
+    try:
+        c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    except OSError:
+        pass
+    try:
+        c.close()
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- machine
+
+class Machine:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.stop = threading.Event()
+        self.exit_code = 0
+        self.serial_lock = threading.Lock()
+        self.serial_f = None
+        self.listening = {}          # guest port -> behaviour mode
+        self.caption = "Microsoft Windows Server"
+        self.tmpdir = None
+        self.fwd_socks = []
+        self.qmp_sock = None
+        self.os_key = None
+
+    # ---- serial
+    def raw(self, line):
+        if self.serial_f is None:
+            return
+        with self.serial_lock:
+            try:
+                self.serial_f.write((line + "\r\n").encode("utf-8"))
+                self.serial_f.flush()
+            except (OSError, ValueError):
+                pass
+
+    def ev(self, event, text=None, **kw):
+        s = "WTL " + event
+        for k, v in kw.items():
+            s += " %s=%s" % (k, urllib.parse.quote(str(v), safe=":\\/.-_,"))
+        if text is not None:
+            s += " | " + text
+        self.raw(s)
+
+    def shutdown(self, code=0, after=0.0):
+        def go():
+            if after:
+                time.sleep(after)
+            self.exit_code = code
+            self.stop.set()
+        threading.Thread(target=go, daemon=True).start()
+
+    # ---- setup
+    def setup(self):
+        cfg = self.cfg
+        for d in cfg.drives:
+            if not os.path.exists(d["file"]):
+                die("-drive file=%s: Could not open '%s': No such file or directory" % (d["file"], d["file"]))
+            if d.get("format") == "qcow2":
+                with open(d["file"], "rb") as f:
+                    if f.read(4) != b"QFI\xfb":
+                        die("-drive file=%s: Image is not in qcow2 format" % d["file"])
+        for host, hport, gport in cfg.hostfwd:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((host if host else "0.0.0.0", hport))
+                s.listen(8)
+            except OSError as e:
+                die("Could not set up host forwarding rule 'tcp:%s:%d-:%d' (%s)" % (host, hport, gport, e))
+            self.fwd_socks.append((s, gport))
+        if cfg.serial:
+            try:
+                self.serial_f = open(cfg.serial, "wb")
+            except OSError as e:
+                die("-serial file:%s: Could not open '%s': %s" % (cfg.serial, cfg.serial, e.strerror))
+        if cfg.qmp:
+            try:
+                os.unlink(cfg.qmp)
+            except OSError:
+                pass
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                s.bind(cfg.qmp)
+                s.listen(4)
+            except OSError as e:
+                die("-qmp unix:%s: Failed to bind socket: %s" % (cfg.qmp, e.strerror))
+            self.qmp_sock = s
+        if cfg.pidfile:
+            with open(cfg.pidfile, "w") as f:
+                f.write("%d\n" % os.getpid())
+        piddir = os.environ.get("FAKE_QEMU_PIDDIR")
+        if piddir:
+            try:
+                open(os.path.join(piddir, str(os.getpid())), "w").close()
+            except OSError:
+                pass
+        # guess os from the disk's backing file (overlay -> images/<os>.qcow2)
+        for d in cfg.drives:
+            if d.get("media") == "cdrom" or d["file"].lower().endswith(".iso"):
+                continue
+            cand = [qcow2_backing(d["file"]) or "", d["file"]]
+            for c in cand:
+                stem = os.path.basename(c).split(".")[0]
+                if stem in OS_TABLE:
+                    self.os_key = stem
+                    break
+            if self.os_key:
+                break
+
+    def cleanup(self):
+        for s, _ in self.fwd_socks:
+            try:
+                s.close()
+            except OSError:
+                pass
+        if self.qmp_sock is not None:
+            try:
+                self.qmp_sock.close()
+                os.unlink(self.cfg.qmp)
+            except OSError:
+                pass
+        if self.cfg.pidfile:
+            try:
+                os.unlink(self.cfg.pidfile)
+            except OSError:
+                pass
+        piddir = os.environ.get("FAKE_QEMU_PIDDIR")
+        if piddir:
+            try:
+                os.unlink(os.path.join(piddir, str(os.getpid())))
+            except OSError:
+                pass
+        if self.tmpdir:
+            shutil.rmtree(self.tmpdir, ignore_errors=True)
+        if self.serial_f:
+            try:
+                self.serial_f.close()
+            except OSError:
+                pass
+
+    # ---- QMP
+    def qmp_loop(self):
+        while not self.stop.is_set():
+            try:
+                r, _, _ = select.select([self.qmp_sock], [], [], 0.2)
+                if not r:
+                    continue
+                c, _ = self.qmp_sock.accept()
+            except (OSError, ValueError):
+                return
+            threading.Thread(target=self.qmp_conn, args=(c,), daemon=True).start()
+
+    def qmp_conn(self, c):
+        def send(obj):
+            c.sendall((json.dumps(obj) + "\r\n").encode())
+
+        def event(name, data=None):
+            t = time.time()
+            send({"event": name, "data": data or {},
+                  "timestamp": {"seconds": int(t), "microseconds": int((t % 1) * 1e6)}})
+        try:
+            send({"QMP": {"version": {"qemu": {"micro": 2, "minor": 2, "major": 8}, "package": "fake-qemu"},
+                          "capabilities": ["oob"]}})
+            negotiated = False
+            buf = ""
+            dec = json.JSONDecoder()
+            while not self.stop.is_set():
+                r, _, _ = select.select([c], [], [], 0.2)
+                if not r:
+                    continue
+                data = c.recv(65536)
+                if not data:
+                    return
+                buf += data.decode("utf-8", "replace")
+                while True:
+                    buf = buf.lstrip()
+                    if not buf:
+                        break
+                    try:
+                        cmd, end = dec.raw_decode(buf)
+                    except ValueError:
+                        break
+                    buf = buf[end:]
+                    if not isinstance(cmd, dict) or "execute" not in cmd:
+                        send({"error": {"class": "GenericError", "desc": "QMP input must be a JSON object with 'execute'"}})
+                        continue
+                    name = cmd["execute"]
+                    args = cmd.get("arguments") or {}
+                    rid = {"id": cmd["id"]} if "id" in cmd else {}
+                    log("qmp %s %s" % (name, json.dumps(args)))
+                    if not negotiated and name != "qmp_capabilities":
+                        send(dict({"error": {"class": "CommandNotFound",
+                                             "desc": "Expecting capabilities negotiation with 'qmp_capabilities'"}}, **rid))
+                        continue
+                    if name == "qmp_capabilities":
+                        negotiated = True
+                        send(dict({"return": {}}, **rid))
+                    elif name == "query-status":
+                        send(dict({"return": {"status": "running", "singlestep": False, "running": True}}, **rid))
+                    elif name == "query-version":
+                        send(dict({"return": {"qemu": {"micro": 2, "minor": 2, "major": 8}, "package": "fake-qemu"}}, **rid))
+                    elif name == "screendump":
+                        fn = args.get("filename")
+                        fmt = args.get("format", "ppm")
+                        if not fn:
+                            send(dict({"error": {"class": "GenericError", "desc": "Parameter 'filename' is missing"}}, **rid))
+                            continue
+                        if fmt not in ("png", "ppm"):
+                            send(dict({"error": {"class": "GenericError", "desc": "Parameter 'format' does not accept value '%s'" % fmt}}, **rid))
+                            continue
+                        try:
+                            with open(fn, "wb") as f:
+                                f.write(png_bytes() if fmt == "png" else ppm_bytes())
+                            send(dict({"return": {}}, **rid))
+                        except OSError as e:
+                            send(dict({"error": {"class": "GenericError", "desc": "failed to open file '%s': %s" % (fn, e.strerror)}}, **rid))
+                    elif name == "system_powerdown":
+                        send(dict({"return": {}}, **rid))
+                        event("POWERDOWN")
+                        delay(0.5)
+                        event("SHUTDOWN", {"guest": True, "reason": "guest-shutdown"})
+                        self.shutdown(0)
+                    elif name == "quit":
+                        send(dict({"return": {}}, **rid))
+                        event("SHUTDOWN", {"guest": False, "reason": "host-qmp-quit"})
+                        self.shutdown(0)
+                    elif name in ("system_reset", "cont", "stop", "send-key", "input-send-event"):
+                        send(dict({"return": {}}, **rid))
+                    elif name == "human-monitor-command":
+                        send(dict({"return": ""}, **rid))
+                    else:
+                        send(dict({"error": {"class": "CommandNotFound", "desc": "The command %s has not been found" % name}}, **rid))
+        except OSError:
+            pass
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+
+    # ---- port forwards (slirp-like: accept, close at once if guest not listening)
+    def fwd_loop(self, s, gport):
+        while not self.stop.is_set():
+            try:
+                r, _, _ = select.select([s], [], [], 0.2)
+                if not r:
+                    continue
+                c, _ = s.accept()
+            except (OSError, ValueError):
+                return
+            mode = self.listening.get(gport)
+            if mode is None:
+                rst_close(c)   # guest not listening: drop at once (no TIME_WAIT on host port)
+                continue
+            threading.Thread(target=self.demo_conn, args=(c, mode), daemon=True).start()
+
+    def demo_conn(self, c, mode):
+        wrong = mode == "wrong"
+        try:
+            c.settimeout(None)
+            f = c.makefile("rwb")
+
+            def out(line):
+                f.write((line + "\r\n").encode("utf-8"))
+                f.flush()
+            out("HELLO wtl-demo os=%s" % self.caption)
+            while not self.stop.is_set():
+                line = f.readline()
+                if not line:
+                    break
+                line = line.decode("utf-8", "replace").strip()
+                if line == "PING":
+                    out("PANG" if wrong else "PONG")
+                elif line == "BYE":
+                    out("BYE")
+                    # let the client close first so the host port is not left in TIME_WAIT
+                    c.settimeout(3)
+                    try:
+                        while c.recv(4096):
+                            pass
+                    except OSError:
+                        pass
+                    break
+                elif line == "ECHO" or line.startswith("ECHO "):
+                    t = line[5:]
+                    out(t[::-1] + "!" if wrong else t)
+                elif line.startswith("ADD "):
+                    p = line[4:].split()
+                    try:
+                        out(str(int(p[0]) + int(p[1]) + (1 if wrong else 0)) if len(p) == 2 else "ERR bad numbers")
+                    except ValueError:
+                        out("ERR bad numbers")
+                else:
+                    out("ERR unknown command")
+        except OSError:
+            pass
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+
+    # ---- guest simulations
+    def guest(self):
+        try:
+            isos = {"job": [], "build": [], "install": [], "unknown": []}
+            for d in self.cfg.drives:
+                if d.get("media") == "cdrom" or d["file"].lower().endswith(".iso"):
+                    kind, iso = classify_iso(d["file"])
+                    log("iso %s -> %s" % (d["file"], kind))
+                    isos[kind].append(iso)
+            if isos["build"]:
+                self.sim_build(isos["build"][0], isos["install"])
+            elif isos["job"]:
+                self.sim_job(isos["job"][0])
+            else:
+                log("no WTL ISO attached; idle")
+        except Exception as e:  # never die silently in a way that looks like a guest event
+            log("guest simulation crashed: %r" % e)
+            self.raw("fake-qemu: internal error: %r" % e)
+
+    def sim_build(self, iso, installs):
+        delay(0.3)
+        self.raw("fake-qemu: booting Windows Setup (simulated)")
+        if not installs:
+            self.ev("BUILD_FAIL", "fake-qemu: no install media (sources/install.wim) attached")
+            return
+        try:
+            xml = iso.read("autounattend.xml")
+            ET.fromstring(xml)
+        except Exception as e:
+            self.ev("BUILD_FAIL", "fake-qemu: autounattend.xml does not parse: %s" % e)
+            return
+        text = xml.decode("utf-8", "replace")
+        left = sorted(set(re.findall(r"@[A-Z][A-Z0-9_]*@", text)))
+        if left:
+            self.ev("BUILD_FAIL", "fake-qemu: unrendered placeholders in autounattend.xml: %s" % " ".join(left))
+            return
+        updates = True
+        bj = None
+        for p in ("WTL/build.json", "build.json"):
+            if iso.has(p):
+                bj = p
+        if bj:
+            try:
+                info = json.loads(iso.read(bj).decode("utf-8-sig"))
+                updates = bool(info.get("updates", True))
+                if info.get("os") in OS_TABLE:
+                    self.os_key = info["os"]
+            except Exception as e:
+                self.ev("BUILD_FAIL", "fake-qemu: build.json invalid: %s" % e)
+                return
+        else:
+            self.ev("BUILD_FAIL", "fake-qemu: WTL/build.json missing on unattend ISO")
+            return
+        if not iso.has("WTL/setup.ps1"):
+            self.ev("BUILD_FAIL", "fake-qemu: WTL/setup.ps1 missing on unattend ISO")
+            return
+        # "install" Windows: write to the disk image(s)
+        delay(0.5)
+        for d in self.cfg.drives:
+            if d.get("media") == "cdrom" or d["file"].lower().endswith(".iso"):
+                continue
+            try:
+                with open(d["file"], "ab") as f:
+                    f.write(b"FAKE-WINDOWS-INSTALL\0" * 3000)
+            except OSError as e:
+                log("disk write failed: %s" % e)
+        self.raw("fake-qemu: setup complete, first logon")
+        if self.os_key:
+            cap, build = OS_TABLE[self.os_key]
+            self.ev("LOG", "setup.ps1 started on %s build %d" % (cap, build))
+        else:
+            self.ev("LOG", "setup.ps1 started")
+        if os.environ.get("FAKE_QEMU_BUILD_FAIL"):
+            delay(0.3)
+            self.ev("BUILD_FAIL", os.environ["FAKE_QEMU_BUILD_FAIL"])
+            return
+        if updates:
+            for n, (found, inst, rb) in enumerate([(5, 5, "true"), (1, 1, "false"), (0, 0, "false"), (0, 0, "false")], 1):
+                delay(0.4)
+                self.raw("WTL WU_ROUND %d found=%d installed=%d reboot=%s" % (n, found, inst, rb))
+        else:
+            self.ev("LOG", "Windows Update skipped (updates=false)")
+        delay(0.3)
+        self.ev("BUILD_DONE")
+        delay(0.5)
+        self.raw("fake-qemu: guest powered off")
+        self.shutdown(0)
+
+    def sim_job(self, iso):
+        cap, build = OS_TABLE.get(self.os_key, ("Microsoft Windows Server", 0))
+        self.caption = cap
+        delay(1.0)
+        self.raw("fake-qemu: guest booted, Administrator logged on")
+        self.ev("AGENT_START", os=cap, build=build)
+        self.ev("JOB_WAIT")
+        delay(0.3)
+        try:
+            job = json.loads(iso.read("JOB.JSON").decode("utf-8-sig"))
+        except Exception as e:
+            self.ev("ERROR", "cannot parse JOB.JSON: %s" % e)
+            return
+        self.ev("JOB_FOUND", drive="D:")
+        zip_name = job.get("zip_name") or "program.zip"
+        desk = "C:\\Users\\Administrator\\Desktop"
+        self.tmpdir = tempfile.mkdtemp(prefix="fake-qemu-desktop-")
+        zpath = os.path.join(self.tmpdir, zip_name)
+        with open(zpath, "wb") as f:
+            f.write(iso.read("PAYLOAD.ZIP"))
+        self.ev("COPIED", path="%s\\%s" % (desk, zip_name))
+        stem = os.path.splitext(zip_name)[0]
+        xdir = os.path.join(self.tmpdir, stem)
+        try:
+            with zipfile.ZipFile(zpath) as z:
+                for n in z.namelist():
+                    p = os.path.normpath(n.replace("\\", "/"))
+                    if p.startswith("..") or os.path.isabs(p):
+                        raise ValueError("unsafe path in zip: %s" % n)
+                z.extractall(xdir)
+        except Exception as e:
+            self.ev("ERROR", "extract failed: %s" % e)
+            return
+        self.ev("EXTRACTED", dir="%s\\%s" % (desk, stem))
+        delay(0.2)
+        exe = job.get("exe") or ""
+        found = self.resolve_exe(xdir, exe)
+        if not found:
+            self.ev("LAUNCH_FAIL", "exe not found in zip: %s" % exe)
+            return
+        rel = os.path.relpath(found, xdir).replace("/", "\\")
+        # decide behaviour
+        mode, spec = "idle", {}
+        names = set()
+        for root, _, fs in os.walk(xdir):
+            for fn in fs:
+                names.add(fn.lower())
+                if fn.lower() == "fake-behavior.json":
+                    try:
+                        with open(os.path.join(root, fn)) as fh:
+                            spec = json.load(fh)
+                    except Exception as e:
+                        log("bad fake-behavior.json: %s" % e)
+        if spec:
+            mode = spec.get("mode", "normal")
+        elif "echo-server.ps1" in names or "program.bat" in names:
+            mode = "normal"
+        pid = 1000 + random.randint(0, 8000) * 4
+        if job.get("mode") == "exit":
+            self.sim_exit(job, spec, pid, "%s\\%s\\%s" % (desk, stem, rel))
+            return
+        self.ev("LAUNCHED", pid=pid, exe="%s\\%s\\%s" % (desk, stem, rel))
+        log("program mode=%s spec=%s args=%r" % (mode, spec, job.get("args")))
+        gport = 5000
+        a = str(job.get("args") or "").split()
+        if a and a[0].isdigit():
+            gport = int(a[0])
+        if mode == "crash":
+            delay(0.5)
+            self.ev("PROC_EXIT", code=int(spec.get("code", 1)))
+            return
+        if mode in ("normal", "wrong"):
+            def start():
+                time.sleep(float(spec.get("delay", 0)))
+                delay(0.5)
+                self.listening[gport] = mode
+            threading.Thread(target=start, daemon=True).start()
+        if mode == "idle":
+            self.ev("LOG", "fake-qemu: no simulation for this program; it runs silently")
+        wait_ports = job.get("wait_ports") or []
+        timeout = float(job.get("timeout") or 900)
+        if not wait_ports:
+            delay(1.0)
+            self.ev("READY")
+            return
+        t0 = time.time()
+        for p in wait_ports:
+            p = int(p)
+            while p not in self.listening:
+                if self.stop.is_set():
+                    return
+                if time.time() - t0 > timeout:
+                    self.ev("ERROR", "port %d not listening after %ds" % (p, timeout))
+                    return
+                time.sleep(0.1)
+            self.ev("READY", port=p)
+
+    def sim_exit(self, job, spec, pid, exe):
+        """exit mode: like agent.ps1 Invoke-RunToExit. fake-behavior.json keys:
+        stdout, stderr (text), code (int), sleep (seconds the 'program' runs)."""
+        import base64
+        self.ev("LAUNCHED", pid=pid, exe=exe, mode="exit")
+        run_for = float(spec.get("sleep", 0.3))
+        limit = float(job.get("timeout") or 300)
+        timed_out = run_for > limit
+        t0 = time.time()
+        while time.time() - t0 < min(run_for, limit):
+            if self.stop.is_set():
+                return
+            time.sleep(0.1)
+        default_out = "fake program %s args=%s\r\n" % (job.get("exe"), job.get("args") or "")
+        for name, text in (("stdout", spec.get("stdout", default_out)), ("stderr", spec.get("stderr", ""))):
+            data = text.encode("utf-8")
+            seq = 0
+            for off in range(0, len(data), 768):
+                self.ev("OUTPUT", base64.b64encode(data[off:off + 768]).decode("ascii"), stream=name, seq=seq)
+                seq += 1
+            self.ev("OUTPUT_END", stream=name, bytes=len(data), sent=len(data), truncated=0)
+        secs = round(time.time() - t0, 1)
+        if timed_out:
+            self.ev("PROC_TIMEOUT", "program still running at the deadline, killed", secs=secs)
+        else:
+            self.ev("PROC_EXIT", code=int(spec.get("code", 0)), secs=secs)
+
+    @staticmethod
+    def resolve_exe(xdir, exe):
+        rel = exe.replace("\\", "/").strip("/")
+        if rel:
+            cur = xdir
+            ok = True
+            for part in rel.split("/"):
+                try:
+                    match = [e for e in sorted(os.listdir(cur)) if e.lower() == part.lower()]
+                except OSError:
+                    match = []
+                if not match:
+                    ok = False
+                    break
+                cur = os.path.join(cur, match[0])
+            if ok and os.path.isfile(cur):
+                return cur
+        base = os.path.basename(rel).lower()
+        if not base:
+            return None
+        for root, dirs, files in os.walk(xdir):
+            dirs.sort()
+            for fn in sorted(files):
+                if fn.lower() == base:
+                    return os.path.join(root, fn)
+        return None
+
+
+def main():
+    argv = sys.argv
+    lp = os.environ.get("FAKE_QEMU_LOG")
+    if lp:
+        try:
+            with open(lp, "a") as f:
+                f.write(json.dumps({"pid": os.getpid(), "cwd": os.getcwd(), "argv": argv}) + "\n")
+        except OSError:
+            pass
+    cfg = parse_args(argv)
+
+    rpipe = None
+    if cfg.daemonize:
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid > 0:
+            os.close(w)
+            st = os.read(r, 1)
+            os._exit(0 if st == b"0" else 1)
+        os.close(r)
+        os.setsid()
+        rpipe = w
+
+    m = Machine(cfg)
+    try:
+        m.setup()
+    except SystemExit:
+        raise
+    if rpipe is not None:
+        os.write(rpipe, b"0")
+        os.close(rpipe)
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+
+    def on_sig(sig, frm):
+        try:
+            sys.stderr.write("%s: terminating on signal %d\n" % (PROG, sig))
+        except Exception:
+            pass
+        m.exit_code = 0
+        m.stop.set()
+    signal.signal(signal.SIGTERM, on_sig)
+    signal.signal(signal.SIGINT, on_sig)
+    signal.signal(signal.SIGHUP, on_sig)
+
+    if m.qmp_sock is not None:
+        threading.Thread(target=m.qmp_loop, daemon=True).start()
+    for s, g in m.fwd_socks:
+        threading.Thread(target=m.fwd_loop, args=(s, g), daemon=True).start()
+    threading.Thread(target=m.guest, daemon=True).start()
+
+    deadline = time.time() + float(os.environ.get("FAKE_QEMU_MAX_LIFETIME", "3600"))
+    while not m.stop.wait(0.2):
+        if time.time() > deadline:
+            log("max lifetime reached, exiting")
+            break
+    log("exit code=%d" % m.exit_code)
+    m.cleanup()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(m.exit_code)
+
+
+if __name__ == "__main__":
+    main()
