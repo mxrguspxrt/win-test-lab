@@ -390,10 +390,150 @@ function Invoke-LabRun($Cfg) {
 
 # ---------------------------------------------------------------- entry
 
+# ================================================================ multi-machine labs (fmt=multi)
+#
+# A multi-machine lab is one DC + N domain-joined members on one private multicast LAN. The DC
+# role is as in the two-machine lab but creates every lab user; a member joins, sets its own
+# autologon user, and (on a run) runs the steps the host put on its control disc. A step's `as`
+# is "system" (the SYSTEM worker), "logon" (this machine's own logged-on user, foreground), or
+# "user" (another account, launched by the worker with its credentials). Each LAB_STEP carries
+# machine= so the host can tell the machines' reports apart.
+
+function Invoke-LabMemberSteps($Cfg) {
+    $run = $Cfg.run
+    $machine = [string]$Cfg.machine
+    if ($run -eq $null) { Send-WtlEvent 'LAB_RUN_DONE' @('machine', $machine, 'steps', 0) 'no run steps'; return 'done' }
+    $steps = @($run.steps | Where-Object { $_ })
+    $defWait = 60; if ($run.wait) { try { $defWait = [int]$run.wait } catch { } }
+
+    Set-LabMounts $run.mounts
+
+    $n = 0
+    foreach ($s in $steps) {
+        $n++
+        $stepWait = $defWait; if ($s.wait) { try { $stepWait = [int]$s.wait } catch { } }
+        [void](Invoke-LabMultiStep $Cfg $machine $n $s $stepWait)
+    }
+    Send-WtlEvent 'LAB_RUN_DONE' @('machine', $machine, 'steps', $n)
+    return 'done'
+}
+
+# Run one step on this machine. $S has: as (system|logon|user), user, password, path, args,
+# keep_running. Reports LAB_STEP machine=.. as=.. n=.. script=.. exit=.. [secs=..].
+function Invoke-LabMultiStep($Cfg, [string]$Machine, [int]$N, $S, [int]$TimeoutS) {
+    $as = [string]$S.as_
+    if (-not $as) { $as = [string]$S.'as' }   # defensive: ConvertFrom-Json key may be 'as_' or 'as'
+    $path = [string]$S.path
+    $argsLine = [string]$S.args
+    $keep = $false; if ($S.keep_running) { $keep = [bool]$S.keep_running }
+    $runDir = 'C:\WTL\run'
+    if (-not (Test-Path $runDir)) { New-Item -ItemType Directory -Path $runDir -Force | Out-Null }
+    $out = Join-Path $runDir ("step$N.out"); $err = Join-Path $runDir ("step$N.err")
+    $cwd = [System.IO.Path]::GetDirectoryName($path)
+    if (-not $cwd) { $cwd = ($path.Substring(0, 2) + '\') }
+
+    $req = @{ action = 'run'; path = $path; cwd = $cwd; timeout = $TimeoutS; out = $out; err = $err;
+              args = $argsLine; keep_running = $keep }
+    if ($as -eq 'user') {
+        $req['user'] = [string]$S.user
+        $req['password'] = [string]$S.password
+        $req['domain'] = [string]$Cfg.netbios
+    }
+
+    if ($as -eq 'logon') {
+        # run in this machine's own interactive session (the logged-on user)
+        $res = Invoke-LabStepForeground $N $path $argsLine $cwd $out $err $TimeoutS $keep
+    } else {
+        # 'system' or 'user': the SYSTEM worker runs it
+        $res = Invoke-SvcRequest $req ($TimeoutS + 60)
+    }
+    if (-not $res.ok) {
+        Send-WtlEvent 'LAB_STEP' @('machine', $Machine, 'as', $as, 'n', $N, 'script', $path, 'exit', 'launchfail') ([string]$res.error)
+        return 1
+    }
+    Send-Output ("step" + $N + "out") $out
+    Send-Output ("step" + $N + "err") $err
+    if ($res.running) {
+        Send-WtlEvent 'LAB_STEP' @('machine', $Machine, 'as', $as, 'n', $N, 'script', $path, 'exit', 'running', 'secs', $res.secs)
+        return 0
+    }
+    if ($res.timed_out) {
+        Send-WtlEvent 'LAB_STEP' @('machine', $Machine, 'as', $as, 'n', $N, 'script', $path, 'exit', 'timeout', 'secs', $res.secs)
+        return 2
+    }
+    Send-WtlEvent 'LAB_STEP' @('machine', $Machine, 'as', $as, 'n', $N, 'script', $path, 'exit', ([int]$res.exit), 'secs', $res.secs)
+    return 0
+}
+
+# Run a step in the current (logged-on) session, capturing output. Mirrors the student branch
+# of the two-machine Invoke-LabStep, with args and keep_running.
+function Invoke-LabStepForeground([int]$N, [string]$Path, [string]$ArgsLine, [string]$Cwd, [string]$Out, [string]$Err, [int]$TimeoutS, [bool]$Keep) {
+    $runDir = 'C:\WTL\run'
+    $inF = Join-Path $runDir 'empty.in'
+    foreach ($f in @($Out, $Err)) { if (Test-Path $f) { Remove-Item $f -Force } }
+    [System.IO.File]::WriteAllText($inF, '')
+    $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    $file = $Path; $argLine = ''
+    if ($ext -eq '.ps1') {
+        $file = 'powershell.exe'; $argLine = '-NoProfile -ExecutionPolicy Bypass -File "' + $Path + '"'
+        if ($ArgsLine) { $argLine += ' ' + $ArgsLine }
+    } elseif ($ext -eq '.bat' -or $ext -eq '.cmd') {
+        $file = $env:ComSpec; $argLine = '/d /c ""' + $Path + '"'
+        if ($ArgsLine) { $argLine += ' ' + $ArgsLine }
+        $argLine += '"'
+    } elseif ($ext -eq '.msi') {
+        $file = 'msiexec.exe'; $argLine = '/i "' + $Path + '" /qn /norestart'
+        if ($ArgsLine) { $argLine += ' ' + $ArgsLine }
+    } elseif ($ArgsLine) {
+        $argLine = $ArgsLine
+    }
+    $sp = @{ FilePath = $file; PassThru = $true; NoNewWindow = $true;
+             RedirectStandardOutput = $Out; RedirectStandardError = $Err; RedirectStandardInput = $inF }
+    if (Test-Path -LiteralPath $Cwd) { $sp['WorkingDirectory'] = $Cwd }
+    if ($argLine) { $sp['ArgumentList'] = $argLine }
+    $t0 = [DateTime]::Now
+    $proc = $null
+    try { $proc = Start-Process @sp } catch { return @{ ok = $false; error = $_.Exception.Message } }
+    try { $null = $proc.Handle } catch { }
+    $deadline = $t0.AddSeconds([Math]::Max(5, $TimeoutS))
+    $timedOut = $false
+    while (-not $proc.HasExited) {
+        if ([DateTime]::Now -ge $deadline) { $timedOut = $true; break }
+        Start-Sleep -Milliseconds 250
+    }
+    $secs = [Math]::Round(([DateTime]::Now - $t0).TotalSeconds, 1)
+    if ($timedOut -and $Keep) { return @{ ok = $true; running = $true; secs = $secs } }
+    if ($timedOut) { Stop-Tree $proc; Start-Sleep -Seconds 1; return @{ ok = $true; timed_out = $true; secs = $secs } }
+    return @{ ok = $true; exit = (Get-ExitCodeSafe $proc); secs = $secs }
+}
+
+function Invoke-LabMulti($Cfg, [string]$LabDir) {
+    $role = [string]$Cfg.role
+    if ($role -eq 'dc') {
+        # the DC uses the same promotion path; Invoke-LabDc reads domain/netbios/users/ip/dc_ip
+        $r = Invoke-LabDc $Cfg
+        if ($r -ne 'ready') { return $r }
+        # the DC also needs the SYSTEM worker baked, so it can run its own steps
+        Register-LabSvc $LabDir
+        if ($Cfg.run -ne $null) { return (Invoke-LabMemberSteps $Cfg) }
+        return 'ready'
+    }
+    if ($role -ne 'member') { throw "unknown role '$role' in lab.json (fmt=multi)" }
+    # a member: join + autologon (phase 'new'), else it is logged on -> ready / run steps
+    $r = Invoke-LabClient $Cfg $LabDir
+    if ($r -ne 'ready') { return $r }
+    if ($Cfg.shutdown_when_ready) { Send-WtlEvent 'LAB_IDLE'; return 'reboot' }
+    if ($Cfg.run -ne $null) { return (Invoke-LabMemberSteps $Cfg) }
+    return 'ready'
+}
+
+# ================================================================ entry
+
 function Invoke-Lab([string]$LabDir) {
     try {
         $cfg = [System.IO.File]::ReadAllText((Join-Path $LabDir 'lab.json')) | ConvertFrom-Json
         Send-WtlEvent 'LAB_START' @('role', $cfg.role, 'phase', (Get-LabPhase), 'user', "$env:USERDOMAIN\$env:USERNAME")
+        if ([string]$cfg.fmt -eq 'multi') { return (Invoke-LabMulti $cfg $LabDir) }
         $r = 'fail'
         if ($cfg.role -eq 'dc') { $r = Invoke-LabDc $cfg }
         elseif ($cfg.role -eq 'client') { $r = Invoke-LabClient $cfg $LabDir }

@@ -63,6 +63,29 @@ run), alongside the existing 2-machine `.conf` path. Host: <=3 VMs at once (1 DC
   `run_as_student` -> the member's logon user, every step `on all`). Both feed the same
   `resolve()`. 2 unit tests. The live `.conf` run still uses labconf + lab.rs unchanged.
 
+- **Part 3 done** (host runner): `src/labrun.rs` `MultiLab` runs N machines, sharing
+  qemu/qmp/serialwait/outputs/mkiso/sys with `lab.rs` (which is unchanged). `lab.rs::route_json`
+  sends `run FOO.json`, `<cmd> LAB` (labs/LAB.json, no .conf shadow) or `<cmd> path/lab.json`
+  here; everything else stays on the `.conf` path. Private LAN = `qemu::Lan::Mcast` (one
+  `-netdev dgram` group 239.77.30.1 : lan_port, members also keep user-mode NAT, DC isolated).
+  Per-VM disks/overlays/serial/QMP as `labs/state/<lab>/<machine>...`, MAC 52:54:00:4c:41:(10+i),
+  base image `images/<os>-{dc,client}.qcow2`. Per-machine `cpus` via new `Opts.cpus`. 0 state:
+  boots DC + members, waits LAB_DC_READY / per-member LAB_JOINED+logon+LAB_CLIENT_READY+LAB_IDLE,
+  freezes. Run: restores, boots, each machine-with-steps gets its own ordered steps + only the
+  mount discs it uses; `run_steps` multiplexes short serial waits across those machines until each
+  emits LAB_RUN_DONE; LAB_STEP carries machine=; expect_exit checked host-side; results in
+  runs/<ts>/<machine>/. Does NOT install Windows (base images must exist). 1 unit test + qemu
+  mcast argv test.
+- **Part 4 done** (guest): `guest/lab.ps1` branches on `fmt=="multi"` -> `Invoke-LabMulti`
+  (DC promotes + registers labsvc + may run steps; member joins/autologons then runs its steps).
+  `Invoke-LabMultiStep` handles as=system|logon|user, args, keep_running, .msi, reports
+  `LAB_STEP machine=..`. `guest/labsvc.ps1` extended ADDITIVELY: run action now takes optional
+  args/user/password/domain/keep_running; `Invoke-SvcRunAs` runs a step as another user
+  (CreateProcessWithLogonW via ProcessStartInfo, output drained to files). The two-machine path
+  is untouched; old baked 0 states still work. `tests/ps_lint.py` passes. NOTE: a fresh 0-state
+  build bakes the new labsvc.ps1 (Register-LabSvc copies it from the CD), so the multi-machine
+  school lab gets the new worker; existing 2012/2016/2019 single labs keep their old baked worker.
+
 ## Next
 
 - The user tries it and switches `~/.local/bin/lab` to target/release/wtl-rs. Until then the

@@ -146,10 +146,13 @@ impl Env {
 /// Where the private VM-to-VM LAN plugs in.
 #[derive(Clone, Debug)]
 pub enum Lan {
-    /// listens on 127.0.0.1:PORT
+    /// listens on 127.0.0.1:PORT (the two-machine `.conf` lab: `-netdev stream` server)
     Server(u16),
     /// connects to 127.0.0.1:PORT (and reconnects)
     Client(u16),
+    /// a UDP multicast group on loopback (`-netdev dgram`): joins N machines without root, so
+    /// several VMs share one private LAN. Every machine of a lab uses the same group+port.
+    Mcast { group: String, port: u16 },
 }
 
 /// The options lib/common.sh qemu_cmd took.
@@ -157,6 +160,8 @@ pub enum Lan {
 pub struct Opts {
     pub name: String,
     pub mem: String,
+    /// vCPUs for this VM (default: WTL_CPUS from the environment)
+    pub cpus: Option<String>,
     pub disk: PathBuf,
     /// writeback unless set
     pub cache: Option<String>,
@@ -191,7 +196,8 @@ pub fn command(env: &Env, o: &Opts) -> Result<Vec<String>> {
     let mut a: Vec<String> = Vec::new();
     let mut push = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
     let machine = if o.uefi.is_some() { "q35" } else { "pc" };
-    push(&[&env.qemu, "-name", &o.name, "-machine", machine, "-m", &o.mem, "-smp", &env.cpus]);
+    let cpus = o.cpus.as_deref().unwrap_or(&env.cpus);
+    push(&[&env.qemu, "-name", &o.name, "-machine", machine, "-m", &o.mem, "-smp", cpus]);
     let cpu = |dflt: &str| env.cpu.clone().unwrap_or_else(|| dflt.to_string());
     match env.accel {
         Accel::Tcg => push(&["-cpu", &cpu("max")]),
@@ -235,6 +241,11 @@ pub fn command(env: &Env, o: &Opts) -> Result<Vec<String>> {
         let nd = match lan {
             Lan::Server(p) => format!("stream,id=lan0,server=on,{}", addr(*p)),
             Lan::Client(p) => format!("stream,id=lan0,server=off,reconnect-ms=1000,{}", addr(*p)),
+            // one multicast group carries the whole lab LAN; each VM both sends to and
+            // receives on 127.0.0.1:PORT of group GROUP (verified to join N VMs with no root)
+            Lan::Mcast { group, port } => format!(
+                "dgram,id=lan0,remote.type=inet,remote.host={group},remote.port={port},local.type=inet,local.host=127.0.0.1,local.port={port}"
+            ),
         };
         let mac = o.lan_mac.as_ref().map(|m| format!(",mac={}", m)).unwrap_or_default();
         push(&["-netdev", &nd, "-device", &format!("{},netdev=lan0{}", env.nic, mac)]);
@@ -371,5 +382,27 @@ mod tests {
         assert!(command(&e, &o).unwrap().join(" ").contains("-cpu Skylake-Client"));
         let t = Opts { qmp: Some(Addr::Tcp("127.0.0.1:4444".into())), ..o };
         assert!(command(&e, &t).unwrap().join(" ").contains("-qmp tcp:127.0.0.1:4444,server=on,wait=off"));
+    }
+
+    #[test]
+    fn mcast_lan_and_cpus() {
+        let e = env();
+        let o = Opts {
+            name: "lab-school-CL1".into(),
+            mem: "4096".into(),
+            cpus: Some("4".into()),
+            disk: "/s/CL1.qcow2".into(),
+            lan: Some(Lan::Mcast { group: "239.77.30.1".into(), port: 47030 }),
+            lan_mac: Some("52:54:00:4c:41:11".into()),
+            ..Default::default()
+        };
+        let a = command(&e, &o).unwrap().join(" ");
+        assert!(a.contains("-smp 4"), "{}", a);
+        assert!(
+            a.contains("-netdev dgram,id=lan0,remote.type=inet,remote.host=239.77.30.1,remote.port=47030,local.type=inet,local.host=127.0.0.1,local.port=47030 -device e1000,netdev=lan0,mac=52:54:00:4c:41:11"),
+            "{}", a
+        );
+        // members still get user-mode NAT
+        assert!(a.contains("user,id=net0"), "{}", a);
     }
 }

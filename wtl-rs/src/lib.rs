@@ -3,6 +3,7 @@
 pub mod lab;
 pub mod labconf;
 pub mod labdef;
+pub mod labrun;
 pub mod logx;
 pub mod mkiso;
 pub mod oslist;

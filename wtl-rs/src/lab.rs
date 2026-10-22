@@ -3,6 +3,7 @@
 //! (labs/state/<lab>/), so the bash `lab` and this one can be used on the same labs.
 
 use crate::labconf::{self, Mount, RunConfig, Step};
+use crate::labrun;
 use crate::logx::{err, log, ok, warn};
 use crate::oslist::{self, OsInfo};
 use crate::qemu::{self, Env, Lan, Opts};
@@ -195,17 +196,17 @@ fn port_free(port: u16) -> bool {
 }
 
 /// an ephemeral free TCP port on 127.0.0.1
-fn free_port() -> Option<u16> {
+pub(crate) fn free_port() -> Option<u16> {
     std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?.local_addr().ok().map(|a| a.port())
 }
 
 /// N (10..99, then 0..9) such that 127.0.0.1:(5900+N) is free
-fn pick_vnc_display() -> Option<u16> {
+pub(crate) fn pick_vnc_display() -> Option<u16> {
     (10..100).chain(0..10).find(|n| port_free(5900 + n))
 }
 
 /// a unix socket path short enough (<= 100 chars; sun_path is ~108)
-fn sock_path(preferred: PathBuf, name: &str) -> PathBuf {
+pub(crate) fn sock_path(preferred: PathBuf, name: &str) -> PathBuf {
     if preferred.as_os_str().len() <= 100 {
         return preferred;
     }
@@ -213,11 +214,11 @@ fn sock_path(preferred: PathBuf, name: &str) -> PathBuf {
     PathBuf::from(dir).join(format!("wtl-{}.sock", name))
 }
 
-fn read_trim(p: &Path) -> Option<String> {
+pub(crate) fn read_trim(p: &Path) -> Option<String> {
     std::fs::read_to_string(p).ok().map(|s| s.trim_end_matches(['\r', '\n']).to_string())
 }
 
-fn indent_file(p: &Path) {
+pub(crate) fn indent_file(p: &Path) {
     if let Ok(s) = std::fs::read(p) {
         for l in String::from_utf8_lossy(&s).lines() {
             eprintln!("    {}", l);
@@ -225,7 +226,7 @@ fn indent_file(p: &Path) {
     }
 }
 
-fn write_file(p: &Path, data: impl AsRef<[u8]>) -> Result<()> {
+pub(crate) fn write_file(p: &Path, data: impl AsRef<[u8]>) -> Result<()> {
     std::fs::write(p, data).with_context(|| format!("cannot write {}", p.display()))
 }
 
@@ -288,6 +289,12 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         Cmd::Rebuild(t) => ("rebuild", t),
     };
     let root = find_root()?;
+    // JSON multi-machine labs: `run FOO.json`, or `<cmd> LAB` where labs/LAB.json exists (and
+    // no labs/LAB.conf shadows it), or `<cmd> path/to/lab.json`. Routed to the N-machine
+    // runner in labrun.rs; the .conf path below is unchanged.
+    if let Some(code) = route_json(cmd, t, &root)? {
+        return Ok(code);
+    }
     // A run always names CONFIG file(s). The other commands take a LAB or CONFIG(s), whose
     // version names the lab. A config = an existing file that is not a bare lab name.
     let is_config = |x: &str| {
@@ -331,6 +338,49 @@ fn run_cli(cli: &Cli) -> Result<i32> {
     }
     let mut l = Lab::new(root, cmd, &lab, t, wait_s, timeout_min, config, run)?;
     l.dispatch()
+}
+
+/// If the target names a JSON lab/run, hand it to the N-machine runner and return its exit
+/// code; otherwise `None` so the two-machine `.conf` path takes over.
+fn route_json(cmd: &'static str, t: &Target, root: &Path) -> Result<Option<i32>> {
+    let first = &t.target[0];
+    // a JSON run config: an existing *.json file (run only)
+    let run_json = cmd == "run" && first.ends_with(".json") && Path::new(first).is_file();
+    // a JSON lab: `<cmd> LAB` with labs/LAB.json present and no labs/LAB.conf, or a *.json file
+    let lab_json_file = cmd != "run" && first.ends_with(".json") && Path::new(first).is_file();
+    let lab_by_name = cmd != "run"
+        && !first.contains('/')
+        && !first.ends_with(".json")
+        && util::is_safe_name(first)
+        && root.join("labs").join(format!("{}.json", first)).is_file()
+        && !root.join("labs").join(format!("{}.conf", first)).is_file();
+    if !(run_json || lab_json_file || lab_by_name) {
+        return Ok(None);
+    }
+    if let Some(x) = t.target.get(1) {
+        bail!("unknown option {} (JSON labs take a single CONFIG/LAB)", x);
+    }
+    if run_json {
+        let config = util::canon(Path::new(first));
+        let (lab_file, lab, run) = match labrun::load_run(&config) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: {:#}", e);
+                bail!("config error (see above)");
+            }
+        };
+        return Ok(Some(labrun::run(cmd, &lab_file, Some(config), Some(run), lab, t.show, t.wait, t.timeout_min)));
+    }
+    // a lab command (restore/up/stop/status/prepare/rebuild)
+    let lab_file = if lab_json_file { util::canon(Path::new(first)) } else { root.join("labs").join(format!("{}.json", first)) };
+    let lab = match labrun::load_lab(&lab_file) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: {:#}", e);
+            bail!("lab error (see above)");
+        }
+    };
+    Ok(Some(labrun::run(cmd, &lab_file, None, None, lab, t.show, t.wait, t.timeout_min)))
 }
 
 impl Lab {
