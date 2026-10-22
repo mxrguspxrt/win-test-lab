@@ -15,7 +15,7 @@
 //! barrier *between* different steps across machines — the simple model the user asked for.
 
 use crate::labdef::{self, Lab, Role, Run, RunStep, StepAs};
-use crate::lab::{find_root, indent_file, pick_vnc_display, read_trim, sock_path, write_file};
+use crate::lab::{build_base_images, find_root, indent_file, pick_vnc_display, read_trim, sock_path, write_file, BaseBuild};
 use crate::logx::{err, log, ok, warn};
 use crate::oslist::{self, OsInfo};
 use crate::qemu::{self, Env, Lan, Opts};
@@ -165,6 +165,10 @@ struct RunResult {
 pub struct MultiLab {
     root: PathBuf,
     env: Env,
+    /// the WTL_* settings (defaults + environment), passed on to build-image.sh
+    vars: HashMap<String, String>,
+    /// install base images with Windows Update (--updates)
+    updates: bool,
     cmd: &'static str,
     name: String,
     lab_file: PathBuf,
@@ -189,6 +193,11 @@ impl Vm {
     }
 }
 
+/// The base image name for a machine: `<os>-dc` or `<os>-client`.
+fn base_name(vm: &Vm) -> String {
+    format!("{}-{}", vm.os.key, if vm.role == Role::Dc { "dc" } else { "client" })
+}
+
 /// Build a [`MultiLab`] and dispatch CMD; returns the exit code. `lab_file` is the lab JSON;
 /// `config`/`run` are set for `run`.
 pub fn run(
@@ -197,11 +206,9 @@ pub fn run(
     config: Option<PathBuf>,
     run: Option<Run>,
     lab: Lab,
-    show: bool,
-    wait_override: Option<i64>,
-    timeout_override: Option<i64>,
+    opts: &RunOpts,
 ) -> i32 {
-    match MultiLab::new(cmd, lab_file, config, run, lab, show, wait_override, timeout_override).and_then(|mut l| l.dispatch()) {
+    match MultiLab::new(cmd, lab_file, config, run, lab, opts).and_then(|mut l| l.dispatch()) {
         Ok(code) => code,
         Err(e) => match e.downcast_ref::<Exit>() {
             Some(Exit(code)) => *code,
@@ -213,18 +220,21 @@ pub fn run(
     }
 }
 
+/// Command-line options that apply to a JSON lab.
+pub struct RunOpts {
+    /// open the VM windows instead of VNC
+    pub show: bool,
+    /// install missing base images with Windows Update (hours)
+    pub updates: bool,
+    /// --wait: overrides the run's `wait`
+    pub wait: Option<i64>,
+    /// --timeout-min: overrides the run's `timeout_min`
+    pub timeout_min: Option<i64>,
+}
+
 impl MultiLab {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        cmd: &'static str,
-        lab_file: &Path,
-        config: Option<PathBuf>,
-        run: Option<Run>,
-        lab: Lab,
-        show: bool,
-        wait_override: Option<i64>,
-        timeout_override: Option<i64>,
-    ) -> Result<MultiLab> {
+    fn new(cmd: &'static str, lab_file: &Path, config: Option<PathBuf>, run: Option<Run>, lab: Lab, opts: &RunOpts) -> Result<MultiLab> {
+        let (show, updates, wait_override, timeout_override) = (opts.show, opts.updates, opts.wait, opts.timeout_min);
         let root = find_root()?;
         let name = util::stem(util::basename(&lab_file.to_string_lossy())).to_string();
         if !util::is_safe_name(&name) {
@@ -308,6 +318,8 @@ impl MultiLab {
             zero_done: state.join("0-state.json"),
             root,
             env,
+            vars,
+            updates,
             cmd,
             name,
             lab_file: lab_file.to_path_buf(),
@@ -581,9 +593,32 @@ impl MultiLab {
 
     // ---------------------------------------------------------------- discs
 
+    /// The Windows install a machine boots from: images/<os>-dc.qcow2 for the DC,
+    /// images/<os>-client.qcow2 for a member. Machines with the same OS and role share one.
     fn base_image(&self, vm: &Vm) -> PathBuf {
-        let kind = if vm.role == Role::Dc { "dc" } else { "client" };
-        self.env.images_dir.join(format!("{}-{}.qcow2", vm.os.key, kind))
+        self.env.images_dir.join(format!("{}.qcow2", base_name(vm)))
+    }
+
+    /// Install Windows for every missing base image (build-image.sh, in parallel; one build
+    /// per image even when several machines share it).
+    fn build_bases(&self) -> Result<()> {
+        let mut builds: Vec<BaseBuild> = Vec::new();
+        for vm in &self.vms {
+            let image = base_name(vm);
+            if self.base_image(vm).is_file() || builds.iter().any(|b| b.image == image) {
+                continue;
+            }
+            // the computer name baked into the image; the lab renames each machine to its key
+            let prefix = if vm.role == Role::Dc { "DC" } else { "CL" };
+            builds.push(BaseBuild::new(&image, &vm.os.key, &image, &format!("{}{}", prefix, vm.os.key).to_uppercase()));
+        }
+        build_base_images(&self.root, &self.vars, &self.state, &builds, self.updates, self.show, &|s| self.nap(s))?;
+        let missing: Vec<String> =
+            self.vms.iter().map(|v| self.base_image(v)).filter(|b| !b.is_file()).map(|b| b.display().to_string()).collect();
+        if !missing.is_empty() {
+            bail!("Windows install failed, missing {} (logs: {}/build-*.log)", missing.join(", "), self.state.display());
+        }
+        Ok(())
     }
 
     /// One read-only ISO per drive letter a machine mounts, label WTL<LETTER>.
@@ -869,22 +904,9 @@ impl MultiLab {
         if self.zero_done.is_file() {
             return Ok(());
         }
-        // all base images must already exist (we do not install Windows here)
-        let mut missing = Vec::new();
-        for vm in &self.vms {
-            let b = self.base_image(vm);
-            if !b.is_file() {
-                missing.push(format!("{} ({})", b.display(), vm.name));
-            }
-        }
-        if !missing.is_empty() {
-            bail!(
-                "missing base image(s): {}\n(build them with the two-machine lab.sh / build-image.sh first; the JSON runner does not install Windows)",
-                missing.join(", ")
-            );
-        }
         log(&format!("=== building the 0 state of lab {} (domain {}; {} machines, once) ===", self.name, self.lab.domain, self.vms.len()));
         self.restore()?;
+        self.build_bases()?;
         for vm in self.vm_names() {
             // the frozen 0-state disk is an overlay on the (read-only) base image; the build
             // boots it directly so the domain/join is baked into the 0 state

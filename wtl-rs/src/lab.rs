@@ -230,6 +230,98 @@ pub(crate) fn write_file(p: &Path, data: impl AsRef<[u8]>) -> Result<()> {
     std::fs::write(p, data).with_context(|| format!("cannot write {}", p.display()))
 }
 
+/// One base image (`images/<image>.qcow2`) to install with build-image.sh.
+pub(crate) struct BaseBuild {
+    /// short label for the log prefix and STATE/build-<tag>.log
+    pub tag: String,
+    /// OS key from lib/oslist.conf
+    pub os: String,
+    /// image name: images/<image>.qcow2
+    pub image: String,
+    /// the Windows computer name baked into the image (multi-machine labs rename it later)
+    pub computer: String,
+}
+
+impl BaseBuild {
+    pub(crate) fn new(tag: &str, os: &str, image: &str, computer: &str) -> BaseBuild {
+        BaseBuild { tag: tag.into(), os: os.into(), image: image.into(), computer: computer.into() }
+    }
+}
+
+/// Install Windows into each base image with `build-image.sh` (unattended, in parallel). Each
+/// build's output is tee'd to LOG_DIR/build-<tag>.log and shown prefixed with `[tag]`. `vars`
+/// supplies the WTL_* settings passed on to the script; `nap` sleeps (and fails on Ctrl-C).
+/// The caller checks that the images exist afterwards.
+pub(crate) fn build_base_images(
+    root: &Path,
+    vars: &HashMap<String, String>,
+    log_dir: &Path,
+    builds: &[BaseBuild],
+    updates: bool,
+    show: bool,
+    nap: &dyn Fn(f64) -> Result<()>,
+) -> Result<()> {
+    if builds.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<&str> = builds.iter().map(|b| b.tag.as_str()).collect();
+    log(&format!(
+        "installing Windows for: {} (unattended; {})",
+        names.join(" "),
+        if updates { "with Windows Update, hours" } else { "no updates, ~10-30 min" }
+    ));
+    let script = root.join("build-image.sh");
+    let mut kids = Vec::new();
+    for (i, b) in builds.iter().enumerate() {
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("bash"); // build-image.sh is a bash script
+            c.arg(&script);
+            c
+        } else {
+            Command::new(&script)
+        };
+        cmd.args([&b.os, "--name", &b.image, "--computer-name", &b.computer]);
+        if !updates {
+            cmd.arg("--no-updates");
+        }
+        if show {
+            cmd.arg("--show");
+        }
+        for (k, v) in vars {
+            if k.starts_with("WTL_") || k == "ROOT" {
+                cmd.env(k, v);
+            }
+        }
+        let (reader, writer) = std::io::pipe().context("pipe")?;
+        cmd.stdin(Stdio::null()).stdout(writer.try_clone().context("pipe")?).stderr(writer);
+        let child = cmd.spawn().with_context(|| format!("cannot run {}", script.display()))?;
+        drop(cmd); // closes our copies of the pipe's write end
+        let logf = log_dir.join(format!("build-{}.log", b.tag));
+        let tag = b.tag.clone();
+        let t = std::thread::spawn(move || {
+            let mut lf = std::fs::File::create(logf).ok();
+            for line in std::io::BufReader::new(reader).split(b'\n').map_while(Result::ok) {
+                if let Some(f) = lf.as_mut() {
+                    let _ = f.write_all(&line);
+                    let _ = f.write_all(b"\n");
+                }
+                println!("[{}] {}", tag, String::from_utf8_lossy(&line));
+            }
+        });
+        kids.push((child, t));
+        if i + 1 < builds.len() {
+            nap(10.0)?; // the builds pick their VNC displays one after the other
+        }
+    }
+    for (mut child, t) in kids {
+        while let Ok(None) = child.try_wait() {
+            nap(0.5)?;
+        }
+        let _ = t.join();
+    }
+    Ok(())
+}
+
 struct Lab {
     root: PathBuf,
     env: Env,
@@ -360,6 +452,7 @@ fn route_json(cmd: &'static str, t: &Target, root: &Path) -> Result<Option<i32>>
     if let Some(x) = t.target.get(1) {
         bail!("unknown option {} (JSON labs take a single CONFIG/LAB)", x);
     }
+    let opts = labrun::RunOpts { show: t.show, updates: t.updates, wait: t.wait, timeout_min: t.timeout_min };
     if run_json {
         let config = util::canon(Path::new(first));
         let (lab_file, lab, run) = match labrun::load_run(&config) {
@@ -369,7 +462,7 @@ fn route_json(cmd: &'static str, t: &Target, root: &Path) -> Result<Option<i32>>
                 bail!("config error (see above)");
             }
         };
-        return Ok(Some(labrun::run(cmd, &lab_file, Some(config), Some(run), lab, t.show, t.wait, t.timeout_min)));
+        return Ok(Some(labrun::run(cmd, &lab_file, Some(config), Some(run), lab, &opts)));
     }
     // a lab command (restore/up/stop/status/prepare/rebuild)
     let lab_file = if lab_json_file { util::canon(Path::new(first)) } else { root.join("labs").join(format!("{}.json", first)) };
@@ -380,7 +473,7 @@ fn route_json(cmd: &'static str, t: &Target, root: &Path) -> Result<Option<i32>>
             bail!("lab error (see above)");
         }
     };
-    Ok(Some(labrun::run(cmd, &lab_file, None, None, lab, t.show, t.wait, t.timeout_min)))
+    Ok(Some(labrun::run(cmd, &lab_file, None, None, lab, &opts)))
 }
 
 impl Lab {
@@ -1048,74 +1141,16 @@ impl Lab {
 
     // ------------------------------------------------------------------ 0 state
 
-    /// Install Windows for each missing base image (build-image.sh, in parallel), output
-    /// tee'd to STATE/build-VM.log and shown prefixed with [VM].
+    /// Install Windows for each missing base image (see [`build_base_images`]).
     fn build_bases(&self) -> Result<()> {
-        let mut builds: Vec<(&str, &str, String, &str)> = Vec::new();
+        let mut builds = Vec::new();
         if !self.dc_base.is_file() {
-            builds.push(("dc", &self.dc_os.key, format!("{}-dc", self.name), self.v("LAB_DC_NAME")));
+            builds.push(BaseBuild::new("dc", &self.dc_os.key, &format!("{}-dc", self.name), self.v("LAB_DC_NAME")));
         }
         if !self.cl_base.is_file() {
-            builds.push(("client", &self.cl_os.key, format!("{}-client", self.name), self.v("LAB_CLIENT_NAME")));
+            builds.push(BaseBuild::new("client", &self.cl_os.key, &format!("{}-client", self.name), self.v("LAB_CLIENT_NAME")));
         }
-        if builds.is_empty() {
-            return Ok(());
-        }
-        let names: Vec<&str> = builds.iter().map(|b| b.0).collect();
-        log(&format!(
-            "installing Windows for: {} (unattended; {})",
-            names.join(" "),
-            if self.updates { "with Windows Update, hours" } else { "no updates, ~10 min" }
-        ));
-        let script = self.root.join("build-image.sh");
-        let mut kids = Vec::new();
-        for (i, (vm, os, bname, cn)) in builds.iter().enumerate() {
-            let mut cmd = if cfg!(windows) {
-                let mut c = Command::new("bash"); // build-image.sh is not ported yet
-                c.arg(&script);
-                c
-            } else {
-                Command::new(&script)
-            };
-            cmd.args([os, "--name", bname, "--computer-name", cn]);
-            if !self.updates {
-                cmd.arg("--no-updates");
-            }
-            if self.show {
-                cmd.arg("--show");
-            }
-            for (k, v) in &self.vars {
-                if k.starts_with("WTL_") || k == "ROOT" {
-                    cmd.env(k, v);
-                }
-            }
-            let (reader, writer) = std::io::pipe().context("pipe")?;
-            cmd.stdin(Stdio::null()).stdout(writer.try_clone().context("pipe")?).stderr(writer);
-            let child = cmd.spawn().with_context(|| format!("cannot run {}", script.display()))?;
-            drop(cmd); // closes our copies of the pipe's write end
-            let logf = self.st(&format!("build-{}.log", vm));
-            let tag = vm.to_string();
-            let t = std::thread::spawn(move || {
-                let mut lf = std::fs::File::create(logf).ok();
-                for line in std::io::BufReader::new(reader).split(b'\n').map_while(Result::ok) {
-                    if let Some(f) = lf.as_mut() {
-                        let _ = f.write_all(&line);
-                        let _ = f.write_all(b"\n");
-                    }
-                    println!("[{}] {}", tag, String::from_utf8_lossy(&line));
-                }
-            });
-            kids.push((child, t));
-            if i + 1 < builds.len() {
-                self.nap(10.0)?; // the builds pick their VNC displays one after the other
-            }
-        }
-        for (mut child, t) in kids {
-            while let Ok(None) = child.try_wait() {
-                self.nap(0.5)?;
-            }
-            let _ = t.join();
-        }
+        build_base_images(&self.root, &self.vars, &self.state, &builds, self.updates, self.show, &|s| self.nap(s))?;
         if !(self.dc_base.is_file() && self.cl_base.is_file()) {
             bail!("Windows install failed (logs: {}/build-*.log)", self.state.display());
         }

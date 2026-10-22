@@ -674,6 +674,34 @@ impl Ctx {
             port = free_port()
         );
         std::fs::write(root.join("labs/tri.json"), tri).unwrap();
+        // a JSON lab whose base images do not exist yet: the runner installs them with
+        // build-image.sh (here a fake that writes the image and logs its arguments)
+        let fresh = format!(
+            r#"{{
+  "domain": "lab.local", "netbios": "LAB", "admin_password": "WinTest!2026",
+  "network": {{ "subnet": "10.77.97", "lan_port": {port} }},
+  "machines": {{
+    "DC": {{ "os": "2016", "role": "dc" }},
+    "A": {{ "os": "2016", "logon": "s1" }},
+    "B": {{ "os": "2016", "logon": "s2" }}
+  }},
+  "users": {{ "s1": {{ "password": "Pupil!2026" }}, "s2": {{ "password": "Pupil!2026" }} }}
+}}
+"#,
+            port = free_port()
+        );
+        std::fs::write(root.join("labs/fresh.json"), fresh).unwrap();
+        let fake_build = "#!/bin/sh\n\
+             # fake build-image.sh: OS --name NAME --computer-name CN [--no-updates] [--show]\n\
+             echo \"$*\" >> \"$WTL_IMAGES_DIR/build-calls.log\"\n\
+             echo \"installing $1 into $3.qcow2\"\n\
+             printf 'QFI\\373 fake base image\\n' > \"$WTL_IMAGES_DIR/$3.qcow2\"\n";
+        std::fs::write(root.join("build-image.sh"), fake_build).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.join("build-image.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         for img in ["t-dc", "t-client", "u-dc", "u-client", "2019-dc", "2019-client", "win11-dc", "win11-client"] {
             std::fs::write(root.join(format!("images/{}.qcow2", img)), "QFI\u{fb} fake base image\n").unwrap();
         }
@@ -1262,6 +1290,31 @@ fn driver(args: &[String]) -> i32 {
         c.code(&outs[i].1, 2);
         c.has(&outs[i].1, "is not a machine in lab tri");
         c.ok(cx.live_fakes().is_empty(), "a VM was started for an invalid config");
+    });
+
+    scenario(&mut cx, "JSON lab: missing base images are installed first", &|cx, c, outs| {
+        let i = run(cx, outs, &["prepare", "fresh"], &[]);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        c.has(o, "installing Windows for: 2016-dc 2016-client (unattended; no updates");
+        c.has(o, "[2016-dc] installing 2016 into 2016-dc.qcow2");
+        c.has(o, "[2016-client] installing 2016 into 2016-client.qcow2");
+        c.has(o, "0 state saved for lab fresh (3 machines)");
+        // two members on the same OS share one client image: one build per image
+        let calls = std::fs::read_to_string(cx.root.join("images/build-calls.log")).unwrap_or_default();
+        let mut lines: Vec<&str> = calls.lines().collect();
+        lines.sort();
+        c.ok(
+            lines == ["2016 --name 2016-client --computer-name CL2016 --no-updates", "2016 --name 2016-dc --computer-name DC2016 --no-updates"],
+            format!("build-image.sh calls: {:?}", lines),
+        );
+        c.file(&cx.state("fresh").join("build-2016-dc.log"));
+        // already there: a second prepare after a rebuild does not install again
+        let _ = run(cx, outs, &["rebuild", "fresh"], &[]);
+        let i = run(cx, outs, &["prepare", "fresh"], &[]);
+        c.code(&outs[i].1, 0);
+        c.lacks(&outs[i].1, "installing Windows");
+        let _ = run(cx, outs, &["restore", "fresh"], &[]);
     });
 
     scenario(&mut cx, "JSON lab: unknown field is rejected before boot", &|cx, c, outs| {
