@@ -142,7 +142,12 @@ function New-LabUser($Cfg, $U) {
         Enable-ADAccount -Identity $name
     }
     $groups = @($U.groups | Where-Object { $_ })
-    foreach ($g in $groups) { Add-ADGroupMember -Identity $g -Members $name }
+    foreach ($g in $groups) {
+        # a group named in the lab but not in AD yet is created (a global security group under Users)
+        $have = Get-ADGroup -Filter "Name -eq '$g'" -ErrorAction SilentlyContinue
+        if (-not $have) { New-ADGroup -Name $g -GroupScope Global -GroupCategory Security }
+        Add-ADGroupMember -Identity $g -Members $name
+    }
     Send-LabPhase ("user $($Cfg.netbios)\$name" + $(if ($groups.Count) { ' in ' + ($groups -join ', ') } else { '' }))
 }
 

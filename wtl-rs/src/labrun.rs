@@ -740,7 +740,10 @@ impl MultiLab {
             let (disk, cd, mut cds) = {
                 let vm = &self.vms[vm_idx];
                 let cd = self.st(&format!("{}.iso", vm.name));
-                (self.run_disk(&vm.name), cd.clone(), vec![cd])
+                // the build writes the domain straight into the frozen 0-state disk; a run
+                // writes to a throwaway overlay on top of it
+                let disk = if build { self.zero_disk(&vm.name) } else { self.run_disk(&vm.name) };
+                (disk, cd.clone(), vec![cd])
             };
             self.make_cd(&self.vms[vm_idx], &cd, build)?;
             // mount discs only matter on a real run
@@ -856,12 +859,11 @@ impl MultiLab {
         log(&format!("=== building the 0 state of lab {} (domain {}; {} machines, once) ===", self.name, self.lab.domain, self.vms.len()));
         self.restore()?;
         for vm in self.vm_names() {
+            // the frozen 0-state disk is an overlay on the (read-only) base image; the build
+            // boots it directly so the domain/join is baked into the 0 state
             let base = self.base_image(self.vm(&vm));
             let _ = std::fs::remove_file(self.zero_disk(&vm));
             self.qemu_img_create(&base, &self.zero_disk(&vm))?;
-            // the run uses the same overlay path; point it at the 0 disk for the build boot
-            let _ = std::fs::remove_file(self.run_disk(&vm));
-            self.qemu_img_create(&self.zero_disk(&vm), &self.run_disk(&vm))?;
         }
         self.boot_lab(true)?;
         let dc = self.dc_name();
