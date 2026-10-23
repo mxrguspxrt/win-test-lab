@@ -1,0 +1,11 @@
+{
+  "$schema": "../../wtl-rs/schema/run.schema.json",
+  "lab": "mixed",
+  "mount": { "X": "../smoke-test/out" },
+  "steps": [
+    { "on": "SRV1", "as": "system",  "run": "X:/setup.bat" },
+    { "on": "SRV1",                  "run": "X:/smoke.exe" },
+    { "on": "SRV1", "as": "appuser", "run": "X:/smoke.exe" },
+    { "on": "DC1",  "as": "system",  "run": "X:/smoke.exe" }
+  ]
+}

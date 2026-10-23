@@ -46,17 +46,23 @@ impl std::error::Error for Exit {}
 #[derive(Serialize)]
 struct LabJson<'a> {
     fmt: &'a str,
+    /// "domain" (AD: a DC, the others join) or "workgroup" (standalone machines, local users)
+    mode: &'a str,
     role: &'a str,
     machine: &'a str,
+    /// the machine has a lab LAN NIC (false for a single workgroup machine)
+    lan: bool,
+    /// the static IP on the lab LAN ("" without one)
     ip: &'a str,
     prefix: i64,
+    /// the DC's IP: the DNS server of every machine ("" in workgroup mode)
     dc_ip: &'a str,
     lan_mac: &'a str,
+    /// AD mode only ("" in workgroup mode)
     domain: &'a str,
     netbios: &'a str,
     admin_password: &'a str,
-    /// every lab user (created on the DC; each member only needs its own logon user, but the
-    /// list is small and identical on every disc)
+    /// every lab user: created on the DC in AD mode, on every machine in workgroup mode
     users: Vec<LabUser<'a>>,
     logon_user: &'a str,
     logon_password: &'a str,
@@ -111,6 +117,7 @@ struct Vm {
     os: OsInfo,
     mem: String,
     cpus: String,
+    /// static IP on the lab LAN; empty without one
     ip: String,
     mac: String,
     logon: Option<String>,
@@ -166,7 +173,11 @@ pub struct MultiLab {
     /// install base images with Windows Update (--updates)
     updates: bool,
     cmd: &'static str,
+    /// the state name (`labs/state/<name>/`)
     name: String,
+    /// how to name this lab on the `lab` command line in hints: the name for a lab in
+    /// win-test-lab's labs/, the lab file's path for one anywhere else
+    arg: String,
     lab_file: PathBuf,
     lab: Lab,
     /// the run config file (absolute), if any
@@ -189,9 +200,34 @@ impl Vm {
     }
 }
 
-/// The base image name for a machine: `<os>-dc` or `<os>-client`.
+/// The base image name for a machine: `<os>-dc` for a domain controller, `<os>-client` for
+/// any other machine (a member server, a client, a workgroup machine). Any OS key works with
+/// either role, so e.g. a 2012 DC and a 2019 member use `2012-dc` and `2019-client`.
 fn base_name(vm: &Vm) -> String {
     format!("{}-{}", vm.os.key, if vm.role == Role::Dc { "dc" } else { "client" })
+}
+
+/// The name of a lab's state folder (`labs/state/<name>/`) and VMs. An explicit `name` in the
+/// lab file wins. Otherwise a lab in win-test-lab's own `labs/` is called by its file name
+/// (`labs/school.json` -> `school`), and a lab file anywhere else gets its file name plus a
+/// short hash of its absolute path (`/proj/wintest/lab.json` -> `lab-3f9a1c2b`), so two
+/// projects' `lab.json` never share a 0 state.
+pub fn state_name(root: &Path, lab_file: &Path, lab: &Lab) -> String {
+    if let Some(n) = &lab.name {
+        return n.clone();
+    }
+    let stem = util::stem(util::basename(&lab_file.to_string_lossy())).to_string();
+    let abs = util::canon(lab_file);
+    if abs.parent() == Some(util::canon(&root.join("labs")).as_path()) {
+        return stem;
+    }
+    // FNV-1a: stable across runs and platforms (unlike std's DefaultHasher)
+    let mut h: u32 = 0x811c_9dc5;
+    for b in abs.to_string_lossy().bytes() {
+        h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+    }
+    let stem: String = stem.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
+    format!("{}-{:08x}", stem, h)
 }
 
 /// Build a [`MultiLab`] and dispatch CMD; returns the exit code. `lab_file` is the lab JSON;
@@ -225,9 +261,9 @@ impl MultiLab {
     fn new(cmd: &'static str, lab_file: &Path, config: Option<PathBuf>, run: Option<Run>, lab: Lab, opts: &RunOpts) -> Result<MultiLab> {
         let (show, updates, wait_override, timeout_override) = (opts.show, opts.updates, opts.wait, opts.timeout_min);
         let root = find_root()?;
-        let name = util::stem(util::basename(&lab_file.to_string_lossy())).to_string();
+        let name = state_name(&root, lab_file, &lab);
         if !util::is_safe_name(&name) {
-            bail!("bad lab name {:?} (from {})", name, lab_file.display());
+            bail!("bad lab name {:?} (from {}; set \"name\" in the lab file)", name, lab_file.display());
         }
         let mut vars = qemu::seed_vars(&root);
         // the JSON lab carries its own admin password; keep WTL_PASSWORD only as the fallback
@@ -267,7 +303,7 @@ impl MultiLab {
                 os,
                 mem: m.mem.to_string(),
                 cpus: m.cpus.to_string(),
-                ip: m.ip.clone(),
+                ip: m.ip.clone().unwrap_or_default(),
                 mac: format!("52:54:00:4c:41:{:02x}", idx),
                 logon: m.logon.clone(),
                 steps: Vec::new(),
@@ -285,22 +321,20 @@ impl MultiLab {
                     vm.steps.push((*n, step.clone()));
                 }
             }
-            // each machine mounts only the drives its own steps use
+            // every machine that runs steps gets all of the run's drives: a step's program may
+            // read files from other mounted drives (an install script on Y: installing X:\app.msi)
             for vm in &mut vms {
-                for (_, st) in &vm.steps {
-                    let letter = st.run[..1].to_uppercase();
-                    if letter == "C" {
-                        continue;
-                    }
-                    if !vm.mounts.iter().any(|(l, _)| *l == letter) {
-                        if let Some((_, host)) = r.mounts.iter().find(|(l, _)| *l == letter) {
-                            vm.mounts.push((letter, host.clone()));
-                        }
-                    }
+                if !vm.steps.is_empty() {
+                    vm.mounts = r.mounts.clone();
                 }
             }
         }
 
+        let arg = if util::canon(lab_file).parent() == Some(util::canon(&root.join("labs")).as_path()) {
+            name.clone()
+        } else {
+            util::canon(lab_file).to_string_lossy().into_owned()
+        };
         let now = Instant::now();
         let limit = Duration::from_secs((timeout_min.max(0) as u64).saturating_mul(60));
         Ok(MultiLab {
@@ -310,6 +344,7 @@ impl MultiLab {
             vars,
             updates,
             cmd,
+            arg,
             name,
             lab_file: lab_file.to_path_buf(),
             lab,
@@ -340,8 +375,21 @@ impl MultiLab {
     fn vm(&self, name: &str) -> &Vm {
         self.vms.iter().find(|v| v.name == name).expect("known vm")
     }
-    fn dc_name(&self) -> String {
-        self.vms.iter().find(|v| v.role == Role::Dc).expect("one dc").name.clone()
+    /// The DC's name (None in workgroup mode).
+    fn dc_name(&self) -> Option<String> {
+        self.vms.iter().find(|v| v.role == Role::Dc).map(|v| v.name.clone())
+    }
+    /// The machines that are not the DC, in lab order.
+    fn member_names(&self) -> Vec<String> {
+        self.vms.iter().filter(|v| v.role == Role::Member).map(|v| v.name.clone()).collect()
+    }
+    /// "domain lab.local" or "workgroup", for log lines.
+    fn mode_text(&self) -> String {
+        if self.lab.is_ad() {
+            format!("domain {}", self.lab.domain())
+        } else {
+            "workgroup".into()
+        }
     }
 
     // ---------------------------------------------------------------- QMP (per machine)
@@ -398,7 +446,7 @@ impl MultiLab {
 
     fn interrupted(&self) -> anyhow::Error {
         eprintln!();
-        warn(&format!("interrupted; VMs may still be running (lab status {} / lab restore {})", self.name, self.name));
+        warn(&format!("interrupted; VMs may still be running (lab status {} / lab restore {})", self.arg, self.arg));
         Exit(2).into()
     }
     fn nap(&self, secs: f64) -> Result<()> {
@@ -507,21 +555,26 @@ impl MultiLab {
     }
 
     fn status(&self) {
-        println!("lab {} ({}): domain {}, {} machines", self.name, self.lab_file.display(), self.lab.domain, self.vms.len());
+        println!("lab {} ({}): {}, {} machines", self.name, self.lab_file.display(), self.mode_text(), self.vms.len());
         if self.zero_done.is_file() {
             let z: ZeroState =
                 std::fs::read_to_string(&self.zero_done).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
             println!("  0 state: ready ({})", z.built_at);
         } else {
-            println!("  0 state: not built yet (lab prepare {}, or just lab run ...)", self.name);
+            println!("  0 state: not built yet (lab prepare {}, or just lab run ...)", self.arg);
         }
         for v in &self.vms {
-            let role = if v.role == Role::Dc { "dc" } else { "member" };
+            let role = match (v.role, self.lab.is_ad()) {
+                (Role::Dc, _) => "dc",
+                (Role::Member, true) => "member",
+                (Role::Member, false) => "single",
+            };
             let pid = match self.vm_pid(&v.name) {
                 Some(p) => format!("running (pid {}) {}", p, read_trim(&self.st(&format!("{}.vnc", v.name))).unwrap_or_default()),
                 None => "off".into(),
             };
-            println!("  {:<15} {:<6} {:<7} {} {}", v.name, role, v.os.key, v.ip, pid);
+            let ip = if v.ip.is_empty() { "-" } else { v.ip.as_str() };
+            println!("  {:<15} {:<6} {:<7} {} {}", v.name, role, v.os.key, ip, pid);
         }
         if let Some(last) = self.last_run() {
             println!("  last run: {}", last.display());
@@ -676,16 +729,19 @@ impl MultiLab {
             None
         };
 
+        let dc_ip = self.dc_name().map(|d| self.vm(&d).ip.clone()).unwrap_or_default();
         let j = LabJson {
             fmt: "multi",
+            mode: if self.lab.is_ad() { "domain" } else { "workgroup" },
             role,
             machine: &vm.name,
+            lan: self.lab.network.is_some(),
             ip: &vm.ip,
             prefix: 24,
-            dc_ip: &self.vm(&self.dc_name()).ip,
+            dc_ip: &dc_ip,
             lan_mac: &vm.mac,
-            domain: &self.lab.domain,
-            netbios: &self.lab.netbios,
+            domain: self.lab.domain(),
+            netbios: self.lab.netbios(),
             admin_password: &self.lab.admin_password,
             users,
             logon_user,
@@ -754,9 +810,10 @@ impl MultiLab {
             cpus: Some(vm.cpus.clone()),
             disk,
             cds,
-            lan: Some(Lan { group: LAN_GROUP.into(), port: self.lab.lan_port }),
-            lan_mac: Some(vm.mac.clone()),
-            // the DC is isolated (no internet); members keep user-mode NAT
+            // the private lab LAN (none for a single workgroup machine)
+            lan: self.lab.network.as_ref().map(|n| Lan { group: LAN_GROUP.into(), port: n.lan_port }),
+            lan_mac: self.lab.network.as_ref().map(|_| vm.mac.clone()),
+            // the DC is isolated (no internet); every other machine keeps user-mode NAT
             no_usernet: vm.role == Role::Dc,
             no_shutdown: true,
             uefi: self.uefi_vars(vm)?,
@@ -873,7 +930,7 @@ impl MultiLab {
         log(&format!(
             "logs: {} (guest: C:\\WTL\\agent.log); the VMs keep running - lab restore {}",
             self.st(&format!("{}.serial.log", vm)).display(),
-            self.name
+            self.arg
         ));
         Exit(if o == Outcome::Timeout { 3 } else { 2 }).into()
     }
@@ -901,7 +958,7 @@ impl MultiLab {
         if self.zero_done.is_file() {
             return Ok(());
         }
-        log(&format!("=== building the 0 state of lab {} (domain {}; {} machines, once) ===", self.name, self.lab.domain, self.vms.len()));
+        log(&format!("=== building the 0 state of lab {} ({}; {} machines, once) ===", self.name, self.mode_text(), self.vms.len()));
         self.restore()?;
         self.build_bases()?;
         for vm in self.vm_names() {
@@ -912,30 +969,34 @@ impl MultiLab {
             self.qemu_img_create(&base, &self.zero_disk(&vm))?;
         }
         self.boot_lab(true)?;
-        let dc = self.dc_name();
-        log("creating the domain (DC: AD DS + forest + users, one reboot)");
-        let line = self.wait_ev(&dc, "LAB_DC_READY", "LAB_FAIL,ERROR", "domain controller")?;
-        ok(&format!("DC ready: {}", line));
-        // members: join, reboot, autologon, ready, then idle (shutdown_when_ready)
-        let members: Vec<String> = self.vms.iter().filter(|v| v.role == Role::Member).map(|v| v.name.clone()).collect();
+        if let Some(dc) = self.dc_name() {
+            log("creating the domain (DC: AD DS + forest + users, one reboot)");
+            let line = self.wait_ev(&dc, "LAB_DC_READY", "LAB_FAIL,ERROR", "domain controller")?;
+            ok(&format!("DC ready: {}", line));
+        }
+        // the other machines: join (AD) or set up local users (workgroup), reboot, autologon,
+        // ready, then idle (shutdown_when_ready)
+        let members = self.member_names();
+        let (doing, label) = if self.lab.is_ad() { ("joining", "domain join") } else { ("setting up", "setup") };
         for m in &members {
-            log(&format!("joining {} (one reboot, then autologon)", m));
-            self.wait_ev(m, "LAB_JOINED", "LAB_FAIL,ERROR", &format!("{} domain join", m))?;
+            log(&format!("{} {} (one reboot, then autologon)", doing, m));
+            self.wait_ev(m, "LAB_JOINED", "LAB_FAIL,ERROR", &format!("{} {}", m, label))?;
         }
         for m in &members {
-            self.wait_logon(m, &format!("{} logon after the join", m))?;
+            self.wait_logon(m, &format!("{} logon after the {}", m, label))?;
             let line = self.wait_ev(m, "LAB_CLIENT_READY", "LAB_FAIL,ERROR", m)?;
             ok(&format!("{} ready: {}", m, line));
             self.wait_ev(m, "LAB_IDLE", "LAB_FAIL,ERROR", m)?;
         }
-        self.settle(20.0)?; // let first logons finish (profile, group policy) before the freeze
-                            // power off: members first, DC last
+        // let first logons finish (profile, group policy) before the freeze; then power off,
+        // members first, DC last
+        self.settle(20.0)?;
         let mut order = self.vm_names();
         order.sort_by_key(|n| if self.vm(n).role == Role::Dc { 1 } else { 0 });
         for vm in &order {
             log(&format!("shutting {} down cleanly", vm));
             if !self.freeze_off(vm)? {
-                bail!("{} did not power off; 0 state not saved (lab rebuild {}, then retry)", vm, self.name);
+                bail!("{} did not power off; 0 state not saved (lab rebuild {}, then retry)", vm, self.arg);
             }
             let _ = std::fs::remove_file(self.st(&format!("{}.pid", vm)));
             let _ = std::fs::remove_file(self.st(&format!("{}.iso", vm)));
@@ -954,23 +1015,30 @@ impl MultiLab {
 
     fn summary(&self) {
         eprintln!();
-        eprintln!("  lab {}: domain {}", self.name, self.lab.domain);
+        eprintln!("  lab {}: {}", self.name, self.mode_text());
         for v in &self.vms {
+            // who is logged on: DOMAIN\user in AD mode, MACHINE\user (a local account) otherwise
+            let realm = if self.lab.is_ad() { self.lab.netbios().to_string() } else { v.name.clone() };
             let who = match &v.logon {
-                Some(u) => format!("logon {}\\{}", self.lab.netbios, u),
-                None => format!("{}\\Administrator", self.lab.netbios),
+                Some(u) => format!("logon {}\\{}", realm, u),
+                None => format!("{}\\Administrator", realm),
             };
-            let role = if v.role == Role::Dc { "DC    " } else { "member" };
+            let role = match (v.role, self.lab.is_ad()) {
+                (Role::Dc, _) => "DC    ",
+                (Role::Member, true) => "member",
+                (Role::Member, false) => "single",
+            };
+            let ip = if v.ip.is_empty() { "(NAT only)" } else { v.ip.as_str() };
             eprintln!(
                 "    {} {:<15} {}  {}  {}",
                 role,
                 v.name,
-                v.ip,
+                ip,
                 read_trim(&self.st(&format!("{}.vnc", v.name))).unwrap_or_default(),
                 who
             );
         }
-        eprintln!("  back to the 0 state: lab restore {}      another run: lab run CONFIG", self.name);
+        eprintln!("  back to the 0 state: lab restore {}      another run: lab run CONFIG", self.arg);
     }
 
     fn run_lab(&mut self) -> Result<i32> {
@@ -999,11 +1067,11 @@ impl MultiLab {
         }
         log(&format!("lab {}: booting {} machines from the 0 state", self.name, self.vms.len()));
         self.boot_lab(false)?;
-        let dc = self.dc_name();
-        self.wait_ev(&dc, "LAB_DC_READY", "LAB_FAIL,ERROR", "domain controller")?;
-        ok("DC ready");
-        let members: Vec<String> = self.vms.iter().filter(|v| v.role == Role::Member).map(|v| v.name.clone()).collect();
-        for m in &members {
+        if let Some(dc) = self.dc_name() {
+            self.wait_ev(&dc, "LAB_DC_READY", "LAB_FAIL,ERROR", "domain controller")?;
+            ok("DC ready");
+        }
+        for m in &self.member_names() {
             self.wait_logon(m, &format!("{} logon", m))?;
             self.wait_ev(m, "LAB_CLIENT_READY", "LAB_FAIL,ERROR", m)?;
             ok(&format!("{} ready", m));
@@ -1132,18 +1200,29 @@ pub fn load_lab(path: &Path) -> Result<Lab> {
     labdef::LabDef::load(path)
 }
 
-/// Resolve the run file against its lab (found at `labs/<lab>.json` under the root). Returns the
-/// lab file path, the resolved lab, and the resolved run.
+/// Resolve the run file against its lab: `"lab": "school"` is `labs/school.json` under the
+/// win-test-lab root, `"lab": "./lab.json"` (anything with a `/` or `\`, or ending in
+/// `.json`) is a lab file relative to the run file. Returns the lab file path, the resolved
+/// lab, and the resolved run.
 pub fn load_run(config: &Path) -> Result<(PathBuf, Lab, Run)> {
     let root = find_root()?;
     let text = std::fs::read_to_string(config).map_err(|e| anyhow!("{}: {}", config.display(), e))?;
     let def = labdef::RunDef::parse(&text, &config.display().to_string())?;
-    let lab_file = root.join("labs").join(format!("{}.json", def.lab));
+    let base_dir = util::abspath(config).parent().unwrap_or(Path::new(".")).to_path_buf();
+    let lab_file = if labdef::lab_is_path(&def.lab) {
+        let p = Path::new(&def.lab);
+        let p = if p.is_absolute() { p.to_path_buf() } else { base_dir.join(p) };
+        util::canon(&util::normpath(&p))
+    } else {
+        if !util::is_safe_name(&def.lab) {
+            bail!("{}: lab {:?} must be a lab name (A-Z 0-9 . _ -) or a path to a lab file", config.display(), def.lab);
+        }
+        root.join("labs").join(format!("{}.json", def.lab))
+    };
     if !lab_file.is_file() {
         bail!("{}: lab {:?} not found ({} missing)", config.display(), def.lab, lab_file.display());
     }
     let lab = labdef::LabDef::load(&lab_file)?;
-    let base_dir = util::abspath(config).parent().unwrap_or(Path::new(".")).to_path_buf();
     let host_resolve = |h: &str| {
         let p = Path::new(h);
         if p.is_absolute() {
@@ -1164,5 +1243,27 @@ mod tests {
     #[test]
     fn lan_group_is_admin_scoped() {
         assert!(LAN_GROUP.starts_with("239."));
+    }
+
+    #[test]
+    fn state_names_do_not_collide() {
+        let lab = |name: Option<&str>| Lab {
+            name: name.map(str::to_string),
+            mode: labdef::Mode::Workgroup,
+            admin_password: "p".into(),
+            network: None,
+            machines: vec![],
+            users: vec![],
+        };
+        let root = Path::new("/r");
+        // labs/ in the checkout: the file name
+        assert_eq!(state_name(root, Path::new("/r/labs/school.json"), &lab(None)), "school");
+        // elsewhere: the file name + a hash of the path, different per project
+        let a = state_name(root, Path::new("/p1/wintest/lab.json"), &lab(None));
+        let b = state_name(root, Path::new("/p2/wintest/lab.json"), &lab(None));
+        assert!(a.starts_with("lab-") && a.len() == 12 && a != b, "{} {}", a, b);
+        assert_eq!(a, state_name(root, Path::new("/p1/wintest/lab.json"), &lab(None)), "stable");
+        // an explicit name wins
+        assert_eq!(state_name(root, Path::new("/p1/wintest/lab.json"), &lab(Some("myapp"))), "myapp");
     }
 }

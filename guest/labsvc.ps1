@@ -77,8 +77,8 @@ function Invoke-SvcRun($Req) {
     $resolved = Resolve-SvcLaunch $path $userArgs
     $file = $resolved[0]; $argLine = $resolved[1]
 
-    # run as another user (not logged on): SYSTEM launches it with that account's credentials
-    # via ProcessStartInfo (CreateProcessWithLogonW); output still captured. No GUI (session 0).
+    # run as another user (not logged on): SYSTEM logs that account on and starts the program
+    # with its token; output still captured. No desktop.
     if ($runUser) {
         return (Invoke-SvcRunAs $file $argLine $cwd $outFile $errFile $runUser $runPass $runDomain $timeout $keepRunning)
     }
@@ -109,62 +109,132 @@ function Invoke-SvcRun($Req) {
     return @{ ok = $true; exit = $code; secs = [Math]::Round(([DateTime]::Now - $t0).TotalSeconds, 1) }
 }
 
-# Run a program as another domain user (not the logged-on one). SYSTEM has SeAssignPrimaryToken,
-# so ProcessStartInfo with UserName/Password uses CreateProcessWithLogonW. Output is redirected
-# to files. The process runs in session 0 with no desktop (fine for console programs / installers).
+# Start a program as another user from SYSTEM: LogonUser + CreateProcessAsUser (what services
+# use; CreateProcessWithLogonW, behind Process.Start with credentials, refuses to run from
+# LocalSystem). The user's profile is loaded and its environment used; stdin/stdout/stderr are
+# files opened here and inherited, so the user needs no rights on C:\WTL. lpDesktop "" puts the
+# process on a window station of its own logon session (no desktop; console programs and
+# installers are fine).
+$SvcRunAsSource = @'
+using System;
+using System.Runtime.InteropServices;
+public static class WtlRunAs {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct STARTUPINFO {
+        public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct SECURITY_ATTRIBUTES { public int nLength; public IntPtr lpSecurityDescriptor; public bool bInheritHandle; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct PROFILEINFO {
+        public int dwSize, dwFlags; public string lpUserName, lpProfilePath, lpDefaultPath, lpServerName, lpPolicyPath;
+        public IntPtr hProfile;
+    }
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool LogonUser(string user, string domain, string password, int type, int provider, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool CreateProcessAsUser(IntPtr token, string app, string cmd, IntPtr pa, IntPtr ta, bool inherit,
+        uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr CreateFile(string name, uint access, uint share, ref SECURITY_ATTRIBUTES sa, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr h, uint ms);
+    [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr h, out uint code);
+    [DllImport("userenv.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool LoadUserProfile(IntPtr token, ref PROFILEINFO pi);
+    [DllImport("userenv.dll", SetLastError = true)] static extern bool UnloadUserProfile(IntPtr token, IntPtr profile);
+    [DllImport("userenv.dll", SetLastError = true)] static extern bool CreateEnvironmentBlock(out IntPtr env, IntPtr token, bool inherit);
+    [DllImport("userenv.dll", SetLastError = true)] static extern bool DestroyEnvironmentBlock(IntPtr env);
+
+    static IntPtr Open(string path, bool write) {
+        SECURITY_ATTRIBUTES sa = new SECURITY_ATTRIBUTES();
+        sa.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+        sa.bInheritHandle = true;
+        IntPtr h = write ? CreateFile(path, 0x40000000, 3, ref sa, 2, 0x80, IntPtr.Zero)   // GENERIC_WRITE, CREATE_ALWAYS
+                         : CreateFile(path, 0x80000000, 3, ref sa, 3, 0x80, IntPtr.Zero);  // GENERIC_READ, OPEN_EXISTING
+        if (h == new IntPtr(-1)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "cannot open " + path);
+        return h;
+    }
+
+    // Run CMDLINE as DOMAIN\USER (DOMAIN "." = a local account). Returns { state, code, pid }:
+    // state 0 = exited with code, 1 = still running after timeoutMs (left running; the caller
+    // stops it or keeps it).
+    public static long[] Run(string user, string domain, string password, string cmdline, string cwd,
+                             string outPath, string errPath, string inPath, int timeoutMs) {
+        IntPtr token;
+        // an interactive logon gives the usual user token; batch, then network, where the user
+        // may not log on interactively (e.g. a plain domain user on a DC)
+        if (!LogonUser(user, domain, password, 2, 0, out token) && !LogonUser(user, domain, password, 4, 0, out token)
+            && !LogonUser(user, domain, password, 3, 0, out token))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "logon as " + domain + "\\" + user + " failed");
+        PROFILEINFO prof = new PROFILEINFO();
+        prof.dwSize = Marshal.SizeOf(typeof(PROFILEINFO));
+        prof.dwFlags = 1;   // PI_NOUI
+        prof.lpUserName = user;
+        bool profLoaded = LoadUserProfile(token, ref prof);
+        IntPtr env;
+        if (!CreateEnvironmentBlock(out env, token, false)) env = IntPtr.Zero;
+        IntPtr hIn = Open(inPath, false), hOut = Open(outPath, true), hErr = Open(errPath, true);
+        PROCESS_INFORMATION pi;
+        try {
+            STARTUPINFO si = new STARTUPINFO();
+            si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+            si.lpDesktop = "";
+            si.dwFlags = 0x100;   // STARTF_USESTDHANDLES
+            si.hStdInput = hIn; si.hStdOutput = hOut; si.hStdError = hErr;
+            uint flags = 0x00000400 | 0x08000000;   // CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW
+            if (!CreateProcessAsUser(token, null, cmdline, IntPtr.Zero, IntPtr.Zero, true, flags, env, cwd, ref si, out pi))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "starting " + cmdline + " as " + domain + "\\" + user + " failed");
+        } finally {
+            CloseHandle(hIn); CloseHandle(hOut); CloseHandle(hErr);
+            if (env != IntPtr.Zero) DestroyEnvironmentBlock(env);
+        }
+        CloseHandle(pi.hThread);
+        long state = 1, code = 0;
+        if (WaitForSingleObject(pi.hProcess, (uint)Math.Max(0, timeoutMs)) == 0) {
+            uint c;
+            GetExitCodeProcess(pi.hProcess, out c);
+            state = 0; code = (int)c;
+        }
+        CloseHandle(pi.hProcess);
+        if (state == 0 && profLoaded) UnloadUserProfile(token, prof.hProfile);
+        CloseHandle(token);
+        return new long[] { state, code, pi.dwProcessId };
+    }
+}
+'@
+
+# Run a program as another lab user (not the logged-on one): a domain user in an AD lab
+# ($Domain = the NetBIOS name), a local user in a workgroup lab ($Domain = '.').
 function Invoke-SvcRunAs([string]$File, [string]$ArgLine, [string]$Cwd, [string]$OutFile, [string]$ErrFile,
                          [string]$User, [string]$Pass, [string]$Domain, [int]$Timeout, [bool]$KeepRunning) {
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $File
-    $psi.Arguments = $ArgLine
-    if ($Cwd -and (Test-Path -LiteralPath $Cwd)) { $psi.WorkingDirectory = $Cwd }
-    $psi.UserName = $User
-    if ($Domain) { $psi.Domain = $Domain }
-    $sec = New-Object System.Security.SecureString
-    foreach ($ch in $Pass.ToCharArray()) { $sec.AppendChar($ch) }
-    $psi.Password = $sec
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.CreateNoWindow = $true
+    if (-not ('WtlRunAs' -as [type])) { Add-Type -TypeDefinition $SvcRunAsSource }
+    if (-not $Domain) { $Domain = '.' }
+    $inFile = Join-Path $SvcDir 'empty.in'
+    if (-not (Test-Path -LiteralPath $inFile)) { [System.IO.File]::WriteAllText($inFile, '') }
+    $cmdline = '"' + $File + '"'
+    if ($File -notmatch '\\') {
+        # a bare program name (powershell.exe, msiexec.exe): CreateProcess finds it on the PATH
+        $cmdline = $File
+    }
+    if ($ArgLine) { $cmdline += ' ' + $ArgLine }
+    $wd = $null
+    if ($Cwd -and (Test-Path -LiteralPath $Cwd)) { $wd = $Cwd }
     $t0 = [DateTime]::Now
-    $proc = $null
-    try { $proc = [System.Diagnostics.Process]::Start($psi) } catch {
+    $r = $null
+    try { $r = [WtlRunAs]::Run($User, $Domain, $Pass, $cmdline, $wd, $OutFile, $ErrFile, $inFile, [Math]::Max(5, $Timeout) * 1000) } catch {
         return @{ ok = $false; error = "run as ${Domain}\${User} failed: $($_.Exception.Message)" }
     }
-    if ($proc -eq $null) { return @{ ok = $false; error = "run as ${Domain}\${User}: Process.Start returned null" } }
-    # drain the pipes on background threads so a chatty program cannot deadlock
-    $outBuf = New-Object System.Text.StringBuilder
-    $errBuf = New-Object System.Text.StringBuilder
-    $null = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -Action { if ($EventArgs.Data -ne $null) { [void]$Event.MessageData.Append($EventArgs.Data + "`r`n") } } -MessageData $outBuf
-    $null = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -Action { if ($EventArgs.Data -ne $null) { [void]$Event.MessageData.Append($EventArgs.Data + "`r`n") } } -MessageData $errBuf
-    $proc.BeginOutputReadLine()
-    $proc.BeginErrorReadLine()
-    $deadline = $t0.AddSeconds([Math]::Max(5, $Timeout))
-    $timedOut = $false
-    while (-not $proc.HasExited) {
-        if ([DateTime]::Now -ge $deadline) { $timedOut = $true; break }
-        Start-Sleep -Milliseconds 250
+    $secs = [Math]::Round(([DateTime]::Now - $t0).TotalSeconds, 1)
+    if ($r[0] -eq 1) {
+        if ($KeepRunning) { return @{ ok = $true; running = $true; secs = $secs } }
+        try { & taskkill.exe /T /F /PID $r[2] 2>&1 | Out-Null } catch { }
+        return @{ ok = $true; timed_out = $true; secs = $secs }
     }
-    $flush = {
-        try { [System.IO.File]::WriteAllText($OutFile, $outBuf.ToString()) } catch { }
-        try { [System.IO.File]::WriteAllText($ErrFile, $errBuf.ToString()) } catch { }
-    }
-    if ($timedOut -and $KeepRunning) {
-        & $flush
-        return @{ ok = $true; running = $true; secs = [Math]::Round(([DateTime]::Now - $t0).TotalSeconds, 1) }
-    }
-    if ($timedOut) {
-        try { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null } catch { }
-        try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
-        & $flush
-        return @{ ok = $true; timed_out = $true; secs = [Math]::Round(([DateTime]::Now - $t0).TotalSeconds, 1) }
-    }
-    $code = -1
-    try { $proc.WaitForExit(); $code = $proc.ExitCode } catch { }
-    Start-Sleep -Milliseconds 100
-    & $flush
-    return @{ ok = $true; exit = $code; secs = [Math]::Round(([DateTime]::Now - $t0).TotalSeconds, 1) }
+    return @{ ok = $true; exit = [int]$r[1]; secs = $secs }
 }
 
 function Invoke-Request($ReqPath) {

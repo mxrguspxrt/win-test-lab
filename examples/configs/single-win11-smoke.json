@@ -1,0 +1,9 @@
+{
+  "$schema": "../../wtl-rs/schema/run.schema.json",
+  "lab": "single-win11",
+  "mount": { "X": "../smoke-test/out" },
+  "steps": [
+    { "as": "system", "run": "X:/setup.bat" },
+    { "run": "X:/smoke.exe" }
+  ]
+}

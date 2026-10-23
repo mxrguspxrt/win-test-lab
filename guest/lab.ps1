@@ -124,8 +124,11 @@ function Get-LabAdapter([string]$Mac) {
     }
 }
 
-# static IP on the lab NIC; every adapter uses the DC for DNS and registers nothing but the lab IP
+# static IP on the lab NIC. In an AD lab every adapter uses the DC for DNS and registers nothing
+# but the lab IP; in a workgroup the NAT adapter keeps its DHCP DNS. No lab NIC (a single
+# workgroup machine): nothing to do.
 function Set-LabNetwork($Cfg) {
+    if (-not $Cfg.lan) { return }
     $a = Get-LabAdapter ([string]$Cfg.lan_mac)
     $if = $a.ifIndex
     try { Rename-NetAdapter -Name $a.Name -NewName 'LAB' -ErrorAction Stop } catch { }
@@ -136,11 +139,57 @@ function Set-LabNetwork($Cfg) {
         New-NetIPAddress -InterfaceIndex $if -IPAddress ([string]$Cfg.ip) -PrefixLength ([int]$Cfg.prefix) | Out-Null
     }
     Set-NetIPInterface -InterfaceIndex $if -InterfaceMetric 5 -ErrorAction SilentlyContinue
+    if (-not $Cfg.dc_ip) {
+        Send-LabPhase "network: $($Cfg.ip)/$($Cfg.prefix) on the lab NIC (workgroup)"
+        return
+    }
     foreach ($n in @(Get-NetAdapter -ErrorAction SilentlyContinue)) {
         Set-DnsClientServerAddress -InterfaceIndex $n.ifIndex -ServerAddresses @([string]$Cfg.dc_ip)
         if ($n.ifIndex -ne $if) { Set-DnsClient -InterfaceIndex $n.ifIndex -RegisterThisConnectionsAddress $false -ErrorAction SilentlyContinue }
     }
     Send-LabPhase "network: $($Cfg.ip)/$($Cfg.prefix) on the lab NIC, DNS $($Cfg.dc_ip)"
+}
+
+# The local Administrator gets the lab's admin_password (the base image has the default one),
+# and the next autologon uses it. On the DC this becomes the domain Administrator's password.
+function Set-LabLocalAdmin($Cfg) {
+    $pw = [string]$Cfg.admin_password
+    if (-not $pw) { return }
+    Invoke-LabNative 'net.exe' @('user', 'Administrator', $pw)
+    Set-LabAutoLogon $env:COMPUTERNAME 'Administrator' $pw
+}
+
+# Run a native command only for its exit code (its output, stderr included, is dropped). The
+# agent runs with ErrorActionPreference=Stop, under which a native command's stderr would throw.
+function Test-LabNative([string]$Exe, [string[]]$Arguments) {
+    $ErrorActionPreference = 'Continue'
+    $null = & $Exe @Arguments 2>&1
+    return ($LASTEXITCODE -eq 0)
+}
+
+# Workgroup mode: the lab's users as local accounts on this machine, in their (local) groups;
+# a group that does not exist is created. Passwords never expire.
+function New-LabLocalUsers($Cfg) {
+    foreach ($u in @($Cfg.users)) {
+        if (-not $u) { continue }
+        $name = [string]$u.name
+        $pw = [string]$u.password
+        if (Test-LabNative 'net.exe' @('user', $name)) { Invoke-LabNative 'net.exe' @('user', $name, $pw) }
+        else { Invoke-LabNative 'net.exe' @('user', $name, $pw, '/add') }
+        if (-not (Test-LabNative 'net.exe' @('user', $name))) { throw "creating the local user $name failed (password too simple, or contains the user name?)" }
+        try {
+            $acct = [ADSI]"WinNT://./$name,user"
+            $acct.UserFlags.Value = $acct.UserFlags.Value -bor 0x10000   # DONT_EXPIRE_PASSWD
+            $acct.SetInfo()
+        } catch { Send-LabPhase "user ${name}: could not set 'password never expires': $($_.Exception.Message)" }
+        $groups = @($u.groups | Where-Object { $_ })
+        foreach ($g in $groups) {
+            if (-not (Test-LabNative 'net.exe' @('localgroup', $g))) { Invoke-LabNative 'net.exe' @('localgroup', $g, '/add') }
+            [void](Test-LabNative 'net.exe' @('localgroup', $g, $name, '/add'))   # fails if already a member
+            if (-not (Test-LabNative 'net.exe' @('localgroup', $g))) { throw "creating the local group $g failed" }
+        }
+        Send-LabPhase ("local user $name" + $(if ($groups.Count) { ' in ' + ($groups -join ', ') } else { '' }))
+    }
 }
 
 # ---------------------------------------------------------------- domain controller
@@ -171,8 +220,10 @@ function New-LabUser($Cfg, $U) {
 function Invoke-LabDc($Cfg) {
     $phase = Get-LabPhase
     if ($phase -eq 'new') {
-        # multi-machine lab: the machine key is the Windows computer name. Rename before promoting
-        # (a promoted DC cannot be renamed), then reboot and re-enter 'new' with the name matching.
+        # the machine key is the Windows computer name. Rename before promoting (a promoted DC
+        # cannot be renamed), then reboot and re-enter 'new' with the name matching. The local
+        # Administrator gets admin_password first: promotion makes it the domain Administrator.
+        Set-LabLocalAdmin $Cfg
         if (Rename-LabComputer $Cfg) { return 'reboot' }
         Set-LabNetwork $Cfg
         Set-LabShutdownFriendly
@@ -248,16 +299,38 @@ function Register-LabSvc([string]$LabDir) {
 
 function Invoke-LabClient($Cfg, [string]$LabDir) {
     $phase = Get-LabPhase
+    $ad = ([string]$Cfg.mode -ne 'workgroup')
+    # the account this machine logs on as: its logon user, else Administrator; in the domain
+    # (AD) or on this machine (workgroup)
     $user = [string]$Cfg.logon_user
+    $pass = [string]$Cfg.logon_password
+    if (-not $user) { $user = 'Administrator'; $pass = [string]$Cfg.admin_password }
+    $realm = [string]$Cfg.netbios
+    if (-not $ad) { $realm = [string]$Cfg.machine }
     if ($phase -eq 'new') {
         Set-LabNetwork $Cfg
         Set-LabShutdownFriendly
-        # the agent runs as the domain user from now on: it writes its log and output under C:\WTL
+        # the agent runs as the logon user from now on: it writes its log and output under C:\WTL
         Invoke-LabNative 'icacls.exe' @('C:\WTL', '/grant', '*S-1-5-32-545:(OI)(CI)M', '/T', '/Q')
         Register-LabSvc $LabDir
         # programs are unpacked on the user's desktop; Defender (2016+) must not eat them
         if (Get-Command Add-MpPreference -ErrorAction SilentlyContinue) {
             try { Add-MpPreference -ExclusionPath 'C:\Users' -ErrorAction Stop } catch { Send-LabPhase "Defender exclusion failed: $($_.Exception.Message)" }
+        }
+        Set-LabLocalAdmin $Cfg
+        if (-not $ad) {
+            # workgroup: local users + groups, rename to the machine key; one reboot
+            New-LabLocalUsers $Cfg
+            $want = [string]$Cfg.machine
+            if ($want -and $env:COMPUTERNAME -ne $want) {
+                Send-LabPhase "renaming this computer $env:COMPUTERNAME -> $want"
+                Rename-Computer -NewName $want -Force -ErrorAction Stop -WarningAction SilentlyContinue
+            }
+            Set-LabAutoLogon $realm $user $pass
+            Set-LabPhase 'joined'
+            Send-WtlEvent 'LAB_JOINED' @('workgroup', $want, 'autologon', "$realm\$user")
+            Restart-Computer -Force
+            return 'reboot'
         }
         Wait-LabDc $Cfg
         $cred = New-Object System.Management.Automation.PSCredential(([string]$Cfg.netbios + '\Administrator'), (ConvertTo-LabSecure ([string]$Cfg.admin_password)))
@@ -278,25 +351,29 @@ function Invoke-LabClient($Cfg, [string]$LabDir) {
                 Start-Sleep -Seconds 30
             }
         }
-        Set-LabAutoLogon ([string]$Cfg.netbios) $user ([string]$Cfg.logon_password)
+        Set-LabAutoLogon $realm $user $pass
         # the first domain logon has no cached credentials: wait for the network before logging on
         $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon'
         if (-not (Test-Path $pol)) { New-Item -Path $pol -Force | Out-Null }
         New-ItemProperty -Path $pol -Name 'SyncForegroundPolicy' -Value 1 -PropertyType DWord -Force | Out-Null
         Set-LabPhase 'joined'
-        Send-WtlEvent 'LAB_JOINED' @('domain', $Cfg.domain, 'autologon', "$($Cfg.netbios)\$user")
+        Send-WtlEvent 'LAB_JOINED' @('domain', $Cfg.domain, 'autologon', "$realm\$user")
         Restart-Computer -Force
         return 'reboot'
     }
 
-    # boots from the 0 state start DC and client together: the program should find the domain up
-    Wait-LabDc $Cfg
     $who = "$env:USERDOMAIN\$env:USERNAME"
     $cs = Get-WmiObject -Class Win32_ComputerSystem
-    if (-not $cs.PartOfDomain) { throw 'this computer is not in a domain' }
-    if ($env:USERDOMAIN -ne $Cfg.netbios -or $env:USERNAME -ne $user) {
-        throw "logged on as $who, expected $($Cfg.netbios)\$user (autologon)"
+    if ($env:USERDOMAIN -ne $realm -or $env:USERNAME -ne $user) {
+        throw "logged on as $who, expected $realm\$user (autologon)"
     }
+    if (-not $ad) {
+        Send-WtlEvent 'LAB_CLIENT_READY' @('user', $who, 'workgroup', $cs.Workgroup, 'computer', $env:COMPUTERNAME, 'ip', $Cfg.ip)
+        return 'ready'
+    }
+    # boots from the 0 state start DC and client together: the program should find the domain up
+    Wait-LabDc $Cfg
+    if (-not $cs.PartOfDomain) { throw 'this computer is not in a domain' }
     $dc = ''
     try { $dc = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().FindDomainController().Name } catch {
         Send-LabPhase "DC lookup failed: $($_.Exception.Message)"
@@ -338,12 +415,12 @@ function Set-LabMounts($Mounts) {
 
 # ---------------------------------------------------------------- run steps
 #
-# A lab is one DC + N domain-joined members on one private multicast LAN. The DC creates every
-# lab user; a member joins, sets its own autologon user, and (on a run) runs the steps the host
-# put on its control disc; the DC may run steps too. A step's `as`
-# is "system" (the SYSTEM worker), "logon" (this machine's own logged-on user, foreground), or
-# "user" (another account, launched by the worker with its credentials). Each LAB_STEP carries
-# machine= so the host can tell the machines' reports apart.
+# An AD lab is one DC + N domain-joined members; a workgroup lab is standalone machines with
+# local users. Every machine runs the steps the host put on its control disc (the DC too). A
+# step's `as` is "system" (the SYSTEM worker), "logon" (this machine's own logged-on user,
+# foreground), or "user" (another lab user - a domain user in AD mode, a local user in
+# workgroup mode - started by the worker with its password). Each LAB_STEP carries machine= so
+# the host can tell the machines' reports apart.
 
 function Invoke-LabMemberSteps($Cfg) {
     $run = $Cfg.run
@@ -383,7 +460,9 @@ function Invoke-LabMultiStep($Cfg, [string]$Machine, [int]$N, $S, [int]$TimeoutS
     if ($as -eq 'user') {
         $req['user'] = [string]$S.user
         $req['password'] = [string]$S.password
+        # a domain user in an AD lab, a local account ('.') in a workgroup
         $req['domain'] = [string]$Cfg.netbios
+        if ([string]$Cfg.mode -eq 'workgroup') { $req['domain'] = '.' }
     }
 
     if ($as -eq 'logon') {

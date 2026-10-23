@@ -15,7 +15,7 @@
       ]
     },
     "lab": {
-      "description": "The lab to boot: `labs/<lab>.json`.",
+      "description": "The lab to boot: a name (`labs/<lab>.json` in win-test-lab, e.g. `school`) or a path to a lab file, relative to this run file (e.g. `./lab.json`). A value with a `/` or `\\` or ending in `.json` is a path.",
       "type": "string"
     },
     "name": {
@@ -80,7 +80,7 @@
           ]
         },
         "as": {
-          "description": "Who to run as: `system` (full rights) or a user name. Default: that machine's `logon` user.",
+          "description": "Who to run as: `system` (full rights) or a user name. Default: the user logged on to that machine (its `logon` user, else Administrator). A step on the DC needs an `as`.",
           "default": null,
           "type": [
             "string",

@@ -1,14 +1,10 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "LabDef",
-  "description": "A lab definition file: `labs/<name>.json`.",
+  "description": "A lab definition file, e.g. `labs/<name>.json`, or a `lab.json` in your own project.\n\nTwo modes, decided by the machines: with one machine of `role: \"dc\"` the lab is an **AD domain** (`domain` and `netbios` required, users are domain users, the other machines join the domain); with no `dc` it is a **workgroup** (no domain; users are local accounts created on every machine). Any Windows Server may be the DC and any OS a member.",
   "type": "object",
   "required": [
-    "admin_password",
-    "domain",
-    "machines",
-    "netbios",
-    "network"
+    "machines"
   ],
   "properties": {
     "$schema": {
@@ -18,30 +14,59 @@
         "null"
       ]
     },
+    "name": {
+      "description": "The lab's name: names its state folder `labs/state/<name>/` and its VMs. Default: the file name without `.json` (for a lab outside win-test-lab's `labs/`, plus a short hash of its path, so two projects' `lab.json` never share a state).",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "domain": {
-      "description": "AD forest DNS name, e.g. `lab.local`.",
-      "type": "string"
+      "description": "AD mode: the forest's DNS name, e.g. `lab.local`. Must be absent in workgroup mode.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "netbios": {
-      "description": "NetBIOS domain name, e.g. `LAB` (users log on as `LAB\\student`).",
-      "type": "string"
+      "description": "AD mode: the NetBIOS domain name, e.g. `LAB` (users log on as `LAB\\student`). Must be absent in workgroup mode.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "admin_password": {
-      "description": "Password of the domain Administrator (also the DSRM password).",
-      "type": "string"
+      "description": "Password of the Administrator: the domain Administrator (and DSRM) in AD mode, each machine's local Administrator in workgroup mode. Default `WinTest!2026` (what the base images are installed with).",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "network": {
-      "$ref": "#/definitions/NetworkDef"
+      "description": "The private network between the machines. Required unless the lab is one workgroup machine (which then only has the host's NAT network).",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/NetworkDef"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "machines": {
-      "description": "The machines, keyed by computer name. Exactly one must have `role: dc`.",
+      "description": "The machines, keyed by computer name. At most one has `role: dc` (none = workgroup).",
       "type": "object",
       "additionalProperties": {
         "$ref": "#/definitions/MachineDef"
       }
     },
     "users": {
-      "description": "Domain users. Each is always in Domain Users; named groups are created if missing.",
+      "description": "The users: domain users in AD mode (always in Domain Users), local users on every machine in workgroup mode (always in Users). Named groups are created if missing.",
       "default": {},
       "type": "object",
       "additionalProperties": {
@@ -60,7 +85,7 @@
       ],
       "properties": {
         "subnet": {
-          "description": "First three octets of the /24, e.g. `10.77.30` (DC gets .10, members .20, .21, ...).",
+          "description": "First three octets of the /24, e.g. `10.77.30` (DC gets .10, the others .20, .21, ...).",
           "type": "string"
         },
         "lan_port": {
@@ -93,7 +118,7 @@
           ]
         },
         "logon": {
-          "description": "A user (from `users`) this machine logs on as automatically. Members usually set one; the DC does not.",
+          "description": "A user (from `users`) this machine logs on as automatically; without one it logs on as Administrator. The DC cannot set one.",
           "default": null,
           "type": [
             "string",
@@ -135,14 +160,14 @@
       "description": "What a machine is for.",
       "oneOf": [
         {
-          "description": "the domain controller (exactly one per lab)",
+          "description": "the domain controller (at most one per lab; one makes it an AD lab). A Windows Server.",
           "type": "string",
           "enum": [
             "dc"
           ]
         },
         {
-          "description": "a domain-joined member (the default)",
+          "description": "a domain-joined member in AD mode, a standalone machine in workgroup mode (the default)",
           "type": "string",
           "enum": [
             "member"
@@ -151,7 +176,7 @@
       ]
     },
     "UserDef": {
-      "description": "One domain user.",
+      "description": "One user (a domain user in AD mode, a local user on every machine in workgroup mode).",
       "type": "object",
       "required": [
         "password"
@@ -161,7 +186,7 @@
           "type": "string"
         },
         "groups": {
-          "description": "Extra groups besides Domain Users; a group that does not exist is created.",
+          "description": "Extra groups (domain groups in AD mode, e.g. \"Domain Admins\"; local groups in workgroup mode, e.g. \"Administrators\"). A group that does not exist is created.",
           "default": [],
           "type": "array",
           "items": {

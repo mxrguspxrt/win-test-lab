@@ -1,21 +1,25 @@
 # win-test-lab
 
-Test your Windows software inside a small Active Directory domain, on any mix of Windows
-versions, on your own Linux machine: a domain controller plus domain-joined machines, each
-logged on as an ordinary domain user, all on a private network. Describe the lab once in a
-JSON file, run your program on it, look at the results, reset it to a clean state in a
-second, repeat.
+> **Testing your own project?** See [docs/USING.md](docs/USING.md): install once, keep a
+> `wintest/` folder with a lab and run files in your repo, run it locally or in CI.
+
+Test your Windows software on real Windows, on your own Linux machine: on one Windows
+machine of any version, or inside a small Active Directory domain with any mix of versions
+(e.g. a Server 2012 R2 domain controller with a Server 2019 member server). Describe the lab
+once in a JSON file, run your program on it, look at the results, reset it to a clean state
+in a second, repeat.
 
 ```
-lab run examples/configs/school-smoke.json
+lab run examples/configs/single-2019-smoke.json     # one Windows Server 2019 machine
+lab run examples/configs/school-smoke.json          # an AD domain: 2019 DC, 2012 R2 + 2016 members
 ```
 
-boots the example lab `school` (a Server 2019 DC, a 2012 R2 and a 2016 member), mounts a
-folder from your machine as drive `X:` on the machines, runs the steps from the config on
-each machine as the user it names, and prints every step's exit code.
+`lab run` boots the lab, mounts a folder from your machine as drive `X:` on the machines,
+runs the steps from the config on each machine as the user it names, and prints every
+step's exit code.
 
-It runs on QEMU/KVM with no root, no Samba and no internet inside the lab. Windows comes from
-Microsoft's free evaluation ISOs.
+It runs on QEMU/KVM with no root and no Samba. Windows comes from Microsoft's free
+evaluation ISOs.
 
 ## Start here
 
@@ -34,11 +38,13 @@ The binary acts as `lab` when called by that name. It finds this folder from its
 **3. Run the example.**
 
     examples/smoke-test/build.sh                   # builds smoke.exe (needs gcc-mingw-w64-x86-64)
-    lab run examples/configs/school-smoke.json
+    lab run examples/configs/single-2019-smoke.json   # one machine, quickest
+    lab run examples/configs/school-smoke.json        # a 3-machine AD domain
 
 The first run installs Windows for each base image it needs (unattended, ~10-30 min, in
-parallel) and builds the lab's 0 state: the domain, the users, the joined members (~20 min).
-Every later run starts from that 0 state and takes a couple of minutes.
+parallel) and builds the lab's 0 state: the machine names, the local users or the domain and
+the joined members (a few minutes for one machine, ~20 min for a domain). Every later run
+starts from that 0 state and takes a couple of minutes.
 
 **4. Look, then reset.**
 
@@ -51,13 +57,19 @@ user, exit code, duration), each step's output, a screenshot per machine.
 
 ## Your own lab and program
 
-- A **lab** (`labs/<name>.json`) names the domain, the machines (computer name, Windows
-  version, which user logs on) and the users and groups.
-- A **run config** names the lab, the host folders to mount as drives, and the steps: what to
-  run, on which machine, as `system` or as which user.
+- A **lab** (`labs/<name>.json`, or a `lab.json` in your project) names the machines
+  (computer name, Windows version, which user logs on) and the users and groups. With one
+  Windows Server marked `"role": "dc"` it is an AD domain (any Server version as DC, any OS as
+  members); without a DC it is a workgroup of standalone machines with local users.
+- A **run config** names the lab (by name, or by a path like `"./lab.json"`), the host
+  folders to mount as drives, and the steps: what to run, on which machine, as `system` or as
+  which user.
 
-Both formats, every field and its default: [docs/CONFIG.md](docs/CONFIG.md). JSON Schemas
-for editor autocompletion are in [wtl-rs/schema/](wtl-rs/schema/).
+Ready-made labs: `single-2012`, `single-2016`, `single-2019`, `single-win10`, `single-win11`
+(one machine each), `mixed` (a 2012 R2 DC + a 2019 member server), `school`, and two-machine
+AD labs `2012`, `2016`, `2019`, `win10`, `win11`. Both formats, every field and its default:
+[docs/CONFIG.md](docs/CONFIG.md). JSON Schemas for editor autocompletion are in
+[wtl-rs/schema/](wtl-rs/schema/).
 
 ## Commands
 
@@ -87,6 +99,8 @@ see [SPEC.md](SPEC.md).
 
 ## More
 
+- [docs/USING.md](docs/USING.md): using win-test-lab from your own project, several Windows
+  versions, CI, limits.
 - [docs/CONFIG.md](docs/CONFIG.md): the lab and run formats, what a run produces.
 - [docs/ISOS.md](docs/ISOS.md): getting the Windows ISOs.
 - [SPEC.md](SPEC.md): how it works inside (host, guest scripts, serial protocol, network).

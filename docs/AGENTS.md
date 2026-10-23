@@ -2,12 +2,14 @@
 
 ## What this is
 
-A tool to test Windows software inside a small Active Directory domain on QEMU/KVM: a
-domain controller plus domain-joined machines on a private LAN, described in
-`labs/<name>.json`, built once into a frozen "0 state", and reset to it before every run. A
-run config (`examples/configs/*.json`) mounts host folders and runs programs on chosen
-machines as chosen users. The user wants it simple: "0 state, run my program, see if it
-works, restore, deploy the new version". No snapshot juggling, no extra modes.
+A tool to test Windows software on QEMU/KVM: on one or more standalone Windows machines
+(workgroup mode) or inside a small Active Directory domain (AD mode: one machine has
+`role: "dc"`, any Server version; the others join, any OS). A lab is `labs/<name>.json` or a
+`lab.json` in another project, built once into a frozen "0 state", and reset to it before
+every run. A run config (`examples/configs/*.json`, or a project's `wintest/*.json`) names
+its lab by name or path, mounts host folders and runs programs on chosen machines as chosen
+users. The user wants it simple: "0 state, run my program, see if it works, restore, deploy
+the new version". No snapshot juggling.
 
 The host side is the Rust program in `wtl-rs/` (binary `wtl-rs`, which acts as `lab` when
 called by that name). The guest side is PowerShell in `guest/`. They talk over a serial log
@@ -75,8 +77,10 @@ serial logs, `runs/<id>/`), `iso-files/`, `runs/` (build-image.sh scratch).
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
     wtl-rs/tests/parity.sh               # mkiso / outputs agree with lib/*.py (needs python3)
 
-Anything touching the guest or the boot sequence also needs a real run, e.g.
-`lab rebuild school && lab run examples/configs/school-smoke.json` (about 30 min).
+Anything touching the guest or the boot sequence also needs a real run, in each mode it
+affects: `lab rebuild single-2019 && lab run examples/configs/single-2019-smoke.json`
+(workgroup, ~10 min) and `lab rebuild mixed && lab run examples/configs/mixed-smoke.json`
+(AD, ~30 min).
 
 ## Gotchas that cost time before
 
@@ -91,3 +95,8 @@ Anything touching the guest or the boot sequence also needs a real run, e.g.
   domain ends up in a throwaway disk.
 - `setup.ps1` must install the `WTL-Agent` autostart after `BUILD_DONE`: an agent started
   during the same logon holds COM1 and the host never sees `BUILD_DONE`.
+- Steps "as" another user: `Process.Start` with credentials (CreateProcessWithLogonW) does not
+  work from LocalSystem; labsvc.ps1 uses `LogonUser` + `CreateProcessAsUser`, with the output
+  files opened by SYSTEM and inherited (the user has no rights on `C:\WTL`).
+- A lab file outside `labs/` gets a state name with a hash of its path: moving a project's
+  `lab.json` means a new 0 state (or set `"name"`).

@@ -21,23 +21,43 @@ use std::path::Path;
 
 // ===================================================================== raw serde types (lab)
 
-/// A lab definition file: `labs/<name>.json`.
+/// A lab definition file, e.g. `labs/<name>.json`, or a `lab.json` in your own project.
+///
+/// Two modes, decided by the machines: with one machine of `role: "dc"` the lab is an
+/// **AD domain** (`domain` and `netbios` required, users are domain users, the other machines
+/// join the domain); with no `dc` it is a **workgroup** (no domain; users are local accounts
+/// created on every machine). Any Windows Server may be the DC and any OS a member.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LabDef {
     /// Optional path or URL of the JSON Schema, for editors (ignored by `lab`).
     #[serde(default, rename = "$schema", skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
-    /// AD forest DNS name, e.g. `lab.local`.
-    pub domain: String,
-    /// NetBIOS domain name, e.g. `LAB` (users log on as `LAB\student`).
-    pub netbios: String,
-    /// Password of the domain Administrator (also the DSRM password).
-    pub admin_password: String,
-    pub network: NetworkDef,
-    /// The machines, keyed by computer name. Exactly one must have `role: dc`.
+    /// The lab's name: names its state folder `labs/state/<name>/` and its VMs. Default: the
+    /// file name without `.json` (for a lab outside win-test-lab's `labs/`, plus a short hash
+    /// of its path, so two projects' `lab.json` never share a state).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// AD mode: the forest's DNS name, e.g. `lab.local`. Must be absent in workgroup mode.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// AD mode: the NetBIOS domain name, e.g. `LAB` (users log on as `LAB\student`). Must be
+    /// absent in workgroup mode.
+    #[serde(default)]
+    pub netbios: Option<String>,
+    /// Password of the Administrator: the domain Administrator (and DSRM) in AD mode, each
+    /// machine's local Administrator in workgroup mode. Default `WinTest!2026` (what the base
+    /// images are installed with).
+    #[serde(default)]
+    pub admin_password: Option<String>,
+    /// The private network between the machines. Required unless the lab is one workgroup
+    /// machine (which then only has the host's NAT network).
+    #[serde(default)]
+    pub network: Option<NetworkDef>,
+    /// The machines, keyed by computer name. At most one has `role: dc` (none = workgroup).
     pub machines: IndexMap<String, MachineDef>,
-    /// Domain users. Each is always in Domain Users; named groups are created if missing.
+    /// The users: domain users in AD mode (always in Domain Users), local users on every
+    /// machine in workgroup mode (always in Users). Named groups are created if missing.
     #[serde(default)]
     pub users: IndexMap<String, UserDef>,
 }
@@ -46,7 +66,7 @@ pub struct LabDef {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkDef {
-    /// First three octets of the /24, e.g. `10.77.30` (DC gets .10, members .20, .21, ...).
+    /// First three octets of the /24, e.g. `10.77.30` (DC gets .10, the others .20, .21, ...).
     pub subnet: String,
     /// Host loopback UDP port the multicast lab LAN uses (unique per running lab).
     pub lan_port: u16,
@@ -56,9 +76,9 @@ pub struct NetworkDef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
-    /// the domain controller (exactly one per lab)
+    /// the domain controller (at most one per lab; one makes it an AD lab). A Windows Server.
     Dc,
-    /// a domain-joined member (the default)
+    /// a domain-joined member in AD mode, a standalone machine in workgroup mode (the default)
     #[default]
     Member,
 }
@@ -72,8 +92,8 @@ pub struct MachineDef {
     /// `dc` or `member` (default `member`).
     #[serde(default)]
     pub role: Role,
-    /// A user (from `users`) this machine logs on as automatically. Members usually set one;
-    /// the DC does not.
+    /// A user (from `users`) this machine logs on as automatically; without one it logs on as
+    /// Administrator. The DC cannot set one.
     #[serde(default)]
     pub logon: Option<String>,
     /// RAM in MB (default 4096 for a member, 3072 for the DC).
@@ -88,12 +108,13 @@ pub struct MachineDef {
     pub ip: Option<String>,
 }
 
-/// One domain user.
+/// One user (a domain user in AD mode, a local user on every machine in workgroup mode).
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UserDef {
     pub password: String,
-    /// Extra groups besides Domain Users; a group that does not exist is created.
+    /// Extra groups (domain groups in AD mode, e.g. "Domain Admins"; local groups in workgroup
+    /// mode, e.g. "Administrators"). A group that does not exist is created.
     #[serde(default)]
     pub groups: Vec<String>,
 }
@@ -107,7 +128,9 @@ pub struct RunDef {
     /// Optional path or URL of the JSON Schema, for editors (ignored by `lab`).
     #[serde(default, rename = "$schema", skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
-    /// The lab to boot: `labs/<lab>.json`.
+    /// The lab to boot: a name (`labs/<lab>.json` in win-test-lab, e.g. `school`) or a path to
+    /// a lab file, relative to this run file (e.g. `./lab.json`). A value with a `/` or `\`
+    /// or ending in `.json` is a path.
     pub lab: String,
     /// Label for the results folder (default: the run file's stem).
     #[serde(default)]
@@ -134,8 +157,8 @@ pub struct StepDef {
     /// Default `all`.
     #[serde(default)]
     pub on: OnSpec,
-    /// Who to run as: `system` (full rights) or a user name. Default: that machine's `logon`
-    /// user.
+    /// Who to run as: `system` (full rights) or a user name. Default: the user logged on to
+    /// that machine (its `logon` user, else Administrator). A step on the DC needs an `as`.
     #[serde(default, rename = "as")]
     pub as_: Option<String>,
     /// The program to run: `.exe .bat .cmd .ps1 .msi`, e.g. `X:/setup.bat`.
@@ -213,20 +236,42 @@ impl JsonSchema for OnSpec {
 
 // ===================================================================== resolved types
 
+/// The default Administrator password: what build-image.sh installs base images with.
+pub const DEFAULT_ADMIN_PASSWORD: &str = "WinTest!2026";
+
 /// A fully resolved lab: defaults filled in, validated, ready to boot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lab {
-    pub domain: String,
-    pub netbios: String,
+    /// the explicit `name` from the file, if any (the runner derives the state name)
+    pub name: Option<String>,
+    /// AD mode (a domain with a DC) or workgroup mode
+    pub mode: Mode,
     pub admin_password: String,
-    pub subnet: String,
-    pub lan_port: u16,
+    /// the lab LAN; None for a single workgroup machine without one
+    pub network: Option<Network>,
     /// in declaration order (the DC may be anywhere in it)
     pub machines: Vec<Machine>,
     /// in declaration order
     pub users: Vec<User>,
 }
 
+/// AD domain or workgroup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// one DC, the others join `domain`
+    Domain { domain: String, netbios: String },
+    /// no domain: standalone machines with local users
+    Workgroup,
+}
+
+/// The resolved lab LAN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Network {
+    pub subnet: String,
+    pub lan_port: u16,
+}
+
+/// One resolved machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Machine {
     pub name: String,
@@ -235,7 +280,8 @@ pub struct Machine {
     pub logon: Option<String>,
     pub mem: u32,
     pub cpus: u32,
-    pub ip: String,
+    /// the static IP on the lab LAN; None without a lab LAN
+    pub ip: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,26 +355,62 @@ impl LabDef {
 
     /// Validate and fill in defaults. `path` is only for error messages.
     pub fn resolve(&self, path: &str) -> Result<Lab> {
-        if self.domain.trim().is_empty() {
-            bail!("{}: domain is empty", path);
-        }
-        if !is_safe_name(&self.netbios) || self.netbios.len() > MAX_COMPUTER_NAME {
-            bail!("{}: netbios {:?} must be 1-15 of A-Z 0-9 . _ -", path, self.netbios);
-        }
-        if self.admin_password.is_empty() {
-            bail!("{}: admin_password is empty", path);
-        }
-        // subnet: three octets 0-255
-        let octets: Vec<&str> = self.network.subnet.split('.').collect();
-        if octets.len() != 3 || !octets.iter().all(|o| o.parse::<u8>().is_ok()) {
-            bail!("{}: network.subnet {:?} must be three octets, e.g. 10.77.30", path, self.network.subnet);
-        }
-        if self.network.lan_port == 0 {
-            bail!("{}: network.lan_port must be a port 1-65535", path);
+        if let Some(n) = &self.name {
+            if !is_safe_name(n) {
+                bail!("{}: name {:?} must be A-Z 0-9 . _ -", path, n);
+            }
         }
         if self.machines.is_empty() {
             bail!("{}: no machines", path);
         }
+        // the mode follows from the machines: one DC = AD, none = workgroup
+        let dc_count = self.machines.values().filter(|m| m.role == Role::Dc).count();
+        let mode = match dc_count {
+            0 => {
+                if self.domain.is_some() || self.netbios.is_some() {
+                    bail!(
+                        "{}: domain/netbios is set but no machine has role \"dc\": give one Windows Server \"role\": \"dc\" for an AD lab, or drop domain and netbios for a workgroup lab",
+                        path
+                    );
+                }
+                Mode::Workgroup
+            }
+            1 => {
+                let domain = self.domain.clone().unwrap_or_default();
+                if domain.trim().is_empty() {
+                    bail!("{}: an AD lab (a machine has role \"dc\") needs \"domain\", e.g. \"lab.local\"", path);
+                }
+                let netbios = self.netbios.clone().unwrap_or_default();
+                if !is_safe_name(&netbios) || netbios.len() > MAX_COMPUTER_NAME {
+                    bail!("{}: an AD lab needs \"netbios\": 1-15 of A-Z 0-9 . _ - (e.g. \"LAB\"), got {:?}", path, netbios);
+                }
+                Mode::Domain { domain, netbios }
+            }
+            n => bail!("{}: at most one machine may have role \"dc\" (found {})", path, n),
+        };
+        let admin_password = self.admin_password.clone().unwrap_or_else(|| DEFAULT_ADMIN_PASSWORD.to_string());
+        if admin_password.is_empty() {
+            bail!("{}: admin_password is empty", path);
+        }
+        // the LAN: needed whenever machines must talk to each other (and always for AD)
+        let network = match &self.network {
+            Some(n) => {
+                // subnet: three octets 0-255
+                let octets: Vec<&str> = n.subnet.split('.').collect();
+                if octets.len() != 3 || !octets.iter().all(|o| o.parse::<u8>().is_ok()) {
+                    bail!("{}: network.subnet {:?} must be three octets, e.g. 10.77.30", path, n.subnet);
+                }
+                if n.lan_port == 0 {
+                    bail!("{}: network.lan_port must be a port 1-65535", path);
+                }
+                Some(Network { subnet: n.subnet.clone(), lan_port: n.lan_port })
+            }
+            None if mode != Mode::Workgroup => bail!("{}: an AD lab needs \"network\" (subnet + lan_port)", path),
+            None if self.machines.len() > 1 => {
+                bail!("{}: a lab with several machines needs \"network\" (subnet + lan_port) for the private LAN between them", path)
+            }
+            None => None,
+        };
 
         // users first, so machines can reference them
         let mut users = Vec::new();
@@ -339,14 +421,14 @@ impl LabDef {
             if u.password.is_empty() {
                 bail!("{}: user {} has an empty password", path, name);
             }
+            // Windows' complexity rule refuses a password that contains the account name (any
+            // case, for names of 3+ characters); catch it here instead of mid-build
+            if name.len() >= 3 && u.password.to_lowercase().contains(&name.to_lowercase()) {
+                bail!("{}: user {}: the password contains the user name, which Windows rejects", path, name);
+            }
             users.push(User { name: name.clone(), password: u.password.clone(), groups: u.groups.clone() });
         }
         let user_names: Vec<&str> = users.iter().map(|u| u.name.as_str()).collect();
-
-        let dc_count = self.machines.values().filter(|m| m.role == Role::Dc).count();
-        if dc_count != 1 {
-            bail!("{}: exactly one machine must have role \"dc\" (found {})", path, dc_count);
-        }
 
         // default IPs: DC .10, members .20, .21, ... in declaration order
         let mut member_octet = 20u16;
@@ -374,14 +456,16 @@ impl LabDef {
                     o
                 }
             };
-            let ip = match &m.ip {
-                None => format!("{}.{}", self.network.subnet, last),
-                Some(s) if s.contains('.') => s.clone(),
-                Some(s) => {
+            let ip = match (&network, &m.ip) {
+                (None, None) => None,
+                (None, Some(_)) => bail!("{}: machine {}: ip needs a \"network\"", path, name),
+                (Some(n), None) => Some(format!("{}.{}", n.subnet, last)),
+                (Some(_), Some(s)) if s.contains('.') => Some(s.clone()),
+                (Some(n), Some(s)) => {
                     let o: u8 = s.parse().map_err(|_| {
                         anyhow::anyhow!("{}: machine {}: ip {:?} must be a full a.b.c.d or a last octet 0-255", path, name, s)
                     })?;
-                    format!("{}.{}", self.network.subnet, o)
+                    Some(format!("{}.{}", n.subnet, o))
                 }
             };
             machines.push(Machine {
@@ -398,31 +482,50 @@ impl LabDef {
         // duplicate IPs
         for i in 0..machines.len() {
             for j in (i + 1)..machines.len() {
-                if machines[i].ip == machines[j].ip {
-                    bail!("{}: machines {} and {} share IP {}", path, machines[i].name, machines[j].name, machines[i].ip);
+                if machines[i].ip.is_some() && machines[i].ip == machines[j].ip {
+                    bail!(
+                        "{}: machines {} and {} share IP {}",
+                        path,
+                        machines[i].name,
+                        machines[j].name,
+                        machines[i].ip.as_deref().unwrap_or("")
+                    );
                 }
             }
         }
 
-        Ok(Lab {
-            domain: self.domain.clone(),
-            netbios: self.netbios.clone(),
-            admin_password: self.admin_password.clone(),
-            subnet: self.network.subnet.clone(),
-            lan_port: self.network.lan_port,
-            machines,
-            users,
-        })
+        Ok(Lab { name: self.name.clone(), mode, admin_password, network, machines, users })
     }
 }
 
 impl Lab {
+    /// The machine called NAME.
     pub fn machine(&self, name: &str) -> Option<&Machine> {
         self.machines.iter().find(|m| m.name == name)
     }
-    pub fn dc(&self) -> &Machine {
-        self.machines.iter().find(|m| m.role == Role::Dc).expect("resolve guarantees one dc")
+    /// The domain controller (None in workgroup mode).
+    pub fn dc(&self) -> Option<&Machine> {
+        self.machines.iter().find(|m| m.role == Role::Dc)
     }
+    /// True for an AD lab (with a DC).
+    pub fn is_ad(&self) -> bool {
+        matches!(self.mode, Mode::Domain { .. })
+    }
+    /// The domain's DNS name, or "" in workgroup mode.
+    pub fn domain(&self) -> &str {
+        match &self.mode {
+            Mode::Domain { domain, .. } => domain,
+            Mode::Workgroup => "",
+        }
+    }
+    /// The NetBIOS domain name, or "" in workgroup mode.
+    pub fn netbios(&self) -> &str {
+        match &self.mode {
+            Mode::Domain { netbios, .. } => netbios,
+            Mode::Workgroup => "",
+        }
+    }
+    /// The machines that are not the DC.
     pub fn members(&self) -> impl Iterator<Item = &Machine> {
         self.machines.iter().filter(|m| m.role == Role::Member)
     }
@@ -438,8 +541,8 @@ impl RunDef {
     /// error messages and the results folder; `host_resolve` makes a mount's host path
     /// absolute (relative to the run file's directory).
     pub fn resolve(&self, path: &str, default_name: &str, lab: &Lab, host_resolve: impl Fn(&str) -> String) -> Result<Run> {
-        if !is_safe_name(&self.lab) {
-            bail!("{}: lab {:?} must be A-Z 0-9 . _ -", path, self.lab);
+        if self.lab.trim().is_empty() {
+            bail!("{}: lab is empty", path);
         }
         let name = self.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| default_name.to_string());
         if !is_safe_name(&name) {
@@ -507,17 +610,13 @@ impl RunDef {
                     StepAs::User(u.to_string())
                 }
             };
-            // if `as` defaults to the logon user, every target machine must have one
+            // `as` defaults to the machine's logged-on user (its logon user, else Administrator);
+            // the DC has no desktop session of its own to run in
             if as_ == StepAs::Logon {
                 for mname in &on {
                     let m = lab.machine(mname).expect("checked above");
-                    if m.logon.is_none() {
-                        bail!(
-                            "{}: step {}: runs on {} which has no logon user, so it needs an explicit \"as\" (a user or \"system\")",
-                            path,
-                            n,
-                            mname
-                        );
+                    if m.role == Role::Dc {
+                        bail!("{}: step {}: runs on the DC {}, so it needs an explicit \"as\" (a user or \"system\")", path, n, mname);
                     }
                 }
             }
@@ -556,6 +655,11 @@ impl RunDef {
 
         Ok(Run { lab: self.lab.clone(), name, wait, timeout_min, mounts, steps })
     }
+}
+
+/// Is a run file's `lab` value a path to a lab file (rather than a name in `labs/`)?
+pub fn lab_is_path(lab: &str) -> bool {
+    lab.contains('/') || lab.contains('\\') || lab.ends_with(".json")
 }
 
 /// `^([A-Za-z]):[\\/](.*)$` -> (letter, rest-with-backslashes)
@@ -605,13 +709,14 @@ mod tests {
     #[test]
     fn resolves_school() {
         let l = lab(SCHOOL).unwrap();
-        assert_eq!(l.domain, "lab.local");
-        assert_eq!(l.lan_port, 47030);
+        assert!(l.is_ad());
+        assert_eq!(l.domain(), "lab.local");
+        assert_eq!(l.netbios(), "LAB");
+        assert_eq!(l.network.as_ref().unwrap().lan_port, 47030);
         assert_eq!(l.machines.len(), 3);
-        assert_eq!(l.dc().name, "DC1");
-        assert_eq!(l.dc().ip, "10.77.30.10");
-        assert_eq!(l.dc().mem, 3072);
-        let members: Vec<_> = l.members().map(|m| (m.name.as_str(), m.ip.as_str(), m.mem, m.cpus)).collect();
+        let dc = l.dc().unwrap();
+        assert_eq!((dc.name.as_str(), dc.ip.as_deref(), dc.mem), ("DC1", Some("10.77.30.10"), 3072));
+        let members: Vec<_> = l.members().map(|m| (m.name.as_str(), m.ip.as_deref().unwrap(), m.mem, m.cpus)).collect();
         assert_eq!(members, vec![("CL1", "10.77.30.20", 4096, 2), ("CL2", "10.77.30.21", 4096, 2)]);
         assert_eq!(l.machine("CL1").unwrap().logon.as_deref(), Some("student1"));
         // users in declaration order, with groups
@@ -633,11 +738,51 @@ mod tests {
     }
 
     #[test]
-    fn needs_exactly_one_dc() {
-        let none = lab(r#"{"domain":"d","netbios":"L","admin_password":"p","network":{"subnet":"10.0.0","lan_port":1},"machines":{"A":{"os":"2019"}}}"#).unwrap_err();
-        assert!(format!("{}", none).contains("exactly one machine must have role"), "{}", none);
-        let two = lab(r#"{"domain":"d","netbios":"L","admin_password":"p","network":{"subnet":"10.0.0","lan_port":1},"machines":{"A":{"os":"2019","role":"dc"},"B":{"os":"2019","role":"dc"}}}"#).unwrap_err();
-        assert!(format!("{}", two).contains("found 2"), "{}", two);
+    fn mode_follows_the_dc() {
+        // a domain without a DC is an error (not silently a workgroup)
+        let none =
+            lab(r#"{"domain":"d","netbios":"L","network":{"subnet":"10.0.0","lan_port":1},"machines":{"A":{"os":"2019"}}}"#).unwrap_err();
+        assert!(format!("{}", none).contains("domain/netbios is set but no machine has role \"dc\""), "{}", none);
+        let two = lab(r#"{"domain":"d","netbios":"L","network":{"subnet":"10.0.0","lan_port":1},"machines":{"A":{"os":"2019","role":"dc"},"B":{"os":"2019","role":"dc"}}}"#).unwrap_err();
+        assert!(format!("{}", two).contains("at most one machine may have role \"dc\" (found 2)"), "{}", two);
+        // a DC needs a domain and a network
+        let nodomain = lab(r#"{"network":{"subnet":"10.0.0","lan_port":1},"machines":{"A":{"os":"2019","role":"dc"}}}"#).unwrap_err();
+        assert!(format!("{}", nodomain).contains("needs \"domain\""), "{}", nodomain);
+        let nonet = lab(r#"{"domain":"d","netbios":"L","machines":{"A":{"os":"2019","role":"dc"}}}"#).unwrap_err();
+        assert!(format!("{}", nonet).contains("an AD lab needs \"network\""), "{}", nonet);
+    }
+
+    #[test]
+    fn workgroup_labs() {
+        // one machine: no network needed, default admin password, local users
+        let one = lab(
+            r#"{"machines":{"WS":{"os":"2019","logon":"tester"}},"users":{"tester":{"password":"Test!2026","groups":["Administrators"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(one.mode, Mode::Workgroup);
+        assert!(!one.is_ad() && one.dc().is_none() && one.network.is_none());
+        assert_eq!(one.admin_password, DEFAULT_ADMIN_PASSWORD);
+        assert_eq!(one.machine("WS").unwrap().ip, None);
+        assert_eq!(one.users[0].groups, vec!["Administrators".to_string()]);
+        // several machines need the LAN; they get .20, .21, ...
+        let multi = lab(r#"{"machines":{"A":{"os":"2019"},"B":{"os":"2016"}}}"#).unwrap_err();
+        assert!(format!("{}", multi).contains("several machines needs \"network\""), "{}", multi);
+        let two = lab(r#"{"network":{"subnet":"10.0.0","lan_port":5},"machines":{"A":{"os":"2019"},"B":{"os":"2016"}}}"#).unwrap();
+        assert_eq!(two.machine("B").unwrap().ip.as_deref(), Some("10.0.0.21"));
+        // an ip without a network makes no sense
+        let ip = lab(r#"{"machines":{"A":{"os":"2019","ip":"5"}}}"#).unwrap_err();
+        assert!(format!("{}", ip).contains("ip needs a \"network\""), "{}", ip);
+        // Windows rejects a password containing the user name: caught before boot
+        let pw = lab(r#"{"machines":{"A":{"os":"2019"}},"users":{"appuser":{"password":"AppUser!2026"}}}"#).unwrap_err();
+        assert!(format!("{}", pw).contains("the password contains the user name"), "{}", pw);
+    }
+
+    #[test]
+    fn any_server_dc_any_member() {
+        // the user's example: a 2012 R2 DC and a 2019 member server
+        let l = lab(r#"{"domain":"lab.local","netbios":"LAB","network":{"subnet":"10.77.40","lan_port":47040},"machines":{"DC1":{"os":"2012","role":"dc"},"SRV1":{"os":"2019"}}}"#).unwrap();
+        assert_eq!(l.dc().unwrap().os, "2012");
+        assert_eq!(l.machine("SRV1").unwrap().logon, None);
     }
 
     #[test]
@@ -651,8 +796,8 @@ mod tests {
     #[test]
     fn explicit_ip_octet_and_full() {
         let l = lab(r#"{"domain":"d","netbios":"L","admin_password":"p","network":{"subnet":"10.0.0","lan_port":1},"machines":{"DC":{"os":"2019","role":"dc"},"A":{"os":"2019","ip":"55"},"B":{"os":"2019","ip":"192.168.1.9"}}}"#).unwrap();
-        assert_eq!(l.machine("A").unwrap().ip, "10.0.0.55");
-        assert_eq!(l.machine("B").unwrap().ip, "192.168.1.9");
+        assert_eq!(l.machine("A").unwrap().ip.as_deref(), Some("10.0.0.55"));
+        assert_eq!(l.machine("B").unwrap().ip.as_deref(), Some("192.168.1.9"));
     }
 
     fn run_against(lab_json: &str, run_json: &str) -> Result<Run> {
@@ -731,7 +876,9 @@ mod tests {
                 labs.insert(p.file_stem().unwrap().to_string_lossy().into_owned(), l);
             }
         }
-        assert!(labs.contains_key("school") && labs.contains_key("2019"), "{:?}", labs.keys());
+        for want in ["school", "2019", "mixed", "single-2019"] {
+            assert!(labs.contains_key(want), "no labs/{}.json: {:?}", want, labs.keys());
+        }
         let mut runs = 0;
         for e in std::fs::read_dir(root.join("examples/configs")).unwrap().flatten() {
             let p = e.path();
