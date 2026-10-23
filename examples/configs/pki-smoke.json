@@ -1,6 +1,7 @@
 {
   "$schema": "../../wtl-rs/schema/run.schema.json",
   "lab": "pki",
+  "wait": 240,
   "mount": { "X": "../pki" },
   "steps": [
     { "on": "DC1", "as": "system",  "run": "X:/dhcp-scope.ps1" },

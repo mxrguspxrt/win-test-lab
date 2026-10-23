@@ -9,6 +9,6 @@
     "CL1": { "os": "2016", "logon": "student" }
   },
   "users": {
-    "student": { "password": "Pupil!2026", "groups": ["Domain Users"] }
+    "student": { "password": "Pupil!2026" }
   }
 }

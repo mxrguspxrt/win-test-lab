@@ -268,15 +268,100 @@ function Install-LabAdCs($Cfg) {
 # Publish the Workstation + User templates on the CA and link a domain GPO that turns on
 # computer and user certificate auto-enrollment. The default template ACLs already grant
 # Domain Computers / Domain Users Enroll + Autoenroll, so members pull certs on gpupdate.
+$LabEnrollRight = [Guid]'0e10c968-78fb-11d2-90d4-00c04f79dc55'       # Certificate-Enrollment
+$LabAutoEnrollRight = [Guid]'a05b8cc2-17bc-4802-a710-e7c15ab866a2'   # Certificate-AutoEnrollment
+
+# Let GROUP (e.g. "Domain Users") read, enroll for and auto-enroll for the template at DN.
+function Grant-LabTemplateEnroll([string]$Dn, [string]$Netbios, [string]$Group) {
+    $sid = (New-Object System.Security.Principal.NTAccount("$Netbios\$Group")).Translate([System.Security.Principal.SecurityIdentifier])
+    $t = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$Dn")
+    $sec = $t.ObjectSecurity
+    $sec.AddAccessRule((New-Object System.DirectoryServices.ActiveDirectoryAccessRule($sid, 'GenericRead', 'Allow')))
+    foreach ($g in @($LabEnrollRight, $LabAutoEnrollRight)) {
+        $sec.AddAccessRule((New-Object System.DirectoryServices.ActiveDirectoryAccessRule($sid, 'ExtendedRight', 'Allow', $g)))
+    }
+    $t.ObjectSecurity = $sec
+    $t.CommitChanges()
+}
+
+# The built-in User template is version 1, which Windows never auto-enrolls, and it requires an
+# e-mail address. Make a version 2 copy, "WTLUser" (subject from the directory path, UPN in the
+# SAN, auto-enrollment on), with its own template OID. ADSI only: no AD module on a member.
+function New-LabUserTemplate([string]$Netbios) {
+    $cfgNc = [string]([ADSI]'LDAP://RootDSE').configurationNamingContext
+    $pks = "CN=Public Key Services,CN=Services,$cfgNc"
+    $dn = "CN=WTLUser,CN=Certificate Templates,$pks"
+    if ([System.DirectoryServices.DirectoryEntry]::Exists("LDAP://$dn")) { return }
+    $src = New-Object System.DirectoryServices.DirectoryEntry("LDAP://CN=User,CN=Certificate Templates,$pks")
+    $oidRoot = [ADSI]"LDAP://CN=OID,$pks"
+    $rnd = New-Object System.Random
+    $oid = [string]$oidRoot.psbase.Properties['msPKI-Cert-Template-OID'].Value + '.' + $rnd.Next(1000000, 99999999) + '.' + $rnd.Next(1000000, 99999999)
+    # the template's OID object, as the Certificate Templates console creates it
+    $o = $oidRoot.Create('msPKI-Enterprise-Oid', 'CN=' + $rnd.Next(1000000, 99999999) + '.' + ([Guid]::NewGuid().ToString('N').ToUpper()))
+    $o.Put('flags', 1)
+    $o.Put('displayName', 'WTL User')
+    $o.Put('msPKI-Cert-Template-OID', $oid)
+    $o.SetInfo()
+    $c = ([ADSI]"LDAP://CN=Certificate Templates,$pks").Create('pKICertificateTemplate', 'CN=WTLUser')
+    foreach ($a in @('pKIDefaultKeySpec', 'pKIKeyUsage', 'pKIMaxIssuingDepth', 'pKICriticalExtensions', 'pKIExpirationPeriod',
+                     'pKIOverlapPeriod', 'pKIExtendedKeyUsage', 'pKIDefaultCSPs', 'msPKI-RA-Signature', 'msPKI-Private-Key-Flag')) {
+        $v = $src.Properties[$a].Value
+        if ($v -ne $null) { $c.Put($a, $v) }
+    }
+    $c.Put('displayName', 'WTL User')
+    $c.Put('revision', 100)
+    # not IS_DEFAULT (0x10000) any more, IS_MODIFIED (0x20000), AUTO_ENROLLMENT (0x20)
+    $c.Put('flags', (([int]$src.Properties['flags'].Value -band (-bnot 0x10000)) -bor 0x20000 -bor 0x20))
+    $c.Put('msPKI-Template-Schema-Version', 2)
+    $c.Put('msPKI-Template-Minor-Revision', 1)
+    $c.Put('msPKI-Cert-Template-OID', $oid)
+    $c.Put('msPKI-Minimal-Key-Size', 2048)
+    $c.Put('msPKI-Enrollment-Flag', 0x29)                    # symmetric algs, publish to DS, auto-enroll
+    $c.Put('msPKI-Certificate-Name-Flag', -2113929216)      # 0x82000000: SAN UPN + subject = DN
+    $c.Put('msPKI-Certificate-Application-Policy', $src.Properties['pKIExtendedKeyUsage'].Value)
+    $c.SetInfo()
+    Grant-LabTemplateEnroll $dn $Netbios 'Domain Users'
+    Send-LabPhase 'certificate template WTLUser (v2 copy of User, auto-enroll) created'
+}
+
 function Enable-LabAutoEnroll($Cfg) {
-    Import-Module ADCSAdministration -ErrorAction SilentlyContinue
-    foreach ($t in @('Workstation', 'User')) {
-        try { Add-CATemplate -Name $t -Force -ErrorAction Stop } catch { Send-LabPhase "publish template ${t}: $($_.Exception.Message)" }
+    $netbios = [string]$Cfg.netbios
+    $pks = 'CN=Public Key Services,CN=Services,' + [string]([ADSI]'LDAP://RootDSE').configurationNamingContext
+    New-LabUserTemplate $netbios
+    # Workstation Authentication (v2) for computers: make sure Domain Computers may auto-enroll
+    Grant-LabTemplateEnroll "CN=Workstation,CN=Certificate Templates,$pks" $netbios 'Domain Computers'
+    # Publishing a template = adding its name to the CA's enrollment-service object in AD
+    # (what Add-CATemplate / certutil -SetCATemplates do too). Written with ADSI, so a freshly
+    # created template the CA's cache has not seen yet is no obstacle; certsvc reloads it below.
+    $ca = [string]$Cfg.ad_cs.ca_name
+    $es = New-Object System.DirectoryServices.DirectoryEntry("LDAP://CN=$ca,CN=Enrollment Services,$pks")
+    $last = ''
+    for ($i = 1; $i -le 12; $i++) {
+        try {
+            $have = @($es.Properties['certificateTemplates'] | ForEach-Object { [string]$_ })
+            foreach ($t in @('Workstation', 'WTLUser')) {
+                if ($have -notcontains $t) { [void]$es.Properties['certificateTemplates'].Add($t) }
+            }
+            $es.CommitChanges()
+            $es.RefreshCache()
+            $now = @($es.Properties['certificateTemplates'] | ForEach-Object { [string]$_ })
+            if (($now -contains 'Workstation') -and ($now -contains 'WTLUser')) { $last = ''; break }
+            $last = 'the templates are not in certificateTemplates after the write: ' + ($now -join ', ')
+        } catch { $last = $_.Exception.Message }
+        Send-LabPhase "publishing templates on $ca, attempt ${i}: $last"
+        Start-Sleep -Seconds 10
+    }
+    if ($last) { throw "publishing the certificate templates Workstation + WTLUser on $ca failed: $last" }
+    # the CA reads its template list at start
+    Restart-Service certsvc -Force
+    for ($i = 0; $i -lt 30; $i++) {
+        if (Test-LabNative 'certutil.exe' @('-ping')) { break }
+        Start-Sleep -Seconds 2
     }
     # the GPO cmdlets come from GPMC; add it if the CA machine does not have it yet
     if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
         $g = Install-WindowsFeature -Name GPMC
-        if (-not $g.Success) { Send-LabPhase "GPMC install failed, exit code $($g.ExitCode)"; return }
+        if (-not $g.Success) { throw "Install-WindowsFeature GPMC failed, exit code $($g.ExitCode) (needed for the auto-enrollment GPO)" }
     }
     Import-Module GroupPolicy -ErrorAction SilentlyContinue
     $gpoName = 'WTL Certificate Auto-Enrollment'
@@ -285,13 +370,12 @@ function Enable-LabAutoEnroll($Cfg) {
     # AEPolicy 7 = enabled + renew expiring + update templates (computer and user)
     Set-GPRegistryValue -Name $gpoName -Key 'HKLM\Software\Policies\Microsoft\Cryptography\AutoEnrollment' -ValueName 'AEPolicy' -Type DWord -Value 7 | Out-Null
     Set-GPRegistryValue -Name $gpoName -Key 'HKCU\Software\Policies\Microsoft\Cryptography\AutoEnrollment' -ValueName 'AEPolicy' -Type DWord -Value 7 | Out-Null
-    $domainDn = (Get-ADDomain -ErrorAction SilentlyContinue).DistinguishedName
-    if ($domainDn) {
-        try { New-GPLink -Name $gpoName -Target $domainDn -LinkEnabled Yes -ErrorAction Stop | Out-Null } catch {
-            if ("$($_.Exception.Message)" -notmatch 'already linked') { Send-LabPhase "GPO link: $($_.Exception.Message)" }
-        }
+    # the domain's DN from RootDSE (a member has no ActiveDirectory module)
+    $domainDn = [string]([ADSI]'LDAP://RootDSE').defaultNamingContext
+    try { New-GPLink -Name $gpoName -Target $domainDn -LinkEnabled Yes -ErrorAction Stop | Out-Null } catch {
+        if ("$($_.Exception.Message)" -notmatch 'already linked') { throw "linking the auto-enrollment GPO to ${domainDn}: $($_.Exception.Message)" }
     }
-    Send-WtlEvent 'LAB_PHASE' @() "auto-enrollment GPO linked, templates Workstation + User published"
+    Send-LabPhase "auto-enrollment GPO linked to $domainDn; templates Workstation + WTLUser published"
 }
 
 # DHCP server: a scope for the lab subnet, router + DNS = the DC, authorized in AD when there
@@ -405,7 +489,10 @@ function New-LabUser($Cfg, $U) {
         # a group named in the lab but not in AD yet is created (a global security group under Users)
         $have = Get-ADGroup -Filter "Name -eq '$g'" -ErrorAction SilentlyContinue
         if (-not $have) { New-ADGroup -Name $g -GroupScope Global -GroupCategory Security }
-        Add-ADGroupMember -Identity $g -Members $name
+        # already a member (e.g. "Domain Users", every user's primary group): nothing to do
+        try { Add-ADGroupMember -Identity $g -Members $name -ErrorAction Stop } catch {
+            if ("$($_.Exception.Message)" -notmatch 'already a member') { throw }
+        }
     }
     Send-LabPhase ("user $($Cfg.netbios)\$name" + $(if ($groups.Count) { ' in ' + ($groups -join ', ') } else { '' }))
 }
@@ -553,6 +640,17 @@ function Invoke-LabClient($Cfg, [string]$LabDir) {
                 Add-Computer @join
                 break
             } catch {
+                # an attempt can join and still report an error (a timeout after the DC answered):
+                # then every retry says "already in that domain". Joined is joined; finish the rename.
+                $now = Get-WmiObject -Class Win32_ComputerSystem
+                if ($now.PartOfDomain -and ([string]$now.Domain -eq [string]$Cfg.domain)) {
+                    Send-LabPhase "joined $($Cfg.domain) (an earlier attempt succeeded: $($_.Exception.Message))"
+                    $pending = [string](Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName').ComputerName
+                    if ($want -and $pending -ne $want) {
+                        Rename-Computer -NewName $want -DomainCredential $cred -Force -ErrorAction Stop -WarningAction SilentlyContinue
+                    }
+                    break
+                }
                 if ($i -ge 40) { throw "joining $($Cfg.domain) failed: $($_.Exception.Message)" }
                 if ($i % 4 -eq 1) { Send-LabPhase "join attempt $i failed (DC still starting?): $($_.Exception.Message)" }
                 Start-Sleep -Seconds 30
@@ -653,7 +751,9 @@ function Set-LabMounts($Mounts) {
 function Update-LabPolicy($Cfg) {
     if ([string]$Cfg.mode -eq 'workgroup') { return }
     [void](Test-LabNative 'gpupdate.exe' @('/force'))
+    # machine and (in this logged-on session) user auto-enrollment
     [void](Test-LabNative 'certutil.exe' @('-pulse'))
+    [void](Test-LabNative 'certutil.exe' @('-user', '-pulse'))
     Send-WtlEvent 'LAB_POLICY' @('machine', [string]$Cfg.machine, 'state', 'refreshed')
 }
 
