@@ -128,7 +128,7 @@ then run again.
 | role | what the build does | options |
 |------|---------------------|---------|
 | `ad-ds` | AD Domain Services: promotes this machine to the domain controller of a new forest. Makes the lab an AD lab (needs `domain`/`netbios`). One per lab. (`role: "dc"` is the alias.) | — |
-| `ad-cs` | AD Certificate Services: an Enterprise Root CA. Needs an AD lab; the machine joins the domain, then installs the CA as a domain admin. With `autoenroll`, a domain GPO turns on computer and user certificate auto-enrollment and the Workstation/User templates are published, so members enrol automatically. | `ad_cs`: `ca_name` (default `<NETBIOS>-ROOT-CA`), `key_length` (2048), `validity_years` (5), `autoenroll` (true) |
+| `ad-cs` | AD Certificate Services: an Enterprise Root CA. Needs an AD lab; the machine joins the domain, then installs the CA as a domain admin. With `autoenroll`, a domain GPO ("WTL Certificate Auto-Enrollment") turns on computer and user certificate auto-enrollment, and two templates are published: `Workstation` (computers; Domain Computers may auto-enroll) and `WTLUser`, a version 2 copy of the built-in User template (Windows never auto-enrolls the version 1 User template), with the UPN in the subject alternative name and auto-enroll for Domain Users. Members get a computer and a user certificate shortly after logon. | `ad_cs`: `ca_name` (default `<NETBIOS>-ROOT-CA`), `key_length` (2048), `validity_years` (5), `autoenroll` (true) |
 | `dhcp` | DHCP server: a scope for the lab subnet (router and DNS = the DC), authorized in AD when there is a domain. | `dhcp`: `range`, the scope as last octets within the subnet, `".<start>-.<end>"` (default `.100-.199`) |
 | `iis` | IIS web server: `Web-Server` + the management console (and ASP.NET 4.5 where available), the default site serving a test page reachable at `http://<machine>/` from other lab machines. | `iis`: `site_path` (default `C:\inetpub\wwwroot`) |
 
@@ -164,8 +164,9 @@ users, then its own roles such as `dhcp`); then the **other machines** join and,
 any, run their `configure` stage (roles like `ad-cs`/`iis`, then features, then setup scripts)
 as the Administrator before switching to their logon user; finally each machine logs on as its
 final user and the 0 state is frozen. At **run** start, members in an AD lab run
-`gpupdate /force` and `certutil -pulse` before the steps, so a step finds its auto-enrolled
-certificates in place.
+`gpupdate /force`, `certutil -pulse` and `certutil -user -pulse` before the steps. Enrollment
+still finishes in the background, so a step that needs a certificate should wait for it for a
+minute or two (as `examples/pki/*-cert.ps1` do).
 
 A **user**:
 

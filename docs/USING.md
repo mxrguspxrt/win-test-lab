@@ -147,12 +147,12 @@ just a bare domain.
              "setup": [ { "run": "./setup/configure-ca.ps1" } ] },
     "CL1": { "os": "2016", "logon": "student" }
   },
-  "users": { "student": { "password": "Pupil!2026", "groups": ["Domain Users"] } }
+  "users": { "student": { "password": "Pupil!2026" } }
 }
 ```
 
-- `roles`: `ad-ds` (the DC), `ad-cs` (an Enterprise Root CA with auto-enrollment), `dhcp`,
-  `iis`. `role: "dc"` is still the short alias for `roles: ["ad-ds"]`.
+- `roles`: `ad-ds` (the DC), `ad-cs` (an Enterprise Root CA; every member auto-enrolls a
+  computer certificate and its users a user certificate), `dhcp`, `iis`. `role: "dc"` is still the short alias for `roles: ["ad-ds"]`.
 - `features`: any `Install-WindowsFeature` name; an unknown one fails the build with the list.
 - `setup`: your scripts (relative to the lab file), run once during the build after the join,
   roles and features, as `system` or a lab user.

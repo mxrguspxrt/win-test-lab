@@ -106,5 +106,11 @@ affects: `lab rebuild single-2019 && lab run examples/configs/single-2019-smoke.
   are on the **build** control disc only (empty on a run disc) and changing them needs
   `lab rebuild`. A member with config stays the (domain) Administrator for that phase, because
   `ad-cs`/`dhcp`-in-AD need that token, then reboots into its `logon` user. `ad-cs` requires an
-  AD lab; roles/features need a server OS (checked before boot). The pki lab/smoke
+  AD lab; roles/features need a server OS (checked before boot). A member has no
+  ActiveDirectory PowerShell module: `ad-cs` uses ADSI (RootDSE, the template and
+  enrollment-service objects) and GroupPolicy, not `Get-ADDomain`. The built-in `User` template
+  is v1 and never auto-enrolls: hence the v2 copy `WTLUser`. `Add-CATemplate` right after
+  creating a template fails (the CA has not seen it); writing `certificateTemplates` directly
+  and restarting certsvc works. `Add-Computer -NewName` can join and still throw ("directory
+  service is busy" on the rename): the join loop checks `PartOfDomain`. The pki lab/smoke
   (`labs/pki.json`, `examples/configs/pki-smoke.json`, `examples/pki/`) is the worked example.

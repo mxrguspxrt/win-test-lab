@@ -103,7 +103,9 @@ built once (`lab prepare`, or the first `lab run`) by booting the overlays thems
    already the domain Administrator) — e.g. `dhcp`; `LAB_DC_READY`; register the SYSTEM worker.
 3. AD, the members (in parallel): static IP with the DC as DNS; register the SYSTEM worker;
    set the local Administrator password; wait for the DC; `Add-Computer -NewName <machine>`
-   (join + rename, one reboot, retried for 20 min while the new DC finishes its first boot);
+   (join + rename, one reboot, retried for 20 min while the new DC finishes its first boot;
+   an attempt that joined but failed the rename, e.g. "the directory service is busy", is
+   detected from `Win32_ComputerSystem` and the rename is redone with `Rename-Computer`);
    autologon; `LAB_JOINED`; reboot. A member with roles/features/setup autologs on as the
    domain Administrator first (phase `configure`): install roles (`ad-cs`, `iis`, ...),
    features, then the setup scripts; switch autologon to its `logon` user; reboot. Then logged
@@ -179,7 +181,17 @@ worker. lab.ps1 refuses a disc whose `fmt` is not `multi`.
 (they are baked into the 0 state; the guest acts on them in the `configure` phase) and absent
 on a run disc. `dhcp` carries full addresses computed from the subnet; `router` is the DC.
 Setup scripts are staged on the control disc under `LAB\<their relative path>` and run by the
-SYSTEM worker. At run start (AD labs) members run `gpupdate /force` + `certutil -pulse` before
+SYSTEM worker.
+
+`ad-cs` on a member (no ActiveDirectory module there) works through ADSI and the GroupPolicy
+module (GPMC is installed if missing): `Install-AdcsCertificationAuthority -CAType
+EnterpriseRootCA`; with `autoenroll`, create the template `WTLUser` (a schema-version-2 copy of
+`User` with its own `msPKI-Enterprise-Oid`, auto-enroll flags, subject = directory path, UPN
+in the SAN), grant Read/Enroll/AutoEnroll to Domain Users on it and to Domain Computers on
+`Workstation`, add both names to the CA's `certificateTemplates` attribute
+(`CN=<ca>,CN=Enrollment Services,...`; read back and retried, with the error text in the
+`LAB_FAIL`), restart certsvc, and link the GPO with `AEPolicy = 7` (HKLM and HKCU) to the
+domain root. At run start (AD labs) members run `gpupdate /force` + `certutil -pulse` before
 their steps so auto-enrolled certificates are present.
 
 ## Privileges in the guest
