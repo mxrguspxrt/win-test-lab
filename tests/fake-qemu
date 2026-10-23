@@ -124,6 +124,7 @@ class Config:
         self.serial_chardev = None
         self.mon_chardevs = []
         self.boot = None
+        self.uefi = False        # booted with OVMF (-drive if=pflash)
 
 
 def parse_args(argv):
@@ -157,6 +158,9 @@ def parse_args(argv):
             sys.exit(0)
         if opt == "-drive":
             d = kv(val)
+            if d.get("if") == "pflash":
+                cfg.uefi = True       # OVMF: install media wait for "press any key"
+                continue
             if "file" in d:
                 cfg.drives.append({"file": d["file"], "media": d.get("media", "disk"),
                                    "format": d.get("format"), "readonly": d.get("readonly")})
@@ -393,6 +397,7 @@ class Machine:
         self.fwd_socks = []
         self.qmp_sock = None
         self.os_key = None
+        self.key_pressed = threading.Event()   # set by QMP send-key / input-send-event
 
     # ---- serial
     def raw(self, line):
@@ -596,7 +601,10 @@ class Machine:
                         send(dict({"return": {}}, **rid))
                         event("SHUTDOWN", {"guest": False, "reason": "host-qmp-quit"})
                         self.shutdown(0)
-                    elif name in ("system_reset", "cont", "stop", "send-key", "input-send-event"):
+                    elif name in ("send-key", "input-send-event"):
+                        self.key_pressed.set()
+                        send(dict({"return": {}}, **rid))
+                    elif name in ("system_reset", "cont", "stop"):
                         send(dict({"return": {}}, **rid))
                     elif name == "human-monitor-command":
                         send(dict({"return": ""}, **rid))
@@ -693,6 +701,19 @@ class Machine:
 
     def sim_build(self, iso, installs):
         delay(0.3)
+        if self.cfg.uefi:
+            # like OVMF + Windows UEFI media: the firmware takes a while to reach the CD (the
+            # real one can take over a minute), prints its "starting Boot" line, then the
+            # media waits ~5 s for a key, else drops to the UEFI shell
+            delay(3.0)
+            self.key_pressed.clear()    # keys pressed before the prompt do not count
+            self.raw('BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM QM00001 " from PciRoot(0x0)')
+            self.raw("Press any key to boot from CD or DVD......")
+            if not self.key_pressed.wait(5.0):
+                self.raw("BdsDxe: failed to start Boot0001 \"UEFI QEMU DVD-ROM\": Time out")
+                self.raw("UEFI Interactive Shell v2.2")
+                log("UEFI boot prompt timed out (no key pressed); idle in the UEFI shell")
+                return
         self.raw("fake-qemu: booting Windows Setup (simulated)")
         if not installs:
             self.ev("BUILD_FAIL", "fake-qemu: no install media (sources/install.wim) attached")

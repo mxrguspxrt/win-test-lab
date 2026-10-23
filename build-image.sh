@@ -63,8 +63,36 @@ check_tools "$WTL_QEMU" "$WTL_QEMU_IMG"
 mkdir -p "$WTL_IMAGES_DIR" "$WTL_RUNS_DIR"
 
 # ------------------------------------------------------------------ cleanup / trap
-CUR_PID="" CUR_SOCK=""
+CUR_PID="" CUR_SOCK="" PRESS_PID=""
+
+# press_boot_key SOCK PID SERIAL : Windows' UEFI install media wait about 5 s for a key ("Press
+# any key to boot from CD or DVD") and otherwise fall through to the firmware shell, so an
+# unattended UEFI build (Win11) would never start Setup. A fresh OVMF can take a minute or
+# more before it gets there, so a fixed time window is not enough: wait for OVMF's serial
+# line "BdsDxe: starting Boot.... DVD-ROM" (printed right before the prompt), then press
+# Enter over QMP for 20 s. Only on that first CD boot, so nothing reaches Setup itself.
+press_boot_key() {
+    local sock="$1" pid="$2" serial="$3" i
+    for ((i = 0; i < 1200; i++)); do      # up to 10 min for the firmware to get to the CD
+        pid_alive "$pid" || return 0
+        grep -aq 'starting Boot.*DVD-ROM' "$serial" 2>/dev/null && break
+        sleep 0.5
+    done
+    for ((i = 0; i < 60; i++)); do
+        pid_alive "$pid" || return 0
+        py "$WTL_LIB/qmp.py" --timeout 2 "$sock" raw \
+            '{"execute":"send-key","arguments":{"keys":[{"type":"qcode","data":"ret"}]}}' >/dev/null 2>&1 || true
+        sleep 0.3
+    done
+}
+stop_press() {
+    [[ -n "$PRESS_PID" ]] && kill "$PRESS_PID" 2>/dev/null
+    PRESS_PID=""
+    return 0
+}
+
 cleanup() {
+    stop_press
     if [[ -n "$CUR_PID" ]]; then
         warn "stopping VM (pid $CUR_PID)"
         stop_vm "$CUR_PID" "$CUR_SOCK" 10
@@ -201,6 +229,10 @@ EOF
     start_qemu "$run_dir/qemu.log" || return 2
     CUR_PID="$QEMU_PID" CUR_SOCK="$sock"
     echo "$QEMU_PID" >"$run_dir/qemu.pid"
+    if [[ "$OS_FIRMWARE" == uefi ]]; then
+        press_boot_key "$sock" "$QEMU_PID" "$serial" &
+        PRESS_PID=$!
+    fi
     log "qemu pid $QEMU_PID; serial log $serial"
     [[ -n "$vnc" ]] && log "watch it: vncviewer 127.0.0.1:$((5900 + vnc))"
     log "waiting for BUILD_DONE (timeout ${TIMEOUT_H}h; Windows Update can take hours)"
@@ -208,6 +240,7 @@ EOF
     rc=0
     run_bg /dev/null "$WTL_PYTHON" "$WTL_LIB/serialwait.py" "$serial" --until BUILD_DONE --fail BUILD_FAIL \
         --timeout "$TIMEOUT_S" --pid "$QEMU_PID" --progress || rc=$?
+    stop_press
     case $rc in
         0) ok "guest reported BUILD_DONE after $(( (SECONDS - t0) / 60 )) min; waiting for shutdown" ;;
         1) err "guest reported BUILD_FAIL: $(grep -a 'WTL BUILD_FAIL' "$serial" | tail -1 | tr -d '\r')" ;;

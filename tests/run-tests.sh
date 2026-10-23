@@ -76,17 +76,21 @@ export FAKE_QEMU_SPEED="${FAKE_QEMU_SPEED:-1}"
 
 # ---------------------------------------------------------------- fixtures
 # fake install media: sources/install.wim = MSWIM header + UTF-16LE XML
-make_install_iso() { # build iso_name
-  local build="$1" name="$2" src="$TMP/data/inst-$1"
+make_install_iso() { # build iso_name [client]
+  local build="$1" name="$2" kind="${3:-server}" src="$TMP/data/inst-$1"
   mkdir -p "$src/sources" "$src/boot"
-  python3 - "$build" "$src/sources/install.wim" <<'PY'
+  python3 - "$build" "$src/sources/install.wim" "$kind" <<'PY'
 import struct, sys
-build, out = int(sys.argv[1]), sys.argv[2]
+build, out, kind = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 imgs = []
-for i, (ed, it, nm) in enumerate([("ServerStandard", "Server Core", "SERVERSTANDARDCORE"),
-                                  ("ServerStandard", "Server", "SERVERSTANDARD"),
-                                  ("ServerDatacenter", "Server Core", "SERVERDATACENTERCORE"),
-                                  ("ServerDatacenter", "Server", "SERVERDATACENTER")], 1):
+editions = [("ServerStandard", "Server Core", "SERVERSTANDARDCORE"),
+            ("ServerStandard", "Server", "SERVERSTANDARD"),
+            ("ServerDatacenter", "Server Core", "SERVERDATACENTERCORE"),
+            ("ServerDatacenter", "Server", "SERVERDATACENTER")]
+if kind == "client":
+    editions = [("Core", "Client", "CORE"), ("Education", "Client", "EDUCATION"),
+                ("Enterprise", "Client", "ENTERPRISE"), ("Professional", "Client", "PROFESSIONAL")]
+for i, (ed, it, nm) in enumerate(editions, 1):
     imgs.append('<IMAGE INDEX="%d"><NAME>Windows Server %s</NAME><WINDOWS><ARCH>9</ARCH>'
                 '<EDITIONID>%s</EDITIONID><INSTALLATIONTYPE>%s</INSTALLATIONTYPE>'
                 '<VERSION><MAJOR>10</MAJOR><MINOR>0</MINOR><BUILD>%d</BUILD><SPBUILD>0</SPBUILD></VERSION>'
@@ -115,6 +119,12 @@ make_install_iso 9600  "9600.17050.WINBLUE_REFRESH.140317-1640_X64FRE_SERVER_EVA
   || skip_all "mkiso.py failed to build the fake install ISO"
 make_install_iso 14393 "14393.0.161119-1705.RS1_REFRESH_SERVER_EVAL_X64FRE_EN-US.ISO" \
   || skip_all "mkiso.py failed to build the fake install ISO"
+make_install_iso 26300 "win11_24h2_en_x64_26300.iso" client \
+  || skip_all "mkiso.py failed to build the fake install ISO"
+# UEFI firmware stand-ins (fake-qemu only checks they are passed as pflash)
+echo "fake OVMF code" > "$TMP/data/OVMF_CODE.fd"
+echo "fake OVMF vars" > "$TMP/data/OVMF_VARS.fd"
+export WTL_OVMF_CODE="$TMP/data/OVMF_CODE.fd" WTL_OVMF_VARS="$TMP/data/OVMF_VARS.fd"
 
 # demo zips
 DEMO_ZIP="$TMP/data/program.zip"
@@ -264,6 +274,8 @@ chk_helpful() {
 echo "run-tests: temp lab $LAB (FAKE_QEMU_SPEED=$FAKE_QEMU_SPEED, per-scenario timeout ${SCEN_TIMEOUT}s)"
 want a || want c || want d || want e || want f || want g || want i || want k || want l || want m || want n || want o || want p && scen_build a 2012
 want b || want i && scen_build b 2016
+# a UEFI build (Win11): the fake waits for a key at "press any key to boot from CD", like OVMF
+want q && scen_build q win11
 
 want c && scen_launch c "launch demo program.bat 2012 --port 5000" 0 pass chk_pass_files -- \
   "$DEMO_ZIP" program.bat 2012 --port 5000 --test "$PYTEST" --timeout 90
