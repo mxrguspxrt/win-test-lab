@@ -19,7 +19,23 @@ Hand-over notes: the current state, decisions and gotchas. User docs: ../README.
 - No-VM checks: cargo test (unit + 15 fake_lab scenarios), clippy clean, fmt, rustdoc with
   `-D warnings`, cross-checks for Windows / macOS, tests/parity.sh, tests/all.sh.
 
+## Lab modes (branch lab-modes, 2026-10-23)
+
+- AD mode (one `role: "dc"`, any Server version) or workgroup mode (no DC: local users, no
+  domain; one machine needs no `network`). A 2012 DC + 2019 member server works
+  (`labs/mixed.json`). Run files name a lab by name or by path (`"./lab.json"`); a lab file
+  outside `labs/` gets the state name `<stem>-<fnv hash of its path>` unless it sets `"name"`.
+- Steps "as" another user use LogonUser + CreateProcessAsUser in labsvc.ps1 (local `.\user`
+  or `DOMAIN\user`); every machine with steps gets all of the run's mounts.
+- Passwords containing the user name are rejected before boot.
+- Verified on KVM: single-2019 (workgroup), mixed (2012 DC + 2019 SRV1, steps as SYSTEM, as
+  LAB\operator and as LAB\appuser), and a project folder outside the repo with its own
+  wintest/lab.json (install.ps1 + smoke.ps1, steps as SYSTEM / appuser / ops).
+- Docs: docs/USING.md (from your own project, CI, limits), CONFIG/SPEC/AGENTS updated.
+
 ## Next (ask the user first)
+
+- A `targets` matrix in one run file (run the same steps on several labs).
 
 - Port build-image.sh / launch-test.sh / lib/isoinfo.py to Rust, so installing base images
   needs no bash or Python (then Windows/macOS hosts need nothing but QEMU).

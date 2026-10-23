@@ -2,11 +2,14 @@
 
 Two small JSON files describe everything:
 
-- a **lab**, `labs/<name>.json`: the domain, the private network, the machines and the users.
-  It is built once into a **0 state** (Windows installed, domain created, members joined,
-  their users logged on) and then reused by every run.
+- a **lab** (`labs/<name>.json` in win-test-lab, or a `lab.json` in your own project): the
+  machines, the users, and either an AD domain or a workgroup. It is built once into a
+  **0 state** (Windows installed, machines named, the domain created and joined or the local
+  users made, everyone logged on) and then reused by every run.
 - a **run config**, any `<something>.json`: which lab to boot, which host folders to mount
   as drives, and which programs to run on which machine as whom.
+
+Using it from another project: [USING.md](USING.md).
 
 ```
 lab run examples/configs/school-smoke.json
@@ -32,7 +35,20 @@ with a `$schema` field and editors such as VS Code validate and autocomplete it:
 
 `lab` ignores `$schema`. The path is relative to the JSON file itself.
 
-## The lab file: `labs/<name>.json`
+## The lab file
+
+A lab has one of two **modes**, decided by its machines:
+
+- **AD mode**: one machine has `"role": "dc"`. It becomes the domain controller of a new
+  forest (`domain`, `netbios` required); the other machines join the domain; `users` are
+  domain users; machines log on as `LAB\<user>`. Any Windows Server version can be the DC,
+  and any OS a member (a member server, or a Windows 10/11 client), in any mix.
+- **Workgroup mode** (single mode): no machine has `role: "dc"`. There is no domain
+  (`domain`/`netbios` must be absent); `users` are local accounts created on every machine,
+  `groups` are local groups; each machine logs on as `<MACHINE>\<user>`. One machine needs no
+  `network`.
+
+An AD lab, `labs/school.json`:
 
 ```json
 {
@@ -53,47 +69,69 @@ with a `$schema` field and editors such as VS Code validate and autocomplete it:
 }
 ```
 
-The lab's name is the file name: `labs/school.json` is the lab `school`, and its state lives
-in `labs/state/school/`.
+A workgroup lab with one machine, `labs/single-2019.json`:
+
+```json
+{
+  "machines": { "WS2019": { "os": "2019", "logon": "tester" } },
+  "users":    { "tester": { "password": "Test!2026" } }
+}
+```
+
+**The lab's name** names its state folder (`labs/state/<name>/`) and its VMs. A lab in
+win-test-lab's `labs/` is called by its file name (`labs/school.json` is `school`). A lab file
+anywhere else gets its file name plus a hash of its full path (`/home/me/myapp/wintest/lab.json`
+becomes e.g. `lab-3f9a1c2b`), so two projects' `lab.json` never share a 0 state; set `"name"`
+to choose it yourself (then keep it unique). `lab status <run or lab file>` shows it.
 
 | field | required | meaning |
 |-------|----------|---------|
-| `domain` | yes | DNS name of the new AD forest, e.g. `lab.local`. |
-| `netbios` | yes | NetBIOS domain name (1-15 of `A-Z 0-9 . _ -`); users log on as `LAB\student1`. |
-| `admin_password` | yes | Password of the domain `Administrator` (also the DSRM password). Must meet Windows' complexity rules and must not contain the account name. |
-| `network.subnet` | yes | First three octets of the lab's private /24, e.g. `10.77.30`. |
-| `network.lan_port` | yes | UDP port of the lab's private LAN on the host (any free port; two labs that run at the same time need different ports). |
-| `machines` | yes | The machines, keyed by **name**. The name is also the Windows computer name (1-15 of `A-Z 0-9 . _ -`). Exactly one machine has `role: "dc"`. |
-| `users` | no | Domain users, keyed by user name. Default: none. |
+| `name` | no | The state folder / VM name (see above). `A-Z 0-9 . _ -`. |
+| `domain` | AD mode | DNS name of the new AD forest, e.g. `lab.local`. Must be absent in workgroup mode. |
+| `netbios` | AD mode | NetBIOS domain name (1-15 of `A-Z 0-9 . _ -`); users log on as `LAB\student1`. Must be absent in workgroup mode. |
+| `admin_password` | no (default `WinTest!2026`) | Password of the `Administrator`: the domain Administrator (also the DSRM password) in AD mode, every machine's local Administrator in workgroup mode. Must meet Windows' complexity rules and must not contain the account name. |
+| `network.subnet` | AD mode, or several machines | First three octets of the lab's private /24, e.g. `10.77.30`. |
+| `network.lan_port` | with `network` | UDP port of the lab's private LAN on the host (any free port; two labs that run at the same time need different ports). |
+| `machines` | yes | The machines, keyed by **name**. The name is also the Windows computer name (1-15 of `A-Z 0-9 . _ -`). At most one has `role: "dc"`. |
+| `users` | no | Domain users (AD) or local users on every machine (workgroup), keyed by user name. Default: none. |
+
+Without `network` (a single workgroup machine) the machine has only the host's NAT network
+(internet, no lab LAN). With it, every machine gets a second NIC on the private lab LAN.
 
 A **machine**:
 
 | field | default | meaning |
 |-------|---------|---------|
 | `os` | (required) | OS key from `lib/oslist.conf`: `2012`, `2016`, `2019`, `2022`, `2025`, `win10`, `win11` (aliases like `2012r2`, `ws2019` work too). The DC must be a Windows Server. |
-| `role` | `"member"` | `"dc"` (the domain controller; exactly one) or `"member"` (joined to the domain). |
-| `logon` | none | A user from `users` that this machine logs on as automatically. Members usually set one; the DC cannot. Steps run as this user by default. |
-| `mem` | 3072 (DC), 4096 (member) | RAM in MB. |
+| `role` | `"member"` | `"dc"` (the domain controller; at most one, and it makes the lab an AD lab) or `"member"` (joined to the domain in AD mode, a standalone machine in workgroup mode). |
+| `logon` | Administrator | A user from `users` that this machine logs on as automatically; without one it logs on as Administrator (domain or local). The DC cannot set one. Steps run as this user by default. |
+| `mem` | 3072 (DC), 4096 (others) | RAM in MB. |
 | `cpus` | 2 | Virtual CPUs. |
-| `ip` | DC `.10`, members `.20`, `.21`, ... in file order | Static IP: a full `a.b.c.d`, or just the last octet (`"55"` = `<subnet>.55`). |
+| `ip` | DC `.10`, the others `.20`, `.21`, ... in file order | Static IP on the lab LAN: a full `a.b.c.d`, or just the last octet (`"55"` = `<subnet>.55`). Needs `network`. |
+
+A machine's Windows install comes from a base image: `images/<os>-dc.qcow2` for the DC,
+`images/<os>-client.qcow2` for every other machine (machines with the same OS share it).
+Missing images are installed automatically by the first run.
 
 A **user**:
 
 | field | default | meaning |
 |-------|---------|---------|
-| `password` | (required) | Must meet Windows' complexity rules and must not contain the user name. |
-| `groups` | `[]` | Groups besides Domain Users. A group that does not exist yet is created (a global security group). `"Domain Admins"` makes an administrator. |
+| `password` | (required) | Must meet Windows' complexity rules (8+ characters from 3 of: upper, lower, digit, symbol) and must not contain the user name (checked before boot). |
+| `groups` | `[]` | AD mode: domain groups besides Domain Users (`"Domain Admins"` makes an administrator). Workgroup mode: local groups besides Users (`"Administrators"`). A group that does not exist yet is created. |
 
 The labs in `labs/`:
 
-| lab | machines |
-|-----|----------|
-| `school` | DC1 (Server 2019) + CL1 (2012 R2, logs on as student1) + CL2 (2016, student2); users student1, student2, teacher |
-| `2012`, `2016`, `2019` | a DC + one member of that version, logged on as `student`; `labadmin` is a Domain Admin |
-| `win10`, `win11` | a 2019 DC + a Windows 10 / 11 member (win11 boots UEFI) |
+| lab | mode | machines |
+|-----|------|----------|
+| `single-2012`, `single-2016`, `single-2019`, `single-win10`, `single-win11` | workgroup | one machine of that version, logged on as the local user `tester` |
+| `mixed` | AD | DC1 (Server 2012 R2) + SRV1 (Server 2019 member server, logs on as `LAB\operator`, a Domain Admin); also the user `appuser` |
+| `school` | AD | DC1 (Server 2019) + CL1 (2012 R2, logs on as student1) + CL2 (2016, student2); users student1, student2, teacher |
+| `2012`, `2016`, `2019` | AD | a DC + one member of that version, logged on as `student`; `labadmin` is a Domain Admin |
+| `win10`, `win11` | AD | a 2019 DC + a Windows 10 / 11 member (win11 boots UEFI) |
 
-Another lab: copy one, change the machine names, `network.subnet` and `network.lan_port`, and
-`lab run` a config that names it.
+Another lab: copy one, change the machine names (and for a LAN `network.subnet` and
+`network.lan_port`), and `lab run` a config that names it.
 
 ## The run config
 
@@ -115,7 +153,7 @@ Another lab: copy one, change the machine names, `network.subnet` and `network.l
 
 | field | default | meaning |
 |-------|---------|---------|
-| `lab` | (required) | The lab to boot: `labs/<lab>.json`. |
+| `lab` | (required) | The lab to boot: a name (`"school"` = `labs/school.json` in win-test-lab) or a path to a lab file, relative to this run file (`"./lab.json"`, `"../labs/ad.json"`). Anything with a `/` or `\`, or ending in `.json`, is a path. |
 | `name` | the file name without `.json` | A label for the run. |
 | `wait` | 60 | Seconds a step may run before it counts as "still running" (see `keep_running`). `lab run --wait S` overrides it. |
 | `timeout_min` | 60 | Give up on the whole run after this many minutes. `lab run --timeout-min M` overrides it. |
@@ -123,7 +161,8 @@ Another lab: copy one, change the machine names, `network.subnet` and `network.l
 | `steps` | (at least one) | The programs to run, top to bottom. |
 
 **Mounts.** Each folder becomes a read-only CD-ROM drive with exactly that letter, on every
-machine that has a step on it. Letters are `A`-`Z`, but `C:` (system) and `D:` (the lab's
+machine that has a step (all the run's drives, so a script on `Y:` can install `X:\app.msi`).
+Letters are `A`-`Z`, but `C:` (system) and `D:` (the lab's
 control disc) are reserved; at most 3 mounts. A mount is a **snapshot taken at launch**: the
 guest cannot write to it, and host edits after the start are seen by the next run. (This is
 how folders reach the guests without Samba or root on the host.)
@@ -133,8 +172,8 @@ A **step**:
 | field | default | meaning |
 |-------|---------|---------|
 | `run` | (required) | The program: `X:/setup.bat`, `X:\app\run.exe`, `C:\Windows\System32\whoami.exe`. It must be on a mounted drive or `C:`, and end in `.exe`, `.bat`, `.cmd`, `.ps1` or `.msi` (`.msi` is installed with `msiexec /i ... /qn /norestart`). `/` and `\` both work. |
-| `on` | `"all"` | Where: a machine name, a list of names, or `"all"` (every member, not the DC). |
-| `as` | the machine's `logon` user | Who: `"system"` (the SYSTEM account: full rights, can install anything), or a user from the lab's `users`. The machine's own `logon` user runs in its logged-on desktop session; any other user is started with that user's password (no desktop). A step on the DC needs an explicit `as`. |
+| `on` | `"all"` | Where: a machine name, a list of names, or `"all"` (every machine except the DC). |
+| `as` | the logged-on user | Who: `"system"` (the SYSTEM account: full rights, can install anything), or a user from the lab's `users` (a domain user in AD mode, a local user in workgroup mode). The machine's logged-on user (its `logon` user, else Administrator) runs in its desktop session; any other user is started with that user's password (no desktop). A step on the DC needs an explicit `as`. |
 | `args` | none | Command-line arguments, as one string. |
 | `expect_exit` | 0 | The exit code that counts as success. |
 | `wait` | the run's `wait` | Seconds before this step counts as still running. |

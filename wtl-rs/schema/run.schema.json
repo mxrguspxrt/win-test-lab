@@ -80,7 +80,7 @@
           ]
         },
         "as": {
-          "description": "Who to run as: `system` (full rights) or a user name. Default: that machine's `logon` user.",
+          "description": "Who to run as: `system` (full rights) or a user name. Default: the user logged on to that machine (its `logon` user, else Administrator). A step on the DC needs an `as`.",
           "default": null,
           "type": [
             "string",

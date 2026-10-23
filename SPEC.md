@@ -60,8 +60,10 @@ xorriso/genisoimage: discs are written by the program itself.
 ## Base images
 
 One unattended Windows install per OS and role: `images/<os>-dc.qcow2` for domain
-controllers and `images/<os>-client.qcow2` for members (a clone of a DC cannot join its own
-domain, so the two are separate installs; members of the same OS share one image).
+controllers and `images/<os>-client.qcow2` for every other machine (members, member servers,
+workgroup machines). A clone of a DC cannot join its own domain, so the two are separate
+installs; machines of the same OS and role share one image, in any lab. Any Server OS key
+works as a DC and any OS key as the rest (a 2012 DC + 2019 member = `2012-dc` + `2019-client`).
 `lab` runs `build-image.sh <os> --name <os>-dc|<os>-client --computer-name DC<os>|CL<os>
 --no-updates` for every missing image of a lab, in parallel, logging to
 `labs/state/<lab>/build-<image>.log`.
@@ -74,6 +76,19 @@ build-image.sh: renders `guest/autounattend*.xml.tmpl`, puts it with `guest/*.ps
 Update rounds, then installs the agent autostart (HKLM Run `WTL-Agent` -> `C:\WTL\agent.ps1`)
 **after** sending `BUILD_DONE` (an agent started earlier would hold COM1), and shuts down.
 
+## Lab modes and names
+
+A lab with one `role: "dc"` machine is an **AD lab**: that machine becomes the DC of a new
+forest, the others join it, `users` are domain users. A lab without one is a **workgroup**:
+no domain, `users` are local accounts on every machine. One workgroup machine needs no lab
+LAN (it gets only QEMU user-mode NAT); every other lab has the multicast LAN below.
+
+The run file's `lab` is a name (`labs/<name>.json` in the checkout) or a path relative to the
+run file. The lab's **state name** (`labs/state/<name>/`, VM names `lab-<name>-<machine>`) is
+the lab's `name` field, else the file name for `labs/*.json`, else the file name plus an
+FNV-1a hash of the lab file's absolute path (`lab-3f9a1c2b`), so labs from different
+projects never collide.
+
 ## The 0 state
 
 `labs/state/<lab>/<machine>-0.qcow2`: a qcow2 overlay per machine on its base image. It is
@@ -82,12 +97,19 @@ built once (`lab prepare`, or the first `lab run`) by booting the overlays thems
 1. Each machine gets a control disc (`<machine>.iso`, label `WTL_LAB`, drive D:) with
    `LAB\lab.ps1`, `LAB\labsvc.ps1` and `LAB\lab.json` (below). The agent finds it at logon
    and dot-sources `lab.ps1`.
-2. DC: rename to the machine name + reboot; static IP; AD DS + new forest + reboot; create
-   the groups and users; `LAB_DC_READY`; register the SYSTEM worker.
-3. Members (in parallel): static IP with the DC as DNS; wait for the DC; register the SYSTEM
-   worker; `Add-Computer -NewName <machine>` (join + rename, one reboot, retried for 20 min
-   while the new DC finishes its first boot); autologon as the machine's `logon` user;
-   `LAB_JOINED`; reboot; logged on -> `LAB_CLIENT_READY`; `LAB_IDLE`.
+2. AD, the DC: set the local Administrator password (`admin_password`; it becomes the domain
+   Administrator's); rename to the machine name + reboot; static IP; AD DS + new forest +
+   reboot; create the groups and users; `LAB_DC_READY`; register the SYSTEM worker.
+3. AD, the members (in parallel): static IP with the DC as DNS; register the SYSTEM worker;
+   set the local Administrator password; wait for the DC; `Add-Computer -NewName <machine>`
+   (join + rename, one reboot, retried for 20 min while the new DC finishes its first boot);
+   autologon as the machine's `logon` user (else the domain Administrator); `LAB_JOINED`;
+   reboot; logged on -> `LAB_CLIENT_READY`; `LAB_IDLE`.
+3. Workgroup machines (in parallel): static IP on the lab LAN if there is one; register the
+   SYSTEM worker; set the local Administrator password; create the lab's users as local
+   accounts in their local groups (missing groups are created); rename to the machine name;
+   autologon as the machine's `logon` user (else Administrator); `LAB_JOINED`; reboot; logged
+   on -> `LAB_CLIENT_READY`; `LAB_IDLE`.
 4. The host powers every machine off with ACPI (members first, then the DC; a second press
    after 60 s if a user session delays it) and writes `0-state.json`.
 
@@ -99,7 +121,7 @@ files and `0-state.json`; the base images stay.
 
 `lab run CONFIG`: restore (QMP quit, delete `<machine>.qcow2`), create new throwaway
 overlays `<machine>.qcow2` on the 0-state disks, write each machine's control disc with
-`run` filled in, write one mount disc per drive a machine's steps use
+`run` filled in, write one mount disc per drive of the run for every machine that has steps
 (`mount-<machine>-<letter>.iso`, label `WTL<LETTER>`, read-only), boot all machines (DC
 first), wait for `LAB_DC_READY` and every member's `LAB_CLIENT_READY`, then read the serial
 logs of all machines that have steps, round-robin, until each sent `LAB_RUN_DONE`. A
@@ -121,8 +143,8 @@ Pure ASCII (PowerShell 4 reads it without a BOM), one per machine:
 
 ```json
 {
- "fmt": "multi", "role": "dc|member", "machine": "CL1",
- "ip": "10.77.30.20", "prefix": 24, "dc_ip": "10.77.30.10", "lan_mac": "52:54:00:4c:41:11",
+ "fmt": "multi", "mode": "domain|workgroup", "role": "dc|member", "machine": "CL1",
+ "lan": true, "ip": "10.77.30.20", "prefix": 24, "dc_ip": "10.77.30.10", "lan_mac": "52:54:00:4c:41:11",
  "domain": "lab.local", "netbios": "LAB", "admin_password": "...",
  "users": [{"name": "student1", "password": "...", "groups": ["Students"]}],
  "logon_user": "student1", "logon_password": "...",
@@ -135,11 +157,13 @@ Pure ASCII (PowerShell 4 reads it without a BOM), one per machine:
 }
 ```
 
-`run` is set only for `lab run`, and only on machines that have steps. `as_` is resolved per
-machine: a step `as` the machine's own logon user is `logon` (its desktop session); another
-lab user is `user` with that user's password (started by the SYSTEM worker with
-`ProcessStartInfo` credentials, no desktop); `system` is the SYSTEM worker. lab.ps1 refuses
-a disc whose `fmt` is not `multi`.
+In workgroup mode `domain`, `netbios` and `dc_ip` are empty; `lan` is false (and `ip`
+empty) for a machine without a lab LAN. `run` is set only for `lab run`, and only on
+machines that have steps. `as_` is resolved per machine: a step `as` the machine's own logon
+user, or with no `as`, is `logon` (its desktop session); another lab user is `user` with that
+user's password (started by the SYSTEM worker with `LogonUser` + `CreateProcessAsUser`, as
+`NETBIOS\user` in AD mode and `.\user` in a workgroup; no desktop); `system` is the SYSTEM
+worker. lab.ps1 refuses a disc whose `fmt` is not `multi`.
 
 ## Privileges in the guest
 
@@ -153,12 +177,13 @@ steps and steps as another user. They talk through files: `C:\WTL\svc\<id>.req.j
 
 ## The network
 
-Every machine of a lab has a second NIC on one private LAN: QEMU `-netdev dgram` on the UDP
-multicast group 239.77.30.1 (administratively scoped, never routed off the host), port
-`network.lan_port`, local address 127.0.0.1. Any number of VMs join it without root; labs
-are kept apart by their ports. MAC `52:54:00:4c:41:<10+i>`, static IPs from the lab file.
-The DC is the DNS server and has no other NIC (no internet); members also have QEMU
-user-mode NAT for internet access.
+With a `network`, every machine of a lab has a second NIC on one private LAN: QEMU `-netdev
+dgram` on the UDP multicast group 239.77.30.1 (administratively scoped, never routed off the
+host), port `network.lan_port`, local address 127.0.0.1. Any number of VMs join it without
+root; labs are kept apart by their ports. MAC `52:54:00:4c:41:<10+i>`, static IPs from the
+lab file. In an AD lab the DC is the DNS server of every NIC and has no other NIC (no
+internet); every other machine also has QEMU user-mode NAT for internet access. A single
+workgroup machine without `network` has only the NAT NIC.
 
 ## Serial protocol (guest -> host)
 
@@ -176,8 +201,8 @@ Values with characters outside `A-Za-z0-9._~:\/+,@()-` are URL-escaped. Lines wi
 | `LAB_PHASE \| text` | lab.ps1 | progress |
 | `LAB_REBOOT phase=..` | lab.ps1 | about to reboot |
 | `LAB_DC_READY domain= netbios= dc= ip=` | DC | domain up, users created |
-| `LAB_JOINED domain= autologon=` | member | joined, rebooting into the autologon |
-| `LAB_CLIENT_READY user= domain= computer= dc= ip=` | member | logged on as its logon user |
+| `LAB_JOINED domain=\|workgroup= autologon=` | member | joined (AD) / users made (workgroup), rebooting into the autologon |
+| `LAB_CLIENT_READY user= domain=\|workgroup= computer= [dc=] ip=` | member | logged on as its logon user |
 | `LAB_IDLE` | member | 0-state build: ready to be powered off |
 | `LAB_MOUNT letter= host=` | lab.ps1 | a mount disc has its drive letter |
 | `OUTPUT stream=stepNout\|stepNerr seq=N \| base64` | lab.ps1 | step output, 768-byte chunks (max 256 KiB per stream) |

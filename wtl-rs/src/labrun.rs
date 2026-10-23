@@ -173,7 +173,7 @@ pub struct MultiLab {
     /// install base images with Windows Update (--updates)
     updates: bool,
     cmd: &'static str,
-    /// the state name (labs/state/<name>/)
+    /// the state name (`labs/state/<name>/`)
     name: String,
     /// how to name this lab on the `lab` command line in hints: the name for a lab in
     /// win-test-lab's labs/, the lab file's path for one anywhere else
