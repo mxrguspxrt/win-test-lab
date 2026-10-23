@@ -613,9 +613,12 @@ impl Ctx {
         )
         .unwrap();
         std::fs::write(proj.join("smoke.ps1"), "Write-Host smoke\r\nFAKE_EXIT=0\r\n").unwrap();
+        // the project's build output, mounted as a second drive the scripts read from
+        std::fs::create_dir_all(tmp.join("proj/build")).unwrap();
+        std::fs::write(tmp.join("proj/build/app.exe"), "MZ app\r\n").unwrap();
         std::fs::write(
             proj.join("run.json"),
-            r#"{ "lab": "./lab.json", "mount": { "X": "." },
+            r#"{ "lab": "./lab.json", "mount": { "X": ".", "Y": "../build" },
   "steps": [ { "on": "SRV1", "as": "system", "run": "X:/smoke.ps1" }, { "on": "DC1", "as": "system", "run": "X:/smoke.ps1" } ] }
 "#,
         )
@@ -945,7 +948,9 @@ fn driver(args: &[String]) -> i32 {
         let dj: Value = serde_json::from_slice(dc_iso.read("LAB/lab.json").unwrap()).unwrap();
         c.ok(s(&dj, "fmt") == "multi" && s(&dj, "role") == "dc" && s(&dj, "ip") == "10.77.98.10", format!("DC lab.json {}", dj));
         c.ok(dj["run"]["steps"].as_array().map(|a| a.len()) == Some(1), format!("DC should have 1 step: {}", dj["run"]));
-        c.ok(dj["run"]["mounts"].as_array().map(|a| a.len()) == Some(0), "DC mounts only C: -> no mount disc");
+        // every machine with steps gets every drive of the run (a step may read other drives)
+        c.ok(dj["run"]["mounts"].as_array().map(|a| a.len()) == Some(1), format!("DC mounts: {}", dj["run"]["mounts"]));
+        c.file(&st.join("mount-DC-X.iso"));
         // CL1's disc: 3 steps (setup, smoke student1, smoke logon), one mount X
         let cl1_iso = IsoReader::open(&st.join("CL1.iso"), true).unwrap();
         let cj: Value = serde_json::from_slice(cl1_iso.read("LAB/lab.json").unwrap()).unwrap();
@@ -1255,6 +1260,8 @@ fn driver(args: &[String]) -> i32 {
             // the hints name the lab file (what `lab` takes for a project lab)
             c.has(o, &format!("lab restore {}", cx.tmp.join("proj/wintest/lab.json").display()));
             c.has(o, &format!("lab {}: domain corp.test", st));
+            // the steps only name X:, but Y: (the build output) is mounted too
+            c.file(&dir.join("mount-SRV1-Y.iso"));
             // a 2012 DC and a 2019 member: images 2012-dc and 2019-client
             c.content(
                 &dir.join("DC1-0.qcow2"),

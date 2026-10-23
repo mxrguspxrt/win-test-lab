@@ -321,18 +321,11 @@ impl MultiLab {
                     vm.steps.push((*n, step.clone()));
                 }
             }
-            // each machine mounts only the drives its own steps use
+            // every machine that runs steps gets all of the run's drives: a step's program may
+            // read files from other mounted drives (an install script on Y: installing X:\app.msi)
             for vm in &mut vms {
-                for (_, st) in &vm.steps {
-                    let letter = st.run[..1].to_uppercase();
-                    if letter == "C" {
-                        continue;
-                    }
-                    if !vm.mounts.iter().any(|(l, _)| *l == letter) {
-                        if let Some((_, host)) = r.mounts.iter().find(|(l, _)| *l == letter) {
-                            vm.mounts.push((letter, host.clone()));
-                        }
-                    }
+                if !vm.steps.is_empty() {
+                    vm.mounts = r.mounts.clone();
                 }
             }
         }
