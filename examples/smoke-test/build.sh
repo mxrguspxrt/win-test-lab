@@ -2,7 +2,7 @@
 # build.sh - cross-compile the standalone smoke.exe example (needs gcc-mingw-w64-x86-64).
 # Produces two things:
 #   examples/smoke-test/out/         (the AD lab config mounts it: mount = ../smoke-test/out:X,
-#                                     see examples/configs/2019-smoke.conf)
+#                                     see examples/configs/school-smoke.json)
 #   examples/smoke-test/smoke.zip    (for the single-VM launch-test.sh: launch-test.sh smoke.zip smoke.exe 2012)
 # smoke.exe is self-contained - no DLLs, no data files.
 set -euo pipefail

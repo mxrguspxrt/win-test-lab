@@ -1,168 +1,49 @@
 # wtl-rs progress
 
-Hand-over file: what is done, what is next, why things are the way they are. Update it
-after each finished piece. User-facing docs are in README.md.
+Hand-over notes: the current state, decisions and gotchas. User docs: ../README.md,
+../docs/CONFIG.md; design: ../SPEC.md; contributor notes: ../docs/AGENTS.md.
 
-## Done (2026-10-22)
+## State (2026-10-23)
 
-1. **labconf** (`src/labconf.rs`): same keys, rules, error texts and step order as
-   lib/labconf.py. `tests/labconf.rs` = tests/test_labconf.py ported case by case, plus
-   exact error messages, edge cases, the JSON form and all examples/configs/*.conf.
-2. **mkiso, qmp, serialwait, outputs** (`src/{mkiso,qmp,serialwait,outputs}.rs`). They are
-   used in-process by `lab` and also available as `wtl-rs mkiso|qmp|serialwait|outputs` with
-   the Python CLIs. mkiso output is byte-identical to mkiso.py apart from timestamps.
-3. **lab** (`src/lab.rs` + `src/qemu.rs`, `src/shconf.rs`, `src/oslist.rs`, `src/sys.rs`):
-   run / up / restore / stop / status / prepare / rebuild / help-config, the same options,
-   messages and exit codes as lab.sh, and the same labs/state/<lab>/ layout. A binary named
-   `lab` acts as `wtl-rs lab`.
-4. **README.md**: build/use, settings, the platform section (KVM / WHPX / Intel-Mac HVF /
-   no Apple Silicon), tests, differences from lab.sh.
-5. **Switched to crates** (user's request, relayed by the parent session). The hand-written
-   JSON, argument parsing, base64, time, Ctrl-C and libc/kernel32 FFI were deleted and
-   replaced by serde/serde_json, clap (derive), anyhow, base64, chrono, ctrlc,
-   percent-encoding, libc and windows-sys.
-   - `src/pyjson.rs` is a small serde_json Formatter that prints Python `json.dumps`
-     style. It keeps `labconf json`, the outputs summary and lab.json byte-identical to
-     the Python output, and pure ASCII.
-6. **Verified**, after the crate switch unless marked:
-   - `cargo test`: 29 unit tests, 13 labconf tests and 13 fake-QEMU scenarios, all green.
-   - `tests/parity.sh`: 73/73 checks against ../lib/*.py.
-   - `cargo check` passes for x86_64-pc-windows-gnu and x86_64-apple-darwin.
-   - Before the switch, a real KVM run, `wtl-rs lab run ../examples/configs/2019-smoke.conf`:
-     exit 0, ALL STEPS OK (labs/state/2019/runs/20261022-214144). After it,
-     `wtl-rs lab restore 2019` worked, and `wtl-rs lab status 2019` printed the same as
-     `lab.sh status 2019`.
-   - After the switch, the real KVM run of 2019-smoke passed again: exit 0, ALL STEPS OK
-     (labs/state/2019/runs/20261022-222742, "RESULT OK", a 1024x768 screen.png). Then
-     `restore` left no VMs or pid files, and `status` matched lab.sh again.
+- The host side is Rust only. `lab` = `wtl-rs` (`~/.local/bin/lab` -> target/release/wtl-rs).
+  lab.sh, lib/labconf.py, tests/test_labconf.py and lib/msdl.py are gone.
+- JSON is the one format: `labs/*.json` (school, 2012, 2016, 2019, win10, win11) and
+  `examples/configs/*.json`. The `.conf` runner, its parsers (labconf.rs, shconf.rs) and the
+  `.conf` -> JSON importers were removed; so was the two-machine `-netdev stream` LAN.
+- Labs: one DC + N members on a `-netdev dgram` multicast LAN; computer name = machine key
+  (the DC renames before promotion, members via `Add-Computer -NewName`); missing groups are
+  created; missing base images are installed with build-image.sh; every run writes
+  `runs/<id>/result.json`.
+- Verified on KVM: the school lab (2019 DC + 2012 + 2016) built from nothing (base images,
+  0 state) and its smoke run passes (ALL STEPS OK, 6 steps on 3 machines).
+- No-VM checks: cargo test (unit + 15 fake_lab scenarios), clippy clean, fmt, rustdoc with
+  `-D warnings`, cross-checks for Windows / macOS, tests/parity.sh, tests/all.sh.
 
-Nothing is committed. Another session may be editing lab.sh in the same checkout. Only
-files under wtl-rs/ belong to this work.
+## Next (ask the user first)
 
-## Multi-machine JSON labs (2026-10-23, in progress)
-
-Goal: N-machine labs described by typed JSON (`labs/<name>.json` = the lab, `<app>.json` = a
-run), alongside the existing 2-machine `.conf` path. Host: <=3 VMs at once (1 DC + 2 clients).
-
-- **Part 1 done**: `src/labdef.rs` has the typed serde structs for both files
-  (`deny_unknown_fields`), validation with clear errors before boot (unknown machine/user
-  names, not exactly one DC, duplicate IPs, reserved/duplicate mount letters, bad script
-  extensions, `as`-defaults-to-logon on a machine with no logon user), and defaults
-  (role=member, DC .10 / members .20,.21,... in order, mem 4096/DC 3072, cpus 2).
-  `LabDef`/`RunDef` are the raw shapes; `resolve()` returns `Lab`/`Run` for the runner.
-  `src/schema.rs` + `wtl-rs schema [DIR]` write the JSON Schema (schemars, draft-07) to
-  `wtl-rs/schema/{lab,run}.schema.json`. 9 unit tests. Decision: **two front-ends sharing one
-  set of plumbing** — `.conf` keeps the old `labconf`+`lab.rs` dc/client path byte-for-byte
-  (all 13 fake_lab + 13 labconf tests pass unchanged); JSON routes to a new N-machine runner
-  (next). Verified multicast LAN (`-netdev dgram` one group) joins 3 VMs with no root on this
-  host (target/tmp/mcast-test.sh).
-- New crates: `indexmap` (machines/users keep JSON order for IP defaults), `schemars`.
-- **Part 2 done**: `labdef::lab_from_conf` (bash vars from a `labs/*.conf` -> `LabDef`: DC +
-  one member logged on as LAB_USER, LAB_ADMIN_USER -> a Domain Admins user) and
-  `labdef::run_from_conf` (old `labconf::RunConfig` -> `RunDef`: `run_as_admin` -> `as system`,
-  `run_as_student` -> the member's logon user, every step `on all`). Both feed the same
-  `resolve()`. 2 unit tests. The live `.conf` run still uses labconf + lab.rs unchanged.
-
-- **Part 3 done** (host runner): `src/labrun.rs` `MultiLab` runs N machines, sharing
-  qemu/qmp/serialwait/outputs/mkiso/sys with `lab.rs` (which is unchanged). `lab.rs::route_json`
-  sends `run FOO.json`, `<cmd> LAB` (labs/LAB.json, no .conf shadow) or `<cmd> path/lab.json`
-  here; everything else stays on the `.conf` path. Private LAN = `qemu::Lan::Mcast` (one
-  `-netdev dgram` group 239.77.30.1 : lan_port, members also keep user-mode NAT, DC isolated).
-  Per-VM disks/overlays/serial/QMP as `labs/state/<lab>/<machine>...`, MAC 52:54:00:4c:41:(10+i),
-  base image `images/<os>-{dc,client}.qcow2`. Per-machine `cpus` via new `Opts.cpus`. 0 state:
-  boots DC + members, waits LAB_DC_READY / per-member LAB_JOINED+logon+LAB_CLIENT_READY+LAB_IDLE,
-  freezes. Run: restores, boots, each machine-with-steps gets its own ordered steps + only the
-  mount discs it uses; `run_steps` multiplexes short serial waits across those machines until each
-  emits LAB_RUN_DONE; LAB_STEP carries machine=; expect_exit checked host-side; results in
-  runs/<ts>/<machine>/. Does NOT install Windows (base images must exist). 1 unit test + qemu
-  mcast argv test.
-- **Part 4 done** (guest): `guest/lab.ps1` branches on `fmt=="multi"` -> `Invoke-LabMulti`
-  (DC promotes + registers labsvc + may run steps; member joins/autologons then runs its steps).
-  `Invoke-LabMultiStep` handles as=system|logon|user, args, keep_running, .msi, reports
-  `LAB_STEP machine=..`. `guest/labsvc.ps1` extended ADDITIVELY: run action now takes optional
-  args/user/password/domain/keep_running; `Invoke-SvcRunAs` runs a step as another user
-  (CreateProcessWithLogonW via ProcessStartInfo, output drained to files). The two-machine path
-  is untouched; old baked 0 states still work. `tests/ps_lint.py` passes. NOTE: a fresh 0-state
-  build bakes the new labsvc.ps1 (Register-LabSvc copies it from the CD), so the multi-machine
-  school lab gets the new worker; existing 2012/2016/2019 single labs keep their old baked worker.
-
-- **Part 5 (tests) done**: `tests/fake_lab.rs` now has 16 scenarios (was 13). The fake QEMU
-  understands `fmt=multi` (run_multi / run_multi_steps: DC promote, member join/logon, per-machine
-  steps with machine= tags, as_=system|logon|user). New fixtures: `labs/tri.json` (2019 DC + 2019
-  member + win11 UEFI member) and base images 2019-/win11-. Three scenarios: a full 3-machine
-  build+run (checks 0 state, per-VM disks, UEFI vars only on the win11 member, per-machine results
-  folders, control-disc lab.json shape incl. as_ collapse of the logon user + explicit `as` user
-  with creds, multicast argv, per-VM cpus, DC isolation), a failing step (expect_exit mismatch ->
-  exit 1) + unknown-machine rejection before boot, and an unknown-field rejection. Added the real
-  `labs/school.json` and `examples/configs/school-smoke.json`. All tests green (42 lib, 16
-  fake_lab, 13 labconf); ps_lint clean.
-- **Part 6 remaining**: a real `lab run examples/configs/school-smoke.json` (2019 DC + 2012 + 2016)
-  on KVM. Base images exist; the JSON runner builds the 3-machine 0 state fresh (bakes the new
-  labsvc), then runs. Not yet done in this session.
-
-## Next
-
-- The user tries it and switches `~/.local/bin/lab` to target/release/wtl-rs. Until then the
-  bash `lab` stays the default.
-- Optional, **ask the user first**: port build-image.sh, launch-test.sh, lib/isoinfo.py.
-  `lab` still shells out to build-image.sh when a base image is missing.
-- Never run on a real Windows or macOS host; only cross-`cargo check`ed. On real WHPX,
+- Port build-image.sh / launch-test.sh / lib/isoinfo.py to Rust, so installing base images
+  needs no bash or Python (then Windows/macOS hosts need nothing but QEMU).
+- Never run on a real Windows or macOS host; only cross-`cargo check`ed. On WHPX,
   `-accel whpx,kernel-irqchip=off -cpu max` may need `WTL_CPU`.
-- If lab.sh gets bug fixes (`git log -- lab.sh lib/common.sh`), port them. src/lab.rs keeps
-  lab.sh's function names (stop_vms, restore, freeze_off, make_cd, start_vm, boot_lab,
-  reset_if_off, wait_ev, wait_logon, build_bases, prepare).
 
 ## Decisions
 
-- **Crates for the generic parts, in-tree code for the win-test-lab logic** (ISO writer,
-  QMP client, serial protocol, lab runner, bash-subset parser for labs/*.conf).
-- **Errors** are anyhow throughout:
-  - `labconf::ConfError` keeps the exact labconf.py texts.
-  - `qmp::ReplyError` marks "QEMU answered with an error" (exit 1 in `wtl-rs qmp`); any
-    other error there is a connect/protocol failure (exit 2).
-  - `lab.rs` ends with an internal `Exit(code)` error once it has printed the reason
-    itself: 2 lab error, 3 timeout.
-- **clap usage errors** exit 2 under `lab` (like lab.sh) and 64 for the tools (like the
-  Python scripts). Help and --version exit 0.
-- **lib + thin bin** (`src/lib.rs`, `src/main.rs`), so the tests call the modules directly.
-- **The state layout is unchanged**, so bash `lab` and `wtl-rs lab` work on the same labs.
-  The only new file is `<vm>.qmp.addr`, written when QMP runs over TCP (the Windows default,
-  or `WTL_QMP=tcp`).
-- **labs/*.conf are read by a bash-subset parser** (src/shconf.rs). Anything that runs a
-  command is an error with its line number.
-- **Serial offsets are kept in memory** per VM, not in .off-* files. A half-written line is
-  re-read on the next wait.
-- **Deliberate differences**:
-  - clap's wording for usage errors.
-  - A non-integer `wait`/`timeout_min` is a clear error (Python crashed).
-  - `last` is a text file where symlinks are not allowed.
-  - `WTL_ACCEL`, `WTL_CPU`, `WTL_QMP`, `WTL_DISPLAY`, `WTL_ROOT` are new.
-- `WTL_TEST_FAST=1` skips the fixed settle sleeps (1 s / 2 s / 20 s). Only the fake-QEMU
-  tests use it.
+- Crates for the generic parts, in-tree code for the win-test-lab logic (ISO writer, QMP,
+  serial protocol, runner).
+- Steps are guest-driven: each machine gets its ordered step list on its control disc; there
+  is no barrier between different machines' steps (the host has no write channel into a
+  booted guest; mounts are read-only ISOs).
+- Errors are anyhow; the runner ends with an internal `Exit(code)` once it printed the reason:
+  2 lab error, 3 timeout. clap usage errors exit 2 under `lab`, 64 for the other tools.
+- Serial offsets are kept in memory per VM; a half-written line is re-read by the next wait.
+- `pyjson` writes Python-`json.dumps`-style ASCII JSON: lab.json must be ASCII for
+  PowerShell 4, and the outputs summary is compared byte for byte with lib/outputs.py.
+- `WTL_TEST_FAST=1` skips the fixed settle sleeps (fake-QEMU tests only).
 
 ## Gotchas
 
-- **The Bash tool's sandbox is broken on this machine.** Run commands with the Terminal
-  panel tools (run_in_terminal / read_terminal).
-  - `$TMPDIR` is empty in that shell, so put scratch output in `target/tmp/`.
-  - The terminal hook rejects any command line containing `!` (so no `sed` that writes
-    `bail!`). Edit Rust macros with the Edit tool instead.
-- **The Write/Edit tools turned a literal `é` in Rust source into `é`.** JSON tests build
-  their expected escapes with `format!` to avoid that.
-- **tests/fake_lab.rs is `harness = false`**: one binary that is the test driver, the fake
-  qemu-system-x86_64 (argv contains `-machine`) and the fake qemu-img (argv[1] = `create`).
-  To run some scenarios: `cargo test --test fake_lab -- <substring of the scenario name>`.
-  The temp dir is kept on failure.
-- **A fake VM must not exit within 0.5 s of starting.** `qemu::start` treats that as "qemu
-  failed to start".
-- **mkiso.py quirks to keep**: file stems are cut to `30 - 1 - len(ext)` chars, Joliet
-  collision renames are checked case-insensitively, and files are laid out in ISO-tree BFS
-  order.
-- **serde_json needs `preserve_order`** so the outputs summary keeps Python's key order.
-- **Real labs**: 2019 has a 0 state with the SYSTEM worker. 2012/2016 0 states predate the
-  worker and need `lab rebuild` before config runs work.
-
-## Log
-
-- 2026-10-22 21:41: first real KVM run (zero-dep version): pass.
-- 2026-10-22 22:27: crate version, real KVM run of 2019-smoke: pass; lab restored to its 0 state.
+- The Bash tool's sandbox is broken on this machine: run commands with the Terminal panel
+  tools. The terminal hook rejects lines with `!`, a leading `#` word, or `(...)` glob-like
+  groups, and multi-line commands; put scripts in `target/tmp/` and run them.
+- A fake VM must not exit within 0.5 s of starting (`qemu::start` treats that as a failure).
+- rustfmt.toml keeps the long-line style (max_width 140).

@@ -1,91 +1,93 @@
-# Guidance for AI coding agents working on win-test-lab
+# Guidance for coding agents (and contributors) working on win-test-lab
 
-This file orients an LLM (Claude Code, etc.) working in this repo. Humans: this doubles as an
-architecture overview.
+## What this is
 
-## What this project is
+A tool to test Windows software inside a small Active Directory domain on QEMU/KVM: a
+domain controller plus domain-joined machines on a private LAN, described in
+`labs/<name>.json`, built once into a frozen "0 state", and reset to it before every run. A
+run config (`examples/configs/*.json`) mounts host folders and runs programs on chosen
+machines as chosen users. The user wants it simple: "0 state, run my program, see if it
+works, restore, deploy the new version". No snapshot juggling, no extra modes.
 
-A dependency-light harness to install Windows Server in throwaway QEMU/KVM VMs, stand up a tiny
-Active Directory domain (a domain controller + a domain-joined client that auto-logs-in as
-`LAB\student`), and run a user's program/scripts on the client - then throw it all away and do
-it again. It exists so people can test their software on several Windows versions easily.
+The host side is the Rust program in `wtl-rs/` (binary `wtl-rs`, which acts as `lab` when
+called by that name). The guest side is PowerShell in `guest/`. They talk over a serial log
+(SPEC.md). `build-image.sh` (bash + `lib/*.py`) still installs the Windows base images; `lab`
+calls it. `launch-test.sh` is a separate, older single-VM tester that shares those helpers.
 
-Two entry points:
-- `lab.sh` (installed as `lab`) - the AD lab: `lab run <config> [<config>...]`, plus `restore`,
-  `up`, `stop`, `status`, `prepare`, `rebuild`. A run is always driven by a config file (mounts +
-  `run_as_admin` / `run_as_student` steps, run in the order written).
-- `launch-test.sh` - the older single-VM (no domain) program tester (zip + exe, the JOB.JSON /
-  `guest/agent.ps1` serial protocol in SPEC.md). Still supported, separate from `lab.sh`.
+Read [SPEC.md](../SPEC.md) for the design and [docs/CONFIG.md](CONFIG.md) for the formats.
 
-## Hard constraints (do not break these)
+## Hard constraints
 
-- **Host:** Linux + `qemu-system-x86_64` + `qemu-img` + `python3` (3.8+ stdlib only). No root
-  is assumed, and **no Samba**. Do not add a host dependency without a very good reason and a
-  fallback; the whole point is that it runs on a stock machine. ISOs are written by the
-  pure-python `lib/mkiso.py` (no xorriso/genisoimage).
-- **Guest PowerShell must be 4.0 / .NET 4.5 compatible** (Server 2012 R2 is the floor). No
-  `Expand-Archive`, no `::new()`, no classes, no `-AsHashtable`. `tests/ps_lint.py` enforces a
-  subset - run it after editing any `guest/*.ps1`.
-- **Serial protocol:** the guest talks to the host over COM1 with `WTL <EVENT> k=v | text`
-  lines (see `SPEC.md`). Values with spaces are URL-escaped. Only ONE process writes COM1 at a
-  time (the agent); the privileged worker talks via files, not serial.
+- **Guest PowerShell must be 4.0 / .NET 4.5 compatible** (Server 2012 R2 is the floor): no
+  `Expand-Archive`, `::new()`, classes or `-AsHashtable`. Run `python3 tests/ps_lint.py
+  guest/*.ps1` after editing any guest script.
+- **Only the agent writes COM1.** The SYSTEM worker (`labsvc.ps1`) answers through files under
+  `C:\WTL\svc`; output reaches the host as `OUTPUT` events sent by the agent's session.
+- **No root and no Samba on the host.** Host folders reach the guests as read-only ISOs
+  written by `wtl-rs/src/mkiso.rs`; the lab LAN is QEMU `-netdev dgram` multicast on loopback.
+- **Keep the formats strict.** `labdef.rs` uses `deny_unknown_fields` and validates before
+  anything boots. A new field needs: the struct field with a doc comment (it becomes the
+  schema description), validation in `resolve()`, `wtl-rs schema` to regenerate
+  `wtl-rs/schema/`, and a line in docs/CONFIG.md.
+- **Use crates for generic work** (JSON, CLI parsing, errors, time, Ctrl-C, base64). The
+  win-test-lab logic itself (ISO writer, QMP client, serial protocol, runner) is in-tree.
+- At most 3 VMs at a time on the development machine.
 
-## How a lab works (the moving parts)
+## Where things are
 
-1. **Base install** (`build-image.sh`): unattended Windows install from the ISO via
-   `guest/autounattend.xml.tmpl` -> `images/<lab>-dc.qcow2`, `images/<lab>-client.qcow2`.
-   `guest/setup.ps1` runs at first logon (autologon, firewall off, optional Windows Update).
-2. **0 state** (`lab prepare`): boots DC + client once; `guest/lab.ps1` promotes the DC to a new
-   forest, creates users, joins the client, sets the student autologon, registers the SYSTEM
-   worker, then both shut down. The resulting disks are frozen as `labs/state/<lab>/*-0.qcow2`.
-   DC and client get **separate** installs because a clone of the DC can't join its own domain.
-3. **A run** (`lab run`): makes throwaway qcow2 overlays on the 0-state disks, boots both,
-   mounts the config's folders (read-only ISOs, labelled `WTL<LETTER>`), runs the steps, reports.
-   `lab restore` / the next run just deletes the overlays - that is the "reset to 0" mechanism.
+    wtl-rs/src/lab.rs        `lab` CLI (run/up/restore/stop/status/prepare/rebuild); find_root;
+                             build_base_images (drives build-image.sh)
+    wtl-rs/src/labdef.rs     LabDef/RunDef (raw serde) -> Lab/Run (resolved, validated)
+    wtl-rs/src/labrun.rs     MultiLab: 0 state, boot, control + mount discs, steps, result.json
+    wtl-rs/src/qemu.rs       Env (WTL_* settings) and the QEMU argv
+    wtl-rs/src/{qmp,serialwait,outputs,mkiso,oslist,sys,util,logx,pyjson,schema}.rs
+    wtl-rs/tests/fake_lab.rs end-to-end suite; one binary that is the test driver, a fake
+                             qemu-system-x86_64 (simulates guest/lab.ps1 from the control disc)
+                             and a fake qemu-img
+    guest/lab.ps1            rename, DC promotion, users/groups, join, autologon, run steps
+    guest/labsvc.ps1         SYSTEM worker: mounts, steps as system / as another user
+    guest/agent.ps1          logon agent (COM1); also the launch-test.sh agent
+    guest/setup.ps1          base-image first logon
+    labs/*.json, examples/configs/*.json, wtl-rs/schema/*.json
 
-Privilege split on the client: the ordinary `LAB\student` session runs `guest/agent.ps1` (owns
-COM1) and `guest/lab.ps1` (orchestration + student steps). A SYSTEM scheduled task runs
-`guest/labsvc.ps1`, which does what the student can't - assign drive letters, run admin steps -
-driven by request/response JSON files under `C:\WTL\svc`. This avoids juggling admin passwords
-or rebooting between phases.
-
-## Networking
-
-Two VMs on a private QEMU `-netdev stream` segment over `127.0.0.1:<LAB_LAN_PORT>`; the DC is
-the DNS server and has no internet, the client also has user-mode NAT. Static IPs from the lab
-conf (`LAB_NET`). Different labs use different nets/ports, so several can run at once.
-
-## Files
-
-    lab.sh                 AD lab CLI
-    build-image.sh         unattended Windows install -> base image
-    launch-test.sh         single-VM program tester (no domain)
-    labs/<v>.conf          lab definition (domain, names, net, accounts) - bash key=value
-    examples/configs/*.conf  run configs (see docs/CONFIG.md) - the parsed key=value format
-    lib/common.sh          shared bash: qemu cmdline, OS table, serial/QMP helpers
-    lib/labconf.py         run-config parser/validator (unit-tested)
-    lib/mkiso.py           pure-python ISO9660+Joliet writer
-    lib/isoinfo.py         pure-python WIM/UDF reader (identify an ISO)
-    lib/qmp.py             QEMU monitor client (screenshot, powerdown, quit)
-    lib/serialwait.py      wait for WTL events in a serial log
-    lib/outputs.py         decode captured program/step output from the serial log
-    guest/autounattend.xml.tmpl   unattended answer file
-    guest/setup.ps1        build phase (first logon)
-    guest/lab.ps1          AD lab orchestration (DC promote, join, mounts, run steps)
-    guest/labsvc.ps1       SYSTEM worker (privileged mounts + admin steps)
-    guest/agent.ps1        single-VM test agent (owns COM1)
-    tests/all.sh           run all no-VM tests
-    tests/test_labconf.py  run-config parser unit tests
-    tests/run-tests.sh     fake-qemu host-logic suite
-    tests/ps_lint.py       PowerShell 4.0 compatibility linter
+State on disk (git-ignored): `images/` (base images), `labs/state/<lab>/` (0 state, overlays,
+serial logs, `runs/<id>/`), `iso-files/`, `runs/` (build-image.sh scratch).
 
 ## When you change things
 
-- Editing `guest/lab.ps1` or `guest/labsvc.ps1`: they ship on the lab control CD and are copied
-  fresh each boot, so a plain `lab run` picks them up **except** anything baked at 0-state build
-  time (the SYSTEM task registration, the join, autologon). If you touch those, `lab rebuild
-  <lab>` then `lab run` to re-bake.
-- Editing `guest/setup.ps1` / `autounattend.xml.tmpl`: these live in the base image - rebuild
-  it (`build-image.sh --force`, or delete `images/<lab>-*.qcow2`), which is slow.
-- Always run `tests/all.sh` before claiming something works. It needs no VM.
-- Keep the serial protocol and the `WTL_*` env contract stable; `SPEC.md` is the source of truth.
+- `guest/lab.ps1`: shipped on the control disc at every boot, so the next `lab run` uses it,
+  except what the 0-state build bakes in (rename, promotion, users, join, autologon, the
+  `WTL-Svc` task): for those, `lab rebuild <lab>` and run again.
+- `guest/labsvc.ps1`: copied into the 0 state, so `lab rebuild <lab>`.
+- `guest/setup.ps1`, `guest/autounattend*.xml.tmpl`, `build-image.sh`: these make the base
+  images; delete `images/<os>-*.qcow2` (or `build-image.sh --force`) and the lab's 0 state.
+- `wtl-rs/src/*`: `cargo build --release` in `wtl-rs/` (`~/.local/bin/lab` points at
+  `target/release/wtl-rs`).
+- The serial protocol, the control disc's `lab.json` and the `WTL_*` variables are the
+  contract between host and guest: change both sides together, and SPEC.md.
+
+## Before saying it works
+
+    tests/all.sh                         # everything that needs no VM (cargo test, ps_lint,
+                                         # lab/config checks, the fake-qemu suite)
+    cd wtl-rs && cargo clippy --all-targets && cargo fmt --check
+    cargo check --target x86_64-pc-windows-gnu && cargo check --target x86_64-apple-darwin
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+    wtl-rs/tests/parity.sh               # mkiso / outputs agree with lib/*.py (needs python3)
+
+Anything touching the guest or the boot sequence also needs a real run, e.g.
+`lab rebuild school && lab run examples/configs/school-smoke.json` (about 30 min).
+
+## Gotchas that cost time before
+
+- Passwords containing the account name are rejected by Windows.
+- Domain autologon needs the LSA secret `DefaultPassword`; it sometimes stops at the sign-in
+  screen, so the host resets a member that does not log on within 5 min.
+- AD Web Services is not up right after the DC boots (retry); 2016/2019 DCs need ~10 min after
+  promotion before joins work (the join retries for 20 min).
+- A plain domain user cannot call `Stop-Computer`: the host powers machines off over ACPI.
+- `Add-ADGroupMember` needs the group to exist: `New-LabUser` creates missing groups.
+- The 0-state build must boot the `-0.qcow2` disks themselves, not an overlay on them, or the
+  domain ends up in a throwaway disk.
+- `setup.ps1` must install the `WTL-Agent` autostart after `BUILD_DONE`: an agent started
+  during the same logon holds COM1 and the host never sees `BUILD_DONE`.
