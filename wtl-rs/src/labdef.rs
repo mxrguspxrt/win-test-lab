@@ -636,7 +636,11 @@ impl LabDef {
             let role = if lab_roles.contains(&LabRole::AdDs) { Role::Dc } else { Role::Member };
             // ad-cs needs a domain to join and enroll against (a standalone CA is a follow-up)
             if lab_roles.contains(&LabRole::AdCs) && !is_ad {
-                bail!("{}: machine {}: the \"ad-cs\" role needs an AD lab (a machine with \"ad-ds\"); a standalone CA is not supported yet", path, name);
+                bail!(
+                    "{}: machine {}: the \"ad-cs\" role needs an AD lab (a machine with \"ad-ds\"); a standalone CA is not supported yet",
+                    path,
+                    name
+                );
             }
             if let Some(l) = &m.logon {
                 if !user_names.contains(&l.as_str()) {
@@ -649,7 +653,10 @@ impl LabDef {
             // role options: present only for the roles the machine actually has
             let ad_cs = if lab_roles.contains(&LabRole::AdCs) {
                 let d = m.ad_cs.clone().unwrap_or_default();
-                let ca_name = d.ca_name.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| format!("{}-ROOT-CA", self.netbios.clone().unwrap_or_default()));
+                let ca_name = d
+                    .ca_name
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| format!("{}-ROOT-CA", self.netbios.clone().unwrap_or_default()));
                 Some(AdCsOpts {
                     ca_name,
                     key_length: d.key_length.unwrap_or(2048),
@@ -682,7 +689,13 @@ impl LabDef {
                     bail!("{}: machine {}: setup[{}] run {:?} must end in .exe .bat .cmd .ps1 or .msi", path, name, si, sd.run);
                 }
                 if run.contains(':') || run.starts_with('/') {
-                    bail!("{}: machine {}: setup[{}] run {:?} must be relative to the lab file (e.g. ./setup/x.ps1)", path, name, si, sd.run);
+                    bail!(
+                        "{}: machine {}: setup[{}] run {:?} must be relative to the lab file (e.g. ./setup/x.ps1)",
+                        path,
+                        name,
+                        si,
+                        sd.run
+                    );
                 }
                 let as_ = match sd.as_.as_deref() {
                     None | Some("system") => StepAs::System,
@@ -1053,15 +1066,13 @@ mod tests {
     #[test]
     fn roles_alias_and_resolution() {
         // role: "dc" is an alias for roles: ["ad-ds"]; the CA machine joins and runs ad-cs + iis
-        let l = lab(
-            r#"{"domain":"lab.local","netbios":"LAB","network":{"subnet":"10.77.50","lan_port":47050},
+        let l = lab(r#"{"domain":"lab.local","netbios":"LAB","network":{"subnet":"10.77.50","lan_port":47050},
             "machines":{
               "DC1":{"os":"2019","role":"dc"},
               "CA1":{"os":"2012","roles":["ad-cs","iis"]},
               "CL1":{"os":"2016","role":"member","logon":"student"}
             },
-            "users":{"student":{"password":"Pupil!2026"}}}"#,
-        )
+            "users":{"student":{"password":"Pupil!2026"}}}"#)
         .unwrap();
         let dc = l.dc().unwrap();
         assert_eq!(dc.roles, vec![LabRole::AdDs]);
@@ -1079,10 +1090,8 @@ mod tests {
 
     #[test]
     fn dhcp_range_and_options() {
-        let l = lab(
-            r#"{"domain":"d","netbios":"LAB","network":{"subnet":"10.9.9","lan_port":1},
-            "machines":{"DC1":{"os":"2019","roles":["ad-ds","dhcp"],"dhcp":{"range":".50-.80"}}}}"#,
-        )
+        let l = lab(r#"{"domain":"d","netbios":"LAB","network":{"subnet":"10.9.9","lan_port":1},
+            "machines":{"DC1":{"os":"2019","roles":["ad-ds","dhcp"],"dhcp":{"range":".50-.80"}}}}"#)
         .unwrap();
         let dc = l.dc().unwrap();
         let d = dc.dhcp.as_ref().unwrap();
@@ -1106,11 +1115,10 @@ mod tests {
 
     #[test]
     fn setup_scripts_resolve_and_validate() {
-        let l = lab(
-            r#"{"machines":{"S":{"os":"2019","setup":[{"run":"./setup/a.ps1"},{"run":"setup/b.bat","args":"--go","as":"operator"}]}},
-            "users":{"operator":{"password":"Pass!2026x"}}}"#,
-        )
-        .unwrap();
+        let l =
+            lab(r#"{"machines":{"S":{"os":"2019","setup":[{"run":"./setup/a.ps1"},{"run":"setup/b.bat","args":"--go","as":"operator"}]}},
+            "users":{"operator":{"password":"Pass!2026x"}}}"#)
+            .unwrap();
         let s = &l.machine("S").unwrap().setup;
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].run, "setup/a.ps1"); // leading "./" normalized away

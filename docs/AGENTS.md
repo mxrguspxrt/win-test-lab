@@ -3,13 +3,14 @@
 ## What this is
 
 A tool to test Windows software on QEMU/KVM: on one or more standalone Windows machines
-(workgroup mode) or inside a small Active Directory domain (AD mode: one machine has
-`role: "dc"`, any Server version; the others join, any OS). A lab is `labs/<name>.json` or a
-`lab.json` in another project, built once into a frozen "0 state", and reset to it before
-every run. A run config (`examples/configs/*.json`, or a project's `wintest/*.json`) names
-its lab by name or path, mounts host folders and runs programs on chosen machines as chosen
-users. The user wants it simple: "0 state, run my program, see if it works, restore, deploy
-the new version". No snapshot juggling.
+(workgroup mode) or inside a small Active Directory domain (AD mode: one machine has the
+`ad-ds` role, any Server version; the others join, any OS). Machines can carry extra server
+roles (`ad-cs`, `dhcp`, `iis`), Windows features and per-machine setup scripts, all baked into
+the 0 state. A lab is `labs/<name>.json` or a `lab.json` in another project, built once into a
+frozen "0 state", and reset to it before every run. A run config (`examples/configs/*.json`,
+or a project's `wintest/*.json`) names its lab by name or path, mounts host folders and runs
+programs on chosen machines as chosen users. The user wants it simple: "0 state, run my
+program, see if it works, restore, deploy the new version". No snapshot juggling.
 
 The host side is the Rust program in `wtl-rs/` (binary `wtl-rs`, which acts as `lab` when
 called by that name). The guest side is PowerShell in `guest/`. They talk over a serial log
@@ -46,7 +47,8 @@ Read [SPEC.md](../SPEC.md) for the design and [docs/CONFIG.md](CONFIG.md) for th
     wtl-rs/tests/fake_lab.rs end-to-end suite; one binary that is the test driver, a fake
                              qemu-system-x86_64 (simulates guest/lab.ps1 from the control disc)
                              and a fake qemu-img
-    guest/lab.ps1            rename, DC promotion, users/groups, join, autologon, run steps
+    guest/lab.ps1            rename, DC promotion, users/groups, join, autologon, the build-time
+                             "configure" phase (roles ad-cs/dhcp/iis, features, setup), run steps
     guest/labsvc.ps1         SYSTEM worker: mounts, steps as system / as another user
     guest/agent.ps1          logon agent (COM1); also the launch-test.sh agent
     guest/setup.ps1          base-image first logon
@@ -100,3 +102,9 @@ affects: `lab rebuild single-2019 && lab run examples/configs/single-2019-smoke.
   files opened by SYSTEM and inherited (the user has no rights on `C:\WTL`).
 - A lab file outside `labs/` gets a state name with a hash of its path: moving a project's
   `lab.json` means a new 0 state (or set `"name"`).
+- Roles/features/setup are baked into the 0 state in a build-only `configure` phase, so they
+  are on the **build** control disc only (empty on a run disc) and changing them needs
+  `lab rebuild`. A member with config stays the (domain) Administrator for that phase, because
+  `ad-cs`/`dhcp`-in-AD need that token, then reboots into its `logon` user. `ad-cs` requires an
+  AD lab; roles/features need a server OS (checked before boot). The pki lab/smoke
+  (`labs/pki.json`, `examples/configs/pki-smoke.json`, `examples/pki/`) is the worked example.

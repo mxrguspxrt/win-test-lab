@@ -102,8 +102,12 @@ A **machine**:
 
 | field | default | meaning |
 |-------|---------|---------|
-| `os` | (required) | OS key from `lib/oslist.conf`: `2012`, `2016`, `2019`, `2022`, `2025`, `win10`, `win11` (aliases like `2012r2`, `ws2019` work too). The DC must be a Windows Server. |
-| `role` | `"member"` | `"dc"` (the domain controller; at most one, and it makes the lab an AD lab) or `"member"` (joined to the domain in AD mode, a standalone machine in workgroup mode). |
+| `os` | (required) | OS key from `lib/oslist.conf`: `2012`, `2016`, `2019`, `2022`, `2025`, `win10`, `win11` (aliases like `2012r2`, `ws2019` work too). A machine with the `ad-ds` role (the DC) must be a Windows Server. |
+| `roles` | `[]` | The server roles baked into this machine's 0 state: any of `ad-ds`, `ad-cs`, `dhcp`, `iis` (see **Roles** below). Servers only. Mutually exclusive with `role`. |
+| `role` | `"member"` | The compact alias for `roles`: `"dc"` means `roles: ["ad-ds"]` (the domain controller; at most one, and it makes the lab an AD lab); `"member"` means no roles. Mutually exclusive with `roles`. |
+| `features` | `[]` | Windows feature names installed during the build with `Install-WindowsFeature`, e.g. `["Telnet-Client"]`. Servers only; an unknown name fails the build with the list of available features. |
+| `setup` | `[]` | Scripts run once during the build, after the join / roles / features (see **Setup scripts** below). |
+| `ad_cs`, `dhcp`, `iis` | (defaults) | Options for the matching role (see **Roles**). Ignored when the role is absent. |
 | `logon` | Administrator | A user from `users` that this machine logs on as automatically; without one it logs on as Administrator (domain or local). The DC cannot set one. Steps run as this user by default. |
 | `mem` | 3072 (DC), 4096 (others) | RAM in MB. |
 | `cpus` | 2 | Virtual CPUs. |
@@ -112,6 +116,56 @@ A **machine**:
 A machine's Windows install comes from a base image: `images/<os>-dc.qcow2` for the DC,
 `images/<os>-client.qcow2` for every other machine (machines with the same OS share it).
 Missing images are installed automatically by the first run.
+
+### Roles
+
+A machine lists the server roles it runs in `roles` (or, for the common domain controller,
+the `role: "dc"` alias). Roles are installed and configured **during the 0-state build** and
+frozen into it, so a running lab starts with the CA, DHCP scope, IIS site and so on already up.
+Changing a machine's roles, features or setup scripts means rebuilding: `lab rebuild <lab>`,
+then run again.
+
+| role | what the build does | options |
+|------|---------------------|---------|
+| `ad-ds` | AD Domain Services: promotes this machine to the domain controller of a new forest. Makes the lab an AD lab (needs `domain`/`netbios`). One per lab. (`role: "dc"` is the alias.) | — |
+| `ad-cs` | AD Certificate Services: an Enterprise Root CA. Needs an AD lab; the machine joins the domain, then installs the CA as a domain admin. With `autoenroll`, a domain GPO turns on computer and user certificate auto-enrollment and the Workstation/User templates are published, so members enrol automatically. | `ad_cs`: `ca_name` (default `<NETBIOS>-ROOT-CA`), `key_length` (2048), `validity_years` (5), `autoenroll` (true) |
+| `dhcp` | DHCP server: a scope for the lab subnet (router and DNS = the DC), authorized in AD when there is a domain. | `dhcp`: `range`, the scope as last octets within the subnet, `".<start>-.<end>"` (default `.100-.199`) |
+| `iis` | IIS web server: `Web-Server` + the management console (and ASP.NET 4.5 where available), the default site serving a test page reachable at `http://<machine>/` from other lab machines. | `iis`: `site_path` (default `C:\inetpub\wwwroot`) |
+
+`ad-cs` needs an AD lab; a standalone (workgroup) CA is not supported yet. A standalone CA
+would be a reasonable follow-up.
+
+### Setup scripts
+
+`setup` runs your own scripts once during the build, in order, after the machine has joined,
+installed its roles and installed its features:
+
+```json
+"setup": [
+  { "run": "./setup/harden.ps1" },
+  { "run": "setup/seed-data.bat", "args": "--demo", "as": "operator" }
+]
+```
+
+| field | default | meaning |
+|-------|---------|---------|
+| `run` | (required) | The script, **relative to the lab file**: `./setup/x.ps1`, `setup/x.bat`. `.exe .bat .cmd .ps1 .msi`. It is staged onto the control disc and run during the build (not from a host mount). |
+| `args` | none | Command-line arguments, as one string. |
+| `as` | `"system"` | Who runs it: `"system"` (full rights) or a lab user (a domain user in AD mode). |
+
+A setup script that exits non-zero (or times out) fails the build with its output, like a
+failed step. Because setup scripts run while the 0 state is being built, their effects are
+baked in and every run starts with them already applied.
+
+### Build order
+
+The 0 state is built in stages so dependencies line up: the **DC** first (AD DS + forest +
+users, then its own roles such as `dhcp`); then the **other machines** join and, if they have
+any, run their `configure` stage (roles like `ad-cs`/`iis`, then features, then setup scripts)
+as the Administrator before switching to their logon user; finally each machine logs on as its
+final user and the 0 state is frozen. At **run** start, members in an AD lab run
+`gpupdate /force` and `certutil -pulse` before the steps, so a step finds its auto-enrolled
+certificates in place.
 
 A **user**:
 
@@ -129,6 +183,7 @@ The labs in `labs/`:
 | `school` | AD | DC1 (Server 2019) + CL1 (2012 R2, logs on as student1) + CL2 (2016, student2); users student1, student2, teacher |
 | `2012`, `2016`, `2019` | AD | a DC + one member of that version, logged on as `student`; `labadmin` is a Domain Admin |
 | `win10`, `win11` | AD | a 2019 DC + a Windows 10 / 11 member (win11 boots UEFI) |
+| `pki` | AD | DC1 (2019, `ad-ds` + `dhcp`) + CA1 (2012 R2, `ad-cs` Enterprise Root CA with auto-enrollment + `iis`) + CL1 (2016, logs on as `student`). `examples/configs/pki-smoke.json` checks the certs, the web site and the DHCP scope. |
 
 Another lab: copy one, change the machine names (and for a LAN `network.subnet` and
 `network.lan_port`), and `lab run` a config that names it.

@@ -99,23 +99,28 @@ built once (`lab prepare`, or the first `lab run`) by booting the overlays thems
    and dot-sources `lab.ps1`.
 2. AD, the DC: set the local Administrator password (`admin_password`; it becomes the domain
    Administrator's); rename to the machine name + reboot; static IP; AD DS + new forest +
-   reboot; create the groups and users; `LAB_DC_READY`; register the SYSTEM worker.
+   reboot; create the groups and users; install its own roles/features/setup inline (it is
+   already the domain Administrator) — e.g. `dhcp`; `LAB_DC_READY`; register the SYSTEM worker.
 3. AD, the members (in parallel): static IP with the DC as DNS; register the SYSTEM worker;
    set the local Administrator password; wait for the DC; `Add-Computer -NewName <machine>`
    (join + rename, one reboot, retried for 20 min while the new DC finishes its first boot);
-   autologon as the machine's `logon` user (else the domain Administrator); `LAB_JOINED`;
-   reboot; logged on -> `LAB_CLIENT_READY`; `LAB_IDLE`.
+   autologon; `LAB_JOINED`; reboot. A member with roles/features/setup autologs on as the
+   domain Administrator first (phase `configure`): install roles (`ad-cs`, `iis`, ...),
+   features, then the setup scripts; switch autologon to its `logon` user; reboot. Then logged
+   on as that user -> `LAB_CLIENT_READY`; `LAB_IDLE`.
 3. Workgroup machines (in parallel): static IP on the lab LAN if there is one; register the
    SYSTEM worker; set the local Administrator password; create the lab's users as local
    accounts in their local groups (missing groups are created); rename to the machine name;
-   autologon as the machine's `logon` user (else Administrator); `LAB_JOINED`; reboot; logged
-   on -> `LAB_CLIENT_READY`; `LAB_IDLE`.
+   a machine with roles/features/setup goes through the same `configure` phase as Administrator
+   first; autologon as the machine's `logon` user (else Administrator); `LAB_JOINED`; reboot;
+   logged on -> `LAB_CLIENT_READY`; `LAB_IDLE`.
 4. The host powers every machine off with ACPI (members first, then the DC; a second press
    after 60 s if a user session delays it) and writes `0-state.json`.
 
 The guest keeps its progress in `C:\WTL\lab-state.json` (`phase`: new, promoted, ready,
-joined), so every reboot continues where it stopped. `lab rebuild` deletes the `-0.qcow2`
-files and `0-state.json`; the base images stay.
+joined, configure), so every reboot continues where it stopped. Roles, features and setup
+scripts (below) are applied here and frozen into the 0 state. `lab rebuild` deletes the
+`-0.qcow2` files and `0-state.json`; the base images stay.
 
 ## A run
 
@@ -149,6 +154,11 @@ Pure ASCII (PowerShell 4 reads it without a BOM), one per machine:
  "users": [{"name": "student1", "password": "...", "groups": ["Students"]}],
  "logon_user": "student1", "logon_password": "...",
  "shutdown_when_ready": false,
+ "roles": ["ad-cs", "iis"], "features": ["Telnet-Client"],
+ "ad_cs": {"ca_name": "LAB-ROOT-CA", "key_length": 2048, "validity_years": 5, "autoenroll": true},
+ "dhcp": {"start": "10.77.30.100", "end": "10.77.30.199", "mask": "255.255.255.0", "router": "10.77.30.10"},
+ "iis": {"site_path": "C:\\inetpub\\wwwroot"},
+ "setup": [{"file": "setup/x.ps1", "args": "", "as_": "system|user", "user": "", "password": ""}],
  "run": null | {
    "mounts": [{"host": "/abs/host/path", "letter": "X"}],
    "steps": [{"n": 1, "as_": "system|logon|user", "user": "", "password": "",
@@ -164,6 +174,13 @@ user, or with no `as`, is `logon` (its desktop session); another lab user is `us
 user's password (started by the SYSTEM worker with `LogonUser` + `CreateProcessAsUser`, as
 `NETBIOS\user` in AD mode and `.\user` in a workgroup; no desktop); `system` is the SYSTEM
 worker. lab.ps1 refuses a disc whose `fmt` is not `multi`.
+
+`roles`, `features`, `ad_cs`/`dhcp`/`iis` and `setup` are present only on the **build** disc
+(they are baked into the 0 state; the guest acts on them in the `configure` phase) and absent
+on a run disc. `dhcp` carries full addresses computed from the subnet; `router` is the DC.
+Setup scripts are staged on the control disc under `LAB\<their relative path>` and run by the
+SYSTEM worker. At run start (AD labs) members run `gpupdate /force` + `certutil -pulse` before
+their steps so auto-enrolled certificates are present.
 
 ## Privileges in the guest
 
@@ -202,6 +219,12 @@ Values with characters outside `A-Za-z0-9._~:\/+,@()-` are URL-escaped. Lines wi
 | `LAB_REBOOT phase=..` | lab.ps1 | about to reboot |
 | `LAB_DC_READY domain= netbios= dc= ip=` | DC | domain up, users created |
 | `LAB_JOINED domain=\|workgroup= autologon=` | member | joined (AD) / users made (workgroup), rebooting into the autologon |
+| `LAB_CONFIGURE machine= role=` | lab.ps1 | 0-state build: starting the roles/features/setup of this machine |
+| `LAB_ROLE machine= name= state=installing\|ready [..]` | lab.ps1 | a server role (`ad-cs`, `dhcp`, `iis`) is being / was installed |
+| `LAB_FEATURE machine= name=` | lab.ps1 | a Windows feature was installed |
+| `LAB_SETUP machine= n= as= script= state=running\|ok` | lab.ps1 | a setup script is running / succeeded |
+| `LAB_CONFIGURED machine= autologon=` | member | 0-state build: configure done, rebooting into the logon user |
+| `LAB_POLICY machine= state=refreshed` | lab.ps1 | run start (AD): gpupdate + certutil -pulse done |
 | `LAB_CLIENT_READY user= domain=\|workgroup= computer= [dc=] ip=` | member | logged on as its logon user |
 | `LAB_IDLE` | member | 0-state build: ready to be powered off |
 | `LAB_MOUNT letter= host=` | lab.ps1 | a mount disc has its drive letter |

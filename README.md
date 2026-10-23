@@ -60,14 +60,17 @@ user, exit code, duration), each step's output, a screenshot per machine.
 - A **lab** (`labs/<name>.json`, or a `lab.json` in your project) names the machines
   (computer name, Windows version, which user logs on) and the users and groups. With one
   Windows Server marked `"role": "dc"` it is an AD domain (any Server version as DC, any OS as
-  members); without a DC it is a workgroup of standalone machines with local users.
+  members); without a DC it is a workgroup of standalone machines with local users. A machine
+  can also carry server roles (`ad-cs` for an Enterprise Root CA, `dhcp`, `iis`), extra Windows
+  features and your own setup scripts, all baked into the 0 state.
 - A **run config** names the lab (by name, or by a path like `"./lab.json"`), the host
   folders to mount as drives, and the steps: what to run, on which machine, as `system` or as
   which user.
 
 Ready-made labs: `single-2012`, `single-2016`, `single-2019`, `single-win10`, `single-win11`
-(one machine each), `mixed` (a 2012 R2 DC + a 2019 member server), `school`, and two-machine
-AD labs `2012`, `2016`, `2019`, `win10`, `win11`. Both formats, every field and its default:
+(one machine each), `mixed` (a 2012 R2 DC + a 2019 member server), `school`, two-machine
+AD labs `2012`, `2016`, `2019`, `win10`, `win11`, and `pki` (a DC with DHCP + a CA server with
+an Enterprise Root CA and IIS + a client). Both formats, every field and its default:
 [docs/CONFIG.md](docs/CONFIG.md). JSON Schemas for editor autocompletion are in
 [wtl-rs/schema/](wtl-rs/schema/).
 

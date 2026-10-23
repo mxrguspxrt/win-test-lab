@@ -402,11 +402,8 @@ impl Guest {
         }
         // build-time config (roles beyond ad-ds, features or setup) baked into the 0 state
         let arr = |k: &str| cfg.get(k).and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
-        let roles_non_adds = cfg
-            .get("roles")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter(|r| r.as_str() != Some("ad-ds")).count())
-            .unwrap_or(0);
+        let roles_non_adds =
+            cfg.get("roles").and_then(Value::as_array).map(|a| a.iter().filter(|r| r.as_str() != Some("ad-ds")).count()).unwrap_or(0);
         let has_config = roles_non_adds > 0 || arr("features") > 0 || arr("setup") > 0;
         self.emit(&format!("WTL AGENT_START os=fake build=17763 machine={}", machine));
         if role == "dc" {
@@ -444,7 +441,11 @@ impl Guest {
             // a member with config logs on as Administrator for the configure phase, then reboots
             // into its logon user (one more reboot the host's wait_ev must ride through)
             if has_config {
-                self.emit(&format!("WTL LAB_START role=member machine={} phase=configure user={}%5CAdministrator", machine, s(cfg, "netbios")));
+                self.emit(&format!(
+                    "WTL LAB_START role=member machine={} phase=configure user={}%5CAdministrator",
+                    machine,
+                    s(cfg, "netbios")
+                ));
                 self.do_configure(m, cfg, &machine, "member")?;
                 self.emit(&format!("WTL LAB_CONFIGURED machine={} autologon={}", machine, user));
                 self.emit("WTL LAB_REBOOT | after configure");
@@ -1394,21 +1395,33 @@ fn driver(args: &[String]) -> i32 {
         // setting both role and roles is an error
         let both = cx.tmp.join("proj/both.json");
         std::fs::write(&both, r#"{ "domain": "d.test", "netbios": "D", "network": {"subnet":"10.1.1","lan_port":41111}, "machines": { "DC": { "os": "2019", "role": "dc", "roles": ["ad-ds"] } } }"#).unwrap();
-        let conf = cx.cfg("both-run.json", &format!("{{ \"lab\": \"{}\", \"steps\": [ {{ \"on\": \"DC\", \"as\": \"system\", \"run\": \"C:/x.bat\" }} ] }}", both.display()));
+        let conf = cx.cfg(
+            "both-run.json",
+            &format!(
+                "{{ \"lab\": \"{}\", \"steps\": [ {{ \"on\": \"DC\", \"as\": \"system\", \"run\": \"C:/x.bat\" }} ] }}",
+                both.display()
+            ),
+        );
         let i = run(cx, outs, &["run", &conf], &[]);
         c.code(&outs[i].1, 2);
         c.has(&outs[i].1, "set either \"role\" or \"roles\"");
         // ad-cs needs an AD lab (a standalone CA is not supported yet)
         let wg = cx.tmp.join("proj/wgca.json");
         std::fs::write(&wg, r#"{ "machines": { "S": { "os": "2019", "roles": ["ad-cs"] } } }"#).unwrap();
-        let conf = cx.cfg("wgca-run.json", &format!("{{ \"lab\": \"{}\", \"steps\": [ {{ \"as\": \"system\", \"run\": \"C:/x.bat\" }} ] }}", wg.display()));
+        let conf = cx.cfg(
+            "wgca-run.json",
+            &format!("{{ \"lab\": \"{}\", \"steps\": [ {{ \"as\": \"system\", \"run\": \"C:/x.bat\" }} ] }}", wg.display()),
+        );
         let i = run(cx, outs, &["run", &conf], &[]);
         c.code(&outs[i].1, 2);
         c.has(&outs[i].1, "the \"ad-cs\" role needs an AD lab");
         // a client OS cannot carry a server role or a feature
         let cl = cx.tmp.join("proj/clientrole.json");
         std::fs::write(&cl, r#"{ "domain": "d.test", "netbios": "D", "network": {"subnet":"10.1.2","lan_port":41112}, "machines": { "DC": { "os": "2019", "role": "dc" }, "W": { "os": "win11", "roles": ["iis"] } } }"#).unwrap();
-        let conf = cx.cfg("clientrole-run.json", &format!("{{ \"lab\": \"{}\", \"steps\": [ {{ \"on\": \"W\", \"as\": \"system\", \"run\": \"C:/x.bat\" }} ] }}", cl.display()));
+        let conf = cx.cfg(
+            "clientrole-run.json",
+            &format!("{{ \"lab\": \"{}\", \"steps\": [ {{ \"on\": \"W\", \"as\": \"system\", \"run\": \"C:/x.bat\" }} ] }}", cl.display()),
+        );
         let i = run(cx, outs, &["run", &conf], &[]);
         c.code(&outs[i].1, 2);
         c.has(&outs[i].1, "role needs a server OS");

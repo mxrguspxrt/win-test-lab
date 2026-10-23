@@ -356,7 +356,13 @@ impl MultiLab {
             // on a client)
             if os.kind != "server" {
                 if let Some(r) = m.roles.first() {
-                    bail!("{}: machine {}: the {:?} role needs a server OS, but {} is a client OS", lab_file.display(), m.name, r.as_str(), m.os);
+                    bail!(
+                        "{}: machine {}: the {:?} role needs a server OS, but {} is a client OS",
+                        lab_file.display(),
+                        m.name,
+                        r.as_str(),
+                        m.os
+                    );
                 }
                 if let Some(f) = m.features.first() {
                     bail!(
