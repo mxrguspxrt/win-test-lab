@@ -70,9 +70,8 @@ pub fn parse_event(line: &str) -> Option<Event> {
     let name = s[4..j].to_string();
     let mut kv = Vec::new();
     let mut rest = &s[j..];
-    loop {
-        // " key=\S*"
-        let Some(r) = rest.strip_prefix(' ') else { break };
+    // " key=\S*"
+    while let Some(r) = rest.strip_prefix(' ') {
         let klen = r.bytes().take_while(|c| c.is_ascii_alphabetic() || *c == b'_').count();
         if klen == 0 || r.as_bytes().get(klen) != Some(&b'=') {
             break;
@@ -82,13 +81,7 @@ pub fn parse_event(line: &str) -> Option<Event> {
         kv.push((r[..klen].to_string(), url_unquote(&v[..vlen])));
         rest = &v[vlen..];
     }
-    let text = if rest.is_empty() {
-        String::new()
-    } else if let Some(t) = rest.strip_prefix(" | ") {
-        t.to_string()
-    } else {
-        return None;
-    };
+    let text = if rest.is_empty() { String::new() } else { rest.strip_prefix(" | ")?.to_string() };
     Some(Event { name, kv, text })
 }
 

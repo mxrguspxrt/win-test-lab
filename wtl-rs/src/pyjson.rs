@@ -91,14 +91,14 @@ impl Formatter for PyFormatter {
             if (' '..='~').contains(&c) {
                 continue;
             }
-            w.write_all(fragment[start..i].as_bytes())?;
+            w.write_all(&fragment.as_bytes()[start..i])?;
             let mut buf = [0u16; 2];
             for u in c.encode_utf16(&mut buf) {
                 write!(w, "\\u{:04x}", u)?;
             }
             start = i + c.len_utf8();
         }
-        w.write_all(fragment[start..].as_bytes())
+        w.write_all(&fragment.as_bytes()[start..])
     }
 }
 

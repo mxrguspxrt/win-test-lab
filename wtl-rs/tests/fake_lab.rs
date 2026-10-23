@@ -850,6 +850,9 @@ fn driver(args: &[String]) -> i32 {
     let mut cx = Ctx::new(filter);
     let mut out_of: Vec<(String, Out)> = Vec::new();
     let mut ran = 0;
+    // a scenario gets the test tree, a checker, and the outputs of the `lab` runs it makes
+    // (printed when it fails)
+    #[allow(clippy::type_complexity)]
     let mut scenario = |cx: &mut Ctx, name: &str, f: &dyn Fn(&Ctx, &mut Check, &mut Vec<(String, Out)>)| {
         if !cx.want(name) {
             return;
@@ -1012,8 +1015,8 @@ fn driver(args: &[String]) -> i32 {
         // the VMs keep running after a run
         c.ok(cx.live_fakes().len() == 2, format!("running VMs: {:?}", cx.live_fakes()));
         let argv = std::fs::read_to_string(&cx.fake_log).unwrap_or_default();
-        let dc_line = argv.lines().filter(|l| l.contains("lab-t-dc")).last().unwrap_or("").replace('\u{1f}', " ");
-        let cl_line = argv.lines().filter(|l| l.contains("lab-t-client")).last().unwrap_or("").replace('\u{1f}', " ");
+        let dc_line = argv.lines().rfind(|l| l.contains("lab-t-dc")).unwrap_or("").replace('\u{1f}', " ");
+        let cl_line = argv.lines().rfind(|l| l.contains("lab-t-client")).unwrap_or("").replace('\u{1f}', " ");
         c.ok(!dc_line.contains("user,id=net0") && dc_line.contains("server=on"), format!("dc argv: {}", dc_line));
         c.ok(cl_line.contains("user,id=net0") && cl_line.contains("server=off,reconnect-ms=1000"), format!("client argv: {}", cl_line));
         c.ok(cl_line.contains("mount-X.iso,media=cdrom,if=ide,index=1,readonly=on"), "client mount cd");
@@ -1142,8 +1145,8 @@ fn driver(args: &[String]) -> i32 {
         c.content(&st.join("client-OVMF_VARS.fd"), b"vars");
         c.no_file(&st.join("dc-OVMF_VARS.fd"));
         let argv = std::fs::read_to_string(&cx.fake_log).unwrap_or_default();
-        let cl = argv.lines().filter(|l| l.contains("lab-u-client")).last().unwrap_or("").replace('\u{1f}', " ");
-        let dc = argv.lines().filter(|l| l.contains("lab-u-dc")).last().unwrap_or("").replace('\u{1f}', " ");
+        let cl = argv.lines().rfind(|l| l.contains("lab-u-client")).unwrap_or("").replace('\u{1f}', " ");
+        let dc = argv.lines().rfind(|l| l.contains("lab-u-dc")).unwrap_or("").replace('\u{1f}', " ");
         c.ok(cl.contains("-machine q35") && cl.contains("if=pflash,format=raw,readonly=on,file=") && cl.contains("client-OVMF_VARS.fd"), format!("client argv: {}", cl));
         c.ok(dc.contains("-machine pc") && !dc.contains("pflash"), format!("dc argv: {}", dc));
         let i = run(cx, outs, &["restore", "u"], &[]);
@@ -1259,7 +1262,7 @@ fn driver(args: &[String]) -> i32 {
             format!("CL1 step4 (teacher) {}", step(&cj, 4)));
         // multicast LAN argv + per-VM cpus; CL2 is UEFI/q35
         let argv = std::fs::read_to_string(&cx.fake_log).unwrap_or_default();
-        let line = |tag: &str| argv.lines().filter(|l| l.contains(tag)).last().unwrap_or("").replace('\u{1f}', " ");
+        let line = |tag: &str| argv.lines().rfind(|l| l.contains(tag)).unwrap_or("").replace('\u{1f}', " ");
         let dc_line = line("lab-tri-DC");
         c.ok(dc_line.contains("-netdev dgram,id=lan0,remote.type=inet,remote.host=239.") && dc_line.contains("local.port="), format!("dc mcast argv: {}", dc_line));
         c.ok(!dc_line.contains("user,id=net0"), "dc should be isolated (no user NAT)");

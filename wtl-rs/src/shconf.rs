@@ -150,8 +150,7 @@ impl P {
     fn word(&mut self, get: &dyn Fn(&str) -> Option<String>, assignment: bool) -> Result<String, String> {
         let mut out = String::new();
         let start = self.i;
-        loop {
-            let Some(c) = self.peek() else { break };
+        while let Some(c) = self.peek() {
             match c {
                 ' ' | '\t' | '\r' | '\n' | ';' => break,
                 '#' if self.i == start && !assignment => break,
