@@ -593,7 +593,7 @@ impl Ctx {
         std::fs::write(
             root.join("labs/solo.json"),
             r#"{ "machines": { "WS1": { "os": "2019", "logon": "tester" } },
-  "users": { "tester": { "password": "Test!2026" }, "admin2": { "password": "Admin2!2026", "groups": ["Administrators"] } } }
+  "users": { "tester": { "password": "Test!2026" }, "admin2": { "password": "Second!2026", "groups": ["Administrators"] } } }
 "#,
         )
         .unwrap();
@@ -1252,7 +1252,9 @@ fn driver(args: &[String]) -> i32 {
         if let Some(st) = st {
             let dir = cx.root.join("labs/state").join(&st);
             c.file(&dir.join("DC1-0.qcow2"));
-            c.has(o, &format!("lab restore {}", st));
+            // the hints name the lab file (what `lab` takes for a project lab)
+            c.has(o, &format!("lab restore {}", cx.tmp.join("proj/wintest/lab.json").display()));
+            c.has(o, &format!("lab {}: domain corp.test", st));
             // a 2012 DC and a 2019 member: images 2012-dc and 2019-client
             c.content(
                 &dir.join("DC1-0.qcow2"),

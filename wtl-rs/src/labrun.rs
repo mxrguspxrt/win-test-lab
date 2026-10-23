@@ -173,7 +173,11 @@ pub struct MultiLab {
     /// install base images with Windows Update (--updates)
     updates: bool,
     cmd: &'static str,
+    /// the state name (labs/state/<name>/)
     name: String,
+    /// how to name this lab on the `lab` command line in hints: the name for a lab in
+    /// win-test-lab's labs/, the lab file's path for one anywhere else
+    arg: String,
     lab_file: PathBuf,
     lab: Lab,
     /// the run config file (absolute), if any
@@ -333,6 +337,11 @@ impl MultiLab {
             }
         }
 
+        let arg = if util::canon(lab_file).parent() == Some(util::canon(&root.join("labs")).as_path()) {
+            name.clone()
+        } else {
+            util::canon(lab_file).to_string_lossy().into_owned()
+        };
         let now = Instant::now();
         let limit = Duration::from_secs((timeout_min.max(0) as u64).saturating_mul(60));
         Ok(MultiLab {
@@ -342,6 +351,7 @@ impl MultiLab {
             vars,
             updates,
             cmd,
+            arg,
             name,
             lab_file: lab_file.to_path_buf(),
             lab,
@@ -443,7 +453,7 @@ impl MultiLab {
 
     fn interrupted(&self) -> anyhow::Error {
         eprintln!();
-        warn(&format!("interrupted; VMs may still be running (lab status {} / lab restore {})", self.name, self.name));
+        warn(&format!("interrupted; VMs may still be running (lab status {} / lab restore {})", self.arg, self.arg));
         Exit(2).into()
     }
     fn nap(&self, secs: f64) -> Result<()> {
@@ -558,7 +568,7 @@ impl MultiLab {
                 std::fs::read_to_string(&self.zero_done).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
             println!("  0 state: ready ({})", z.built_at);
         } else {
-            println!("  0 state: not built yet (lab prepare {}, or just lab run ...)", self.name);
+            println!("  0 state: not built yet (lab prepare {}, or just lab run ...)", self.arg);
         }
         for v in &self.vms {
             let role = match (v.role, self.lab.is_ad()) {
@@ -927,7 +937,7 @@ impl MultiLab {
         log(&format!(
             "logs: {} (guest: C:\\WTL\\agent.log); the VMs keep running - lab restore {}",
             self.st(&format!("{}.serial.log", vm)).display(),
-            self.name
+            self.arg
         ));
         Exit(if o == Outcome::Timeout { 3 } else { 2 }).into()
     }
@@ -993,7 +1003,7 @@ impl MultiLab {
         for vm in &order {
             log(&format!("shutting {} down cleanly", vm));
             if !self.freeze_off(vm)? {
-                bail!("{} did not power off; 0 state not saved (lab rebuild {}, then retry)", vm, self.name);
+                bail!("{} did not power off; 0 state not saved (lab rebuild {}, then retry)", vm, self.arg);
             }
             let _ = std::fs::remove_file(self.st(&format!("{}.pid", vm)));
             let _ = std::fs::remove_file(self.st(&format!("{}.iso", vm)));
@@ -1035,7 +1045,7 @@ impl MultiLab {
                 who
             );
         }
-        eprintln!("  back to the 0 state: lab restore {}      another run: lab run CONFIG", self.name);
+        eprintln!("  back to the 0 state: lab restore {}      another run: lab run CONFIG", self.arg);
     }
 
     fn run_lab(&mut self) -> Result<i32> {

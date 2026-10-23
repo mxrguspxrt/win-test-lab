@@ -157,8 +157,8 @@ pub struct StepDef {
     /// Default `all`.
     #[serde(default)]
     pub on: OnSpec,
-    /// Who to run as: `system` (full rights) or a user name. Default: that machine's `logon`
-    /// user.
+    /// Who to run as: `system` (full rights) or a user name. Default: the user logged on to
+    /// that machine (its `logon` user, else Administrator). A step on the DC needs an `as`.
     #[serde(default, rename = "as")]
     pub as_: Option<String>,
     /// The program to run: `.exe .bat .cmd .ps1 .msi`, e.g. `X:/setup.bat`.
@@ -421,6 +421,11 @@ impl LabDef {
             if u.password.is_empty() {
                 bail!("{}: user {} has an empty password", path, name);
             }
+            // Windows' complexity rule refuses a password that contains the account name (any
+            // case, for names of 3+ characters); catch it here instead of mid-build
+            if name.len() >= 3 && u.password.to_lowercase().contains(&name.to_lowercase()) {
+                bail!("{}: user {}: the password contains the user name, which Windows rejects", path, name);
+            }
             users.push(User { name: name.clone(), password: u.password.clone(), groups: u.groups.clone() });
         }
         let user_names: Vec<&str> = users.iter().map(|u| u.name.as_str()).collect();
@@ -605,17 +610,13 @@ impl RunDef {
                     StepAs::User(u.to_string())
                 }
             };
-            // if `as` defaults to the logon user, every target machine must have one
+            // `as` defaults to the machine's logged-on user (its logon user, else Administrator);
+            // the DC has no desktop session of its own to run in
             if as_ == StepAs::Logon {
                 for mname in &on {
                     let m = lab.machine(mname).expect("checked above");
-                    if m.logon.is_none() {
-                        bail!(
-                            "{}: step {}: runs on {} which has no logon user, so it needs an explicit \"as\" (a user or \"system\")",
-                            path,
-                            n,
-                            mname
-                        );
+                    if m.role == Role::Dc {
+                        bail!("{}: step {}: runs on the DC {}, so it needs an explicit \"as\" (a user or \"system\")", path, n, mname);
                     }
                 }
             }
@@ -771,6 +772,9 @@ mod tests {
         // an ip without a network makes no sense
         let ip = lab(r#"{"machines":{"A":{"os":"2019","ip":"5"}}}"#).unwrap_err();
         assert!(format!("{}", ip).contains("ip needs a \"network\""), "{}", ip);
+        // Windows rejects a password containing the user name: caught before boot
+        let pw = lab(r#"{"machines":{"A":{"os":"2019"}},"users":{"appuser":{"password":"AppUser!2026"}}}"#).unwrap_err();
+        assert!(format!("{}", pw).contains("the password contains the user name"), "{}", pw);
     }
 
     #[test]

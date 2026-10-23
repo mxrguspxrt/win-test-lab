@@ -9,6 +9,6 @@
   },
   "users": {
     "operator": { "password": "Oper!2026", "groups": ["Domain Admins"] },
-    "appuser":  { "password": "AppUser!2026" }
+    "appuser":  { "password": "Runs!2026app" }
   }
 }
