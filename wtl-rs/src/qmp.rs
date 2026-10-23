@@ -360,7 +360,11 @@ pub fn cli(a: &Cli) -> i32 {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("qmp: {:#}", e);
-            if is_reply_error(&e) { 1 } else { 2 }
+            if is_reply_error(&e) {
+                1
+            } else {
+                2
+            }
         }
     }
 }

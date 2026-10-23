@@ -11,6 +11,13 @@
     "network"
   ],
   "properties": {
+    "$schema": {
+      "description": "Optional path or URL of the JSON Schema, for editors (ignored by `lab`).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "domain": {
       "description": "AD forest DNS name, e.g. `lab.local`.",
       "type": "string"

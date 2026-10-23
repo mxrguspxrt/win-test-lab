@@ -3,8 +3,7 @@
 # launch-test.sh still use, so both sides write the same discs and read the same output.
 #   wtl-rs/tests/parity.sh            (needs python3; builds wtl-rs first)
 # Checks: mkiso images byte for byte (only the volume-descriptor timestamps may differ) and
-# outputs.py decoding of real serial logs. (The run-config parser used to be compared with
-# lib/labconf.py; that file is gone and tests/labconf.rs is now the spec.)
+# outputs.py decoding of real serial logs.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"

@@ -25,6 +25,9 @@ use std::path::Path;
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LabDef {
+    /// Optional path or URL of the JSON Schema, for editors (ignored by `lab`).
+    #[serde(default, rename = "$schema", skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
     /// AD forest DNS name, e.g. `lab.local`.
     pub domain: String,
     /// NetBIOS domain name, e.g. `LAB` (users log on as `LAB\student`).
@@ -101,6 +104,9 @@ pub struct UserDef {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RunDef {
+    /// Optional path or URL of the JSON Schema, for editors (ignored by `lab`).
+    #[serde(default, rename = "$schema", skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
     /// The lab to boot: `labs/<lab>.json`.
     pub lab: String,
     /// Label for the results folder (default: the run file's stem).
@@ -198,10 +204,7 @@ impl JsonSchema for OnSpec {
                 description: Some("a machine name, a list of machine names, or \"all\" (every member)".into()),
                 ..Default::default()
             })),
-            subschemas: Some(Box::new(SubschemaValidation {
-                any_of: Some(vec![string.into(), list.into()]),
-                ..Default::default()
-            })),
+            subschemas: Some(Box::new(SubschemaValidation { any_of: Some(vec![string.into(), list.into()]), ..Default::default() })),
             ..Default::default()
         }
         .into()
@@ -511,7 +514,9 @@ impl RunDef {
                     if m.logon.is_none() {
                         bail!(
                             "{}: step {}: runs on {} which has no logon user, so it needs an explicit \"as\" (a user or \"system\")",
-                            path, n, mname
+                            path,
+                            n,
+                            mname
                         );
                     }
                 }
@@ -550,99 +555,6 @@ impl RunDef {
         }
 
         Ok(Run { lab: self.lab.clone(), name, wait, timeout_min, mounts, steps })
-    }
-}
-
-// ===================================================================== legacy .conf import
-//
-// The old 2-machine formats read into the same types. A `labs/*.conf` lab (a bash KEY=value
-// file) becomes one DC + one member logged on as its LAB_USER; an old `.conf` run config
-// becomes a run whose `run_as_admin` steps are `as system` and `run_as_student` steps run as
-// the member's logon user (the default). The live `.conf` path still uses labconf + lab.rs
-// unchanged; these converters prove the "same structs" mapping and give a migration path
-// (`wtl-rs labconf` could emit JSON from them).
-
-/// Build a [`LabDef`] from a lab definition's resolved variables (what `shconf::parse` fills:
-/// LAB_OS, LAB_CLIENT_OS, LAB_DOMAIN, LAB_NETBIOS, LAB_DC_NAME, LAB_CLIENT_NAME, LAB_NET,
-/// LAB_PREFIX, LAB_LAN_PORT, LAB_USER(+PASSWORD), optional LAB_ADMIN_USER(+PASSWORD),
-/// LAB_DC_MEM, LAB_CLIENT_MEM). `admin_password` is the domain Administrator password
-/// (WTL_PASSWORD). The old format is /24 only.
-pub fn lab_from_conf(vars: &std::collections::HashMap<String, String>, admin_password: &str) -> Result<LabDef> {
-    let g = |k: &str| vars.get(k).map(String::as_str).unwrap_or("");
-    let prefix = g("LAB_PREFIX");
-    if !prefix.is_empty() && prefix != "24" {
-        bail!("cannot import a .conf lab with LAB_PREFIX={} (the JSON format is /24 only)", prefix);
-    }
-    let lan_port: u16 = g("LAB_LAN_PORT").parse().map_err(|_| anyhow::anyhow!("LAB_LAN_PORT {:?} is not a port", g("LAB_LAN_PORT")))?;
-    let dc_os = g("LAB_OS");
-    let cl_os = if g("LAB_CLIENT_OS").is_empty() { dc_os } else { g("LAB_CLIENT_OS") };
-    let mem = |k: &str| vars.get(k).and_then(|v| v.parse::<u32>().ok());
-
-    let mut machines = IndexMap::new();
-    machines.insert(
-        g("LAB_DC_NAME").to_string(),
-        MachineDef { os: dc_os.to_string(), role: Role::Dc, logon: None, mem: mem("LAB_DC_MEM"), cpus: None, ip: None },
-    );
-    machines.insert(
-        g("LAB_CLIENT_NAME").to_string(),
-        MachineDef {
-            os: cl_os.to_string(),
-            role: Role::Member,
-            logon: Some(g("LAB_USER").to_string()),
-            mem: mem("LAB_CLIENT_MEM"),
-            cpus: None,
-            ip: None,
-        },
-    );
-
-    let mut users = IndexMap::new();
-    users.insert(g("LAB_USER").to_string(), UserDef { password: g("LAB_USER_PASSWORD").to_string(), groups: vec![] });
-    if !g("LAB_ADMIN_USER").is_empty() {
-        users.insert(
-            g("LAB_ADMIN_USER").to_string(),
-            UserDef { password: g("LAB_ADMIN_USER_PASSWORD").to_string(), groups: vec!["Domain Admins".to_string()] },
-        );
-    }
-
-    Ok(LabDef {
-        domain: g("LAB_DOMAIN").to_string(),
-        netbios: g("LAB_NETBIOS").to_string(),
-        admin_password: admin_password.to_string(),
-        network: NetworkDef { subnet: g("LAB_NET").to_string(), lan_port },
-        machines,
-        users,
-    })
-}
-
-/// Build a [`RunDef`] from an old labconf [`crate::labconf::RunConfig`]: `run_as_admin` ->
-/// `as system`, `run_as_student` -> the member's logon user (default `as`); every step runs
-/// on `all` (the single member). Host paths are kept as labconf already resolved them.
-pub fn run_from_conf(rc: &crate::labconf::RunConfig) -> RunDef {
-    use crate::labconf::Who;
-    let mount: IndexMap<String, String> = rc.mounts.iter().map(|m| (m.letter.clone(), m.host.clone())).collect();
-    let steps = rc
-        .steps
-        .iter()
-        .map(|s| StepDef {
-            on: OnSpec::All,
-            as_: match s.who {
-                Who::Admin => Some("system".to_string()),
-                Who::Student => None, // default = the machine's logon user
-            },
-            run: s.path.clone(),
-            args: None,
-            expect_exit: None,
-            wait: None,
-            keep_running: false,
-        })
-        .collect();
-    RunDef {
-        lab: rc.version.clone(),
-        name: Some(rc.name.clone()),
-        wait: Some(rc.wait),
-        timeout_min: Some(rc.timeout_min),
-        mount,
-        steps,
     }
 }
 
@@ -704,11 +616,14 @@ mod tests {
         assert_eq!(l.machine("CL1").unwrap().logon.as_deref(), Some("student1"));
         // users in declaration order, with groups
         let us: Vec<_> = l.users.iter().map(|u| (u.name.as_str(), u.groups.clone())).collect();
-        assert_eq!(us, vec![
-            ("student1", vec!["Students".to_string()]),
-            ("student2", vec!["Students".to_string()]),
-            ("teacher", vec!["Teachers".to_string()]),
-        ]);
+        assert_eq!(
+            us,
+            vec![
+                ("student1", vec!["Students".to_string()]),
+                ("student2", vec!["Students".to_string()]),
+                ("teacher", vec!["Teachers".to_string()]),
+            ]
+        );
     }
 
     #[test]
@@ -780,7 +695,8 @@ mod tests {
     fn run_rejects_bad_targets() {
         let bad_on = run_against(SCHOOL, r#"{"lab":"school","mount":{"X":"./a"},"steps":[{"on":"NOPE","run":"X:/a.bat"}]}"#).unwrap_err();
         assert!(format!("{}", bad_on).contains("is not a machine"), "{}", bad_on);
-        let bad_as = run_against(SCHOOL, r#"{"lab":"school","mount":{"X":"./a"},"steps":[{"on":"CL1","as":"ghost","run":"X:/a.bat"}]}"#).unwrap_err();
+        let bad_as = run_against(SCHOOL, r#"{"lab":"school","mount":{"X":"./a"},"steps":[{"on":"CL1","as":"ghost","run":"X:/a.bat"}]}"#)
+            .unwrap_err();
         assert!(format!("{}", bad_as).contains("is not a user"), "{}", bad_as);
         // default `as` on the DC (no logon) must be explicit
         let dc_logon = run_against(SCHOOL, r#"{"lab":"school","mount":{"X":"./a"},"steps":[{"on":"DC1","run":"X:/a.bat"}]}"#).unwrap_err();
@@ -789,78 +705,44 @@ mod tests {
 
     #[test]
     fn run_rejects_bad_mounts_and_scripts() {
-        let dup = run_against(SCHOOL, r#"{"lab":"school","mount":{"C":"./a"},"steps":[{"on":"CL1","as":"system","run":"C:/a.bat"}]}"#).unwrap_err();
+        let dup = run_against(SCHOOL, r#"{"lab":"school","mount":{"C":"./a"},"steps":[{"on":"CL1","as":"system","run":"C:/a.bat"}]}"#)
+            .unwrap_err();
         assert!(format!("{}", dup).contains("reserved"), "{}", dup);
-        let ext = run_against(SCHOOL, r#"{"lab":"school","mount":{"X":"./a"},"steps":[{"on":"CL1","as":"system","run":"X:/a.zip"}]}"#).unwrap_err();
+        let ext = run_against(SCHOOL, r#"{"lab":"school","mount":{"X":"./a"},"steps":[{"on":"CL1","as":"system","run":"X:/a.zip"}]}"#)
+            .unwrap_err();
         assert!(format!("{}", ext).contains("must end in"), "{}", ext);
-        let unm = run_against(SCHOOL, r#"{"lab":"school","mount":{"X":"./a"},"steps":[{"on":"CL1","as":"system","run":"Y:/a.bat"}]}"#).unwrap_err();
+        let unm = run_against(SCHOOL, r#"{"lab":"school","mount":{"X":"./a"},"steps":[{"on":"CL1","as":"system","run":"Y:/a.bat"}]}"#)
+            .unwrap_err();
         assert!(format!("{}", unm).contains("not mounted"), "{}", unm);
-        let msi = run_against(SCHOOL, r#"{"lab":"school","mount":{"X":"./a"},"steps":[{"on":"CL1","as":"system","run":"X:/a.msi"}]}"#).unwrap();
+        let msi =
+            run_against(SCHOOL, r#"{"lab":"school","mount":{"X":"./a"},"steps":[{"on":"CL1","as":"system","run":"X:/a.msi"}]}"#).unwrap();
         assert_eq!(msi.steps[0].run, "X:\\a.msi");
     }
 
+    /// Every lab in labs/ and every example run in examples/configs/ loads and resolves.
     #[test]
-    fn imports_a_conf_lab() {
-        use std::collections::HashMap;
-        let mut v: HashMap<String, String> = HashMap::new();
-        for (k, val) in [
-            ("LAB_OS", "2019"),
-            ("LAB_CLIENT_OS", "2012"),
-            ("LAB_DOMAIN", "lab.local"),
-            ("LAB_NETBIOS", "LAB"),
-            ("LAB_DC_NAME", "DC2019"),
-            ("LAB_CLIENT_NAME", "CL2019"),
-            ("LAB_NET", "10.77.19"),
-            ("LAB_PREFIX", "24"),
-            ("LAB_LAN_PORT", "47019"),
-            ("LAB_USER", "student"),
-            ("LAB_USER_PASSWORD", "Pupil!2026"),
-            ("LAB_ADMIN_USER", "labadmin"),
-            ("LAB_ADMIN_USER_PASSWORD", "DomAdm!2026"),
-            ("LAB_DC_MEM", "3072"),
-            ("LAB_CLIENT_MEM", "4096"),
-        ] {
-            v.insert(k.into(), val.into());
+    fn repo_labs_and_runs_resolve() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut labs = std::collections::HashMap::new();
+        for e in std::fs::read_dir(root.join("labs")).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "json") {
+                let l = LabDef::load(&p).unwrap_or_else(|e| panic!("{}: {:#}", p.display(), e));
+                labs.insert(p.file_stem().unwrap().to_string_lossy().into_owned(), l);
+            }
         }
-        let l = lab_from_conf(&v, "WinTest!2026").unwrap().resolve("2019.conf").unwrap();
-        assert_eq!(l.dc().name, "DC2019");
-        assert_eq!(l.dc().os, "2019");
-        assert_eq!(l.dc().ip, "10.77.19.10");
-        let m: Vec<_> = l.members().map(|m| (m.name.as_str(), m.os.as_str(), m.ip.as_str(), m.logon.as_deref())).collect();
-        assert_eq!(m, vec![("CL2019", "2012", "10.77.19.20", Some("student"))]);
-        assert_eq!(l.admin_password, "WinTest!2026");
-        // student (Domain Users only) + labadmin (Domain Admins)
-        let us: Vec<_> = l.users.iter().map(|u| (u.name.as_str(), u.groups.clone())).collect();
-        assert_eq!(us, vec![("student", vec![]), ("labadmin", vec!["Domain Admins".to_string()])]);
-    }
-
-    #[test]
-    fn imports_a_conf_run() {
-        use crate::labconf::{Mount, RunConfig, Step, Who};
-        let rc = RunConfig {
-            version: "2019".into(),
-            name: "smoke".into(),
-            mounts: vec![Mount { host: "/host/app".into(), letter: "X".into() }],
-            steps: vec![
-                Step { who: Who::Admin, path: "X:\\setup.bat".into() },
-                Step { who: Who::Student, path: "X:\\smoke.exe".into() },
-            ],
-            wait: 60,
-            timeout_min: 60,
-        };
-        let r = run_from_conf(&rc);
-        // resolve against the imported 2019-style lab
-        let l = lab(SCHOOL).unwrap(); // one member CL1 logon student1; version field is "lab"
-        // use a lab whose single member has a logon user and matching mount letter
-        let two = lab(r#"{"domain":"lab.local","netbios":"LAB","admin_password":"p","network":{"subnet":"10.77.19","lan_port":47019},"machines":{"DC2019":{"os":"2019","role":"dc"},"CL2019":{"os":"2012","logon":"student"}},"users":{"student":{"password":"Pupil!2026"}}}"#).unwrap();
-        let resolved = r.resolve("2019-smoke.conf", "smoke", &two, |h| h.to_string()).unwrap();
-        assert_eq!(resolved.name, "smoke");
-        assert_eq!(resolved.mounts, vec![("X".to_string(), "/host/app".to_string())]);
-        assert_eq!(resolved.steps[0].as_, StepAs::System);
-        assert_eq!(resolved.steps[0].on, vec!["CL2019"]);
-        assert_eq!(resolved.steps[0].run, "X:\\setup.bat");
-        assert_eq!(resolved.steps[1].as_, StepAs::Logon); // run_as_student -> the logon user
-        let _ = l;
+        assert!(labs.contains_key("school") && labs.contains_key("2019"), "{:?}", labs.keys());
+        let mut runs = 0;
+        for e in std::fs::read_dir(root.join("examples/configs")).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "json") {
+                let def = RunDef::parse(&std::fs::read_to_string(&p).unwrap(), &p.display().to_string()).unwrap();
+                let lab = labs.get(&def.lab).unwrap_or_else(|| panic!("{}: no labs/{}.json", p.display(), def.lab));
+                def.resolve(&p.display().to_string(), "x", lab, |h| h.to_string()).unwrap_or_else(|e| panic!("{}: {:#}", p.display(), e));
+                runs += 1;
+            }
+        }
+        assert!(runs >= 4, "{} example runs", runs);
     }
 
     #[test]

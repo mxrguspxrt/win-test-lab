@@ -1,10 +1,14 @@
-//! Decode program output the guest sent over serial (port of lib/outputs.py).
+//! Decode program output the guest sent over serial (same result as lib/outputs.py, which
+//! launch-test.sh still uses).
 //!
+//! ```text
 //! The guest sends   WTL OUTPUT stream=NAME seq=N | <base64>
 //! followed by       WTL OUTPUT_END stream=NAME bytes=TOTAL sent=N truncated=0|1
 //! and (launch-test) WTL PROC_EXIT code=N secs=S   or   WTL PROC_TIMEOUT secs=S
-//! A lab run uses streams stepNout / stepNerr. Each stream is written to
-//! RESULTS_DIR/<stream>.txt (stdout.txt and stderr.txt always), raw bytes.
+//! ```
+//!
+//! A lab run uses streams `stepNout` / `stepNerr`. Each stream is written to
+//! `RESULTS_DIR/<stream>.txt` (stdout.txt and stderr.txt always), raw bytes.
 
 use crate::util::{py_int, url_unquote};
 use anyhow::{Context, Result};

@@ -223,10 +223,8 @@ impl Tree {
                 used_iso.push(cand);
             }
             // ---- Joliet (64 UCS-2 chars; disallowed chars replaced)
-            let jn: String = name
-                .chars()
-                .map(|ch| if (ch as u32) < 32 || "*/:;?\\".contains(ch) || (ch as u32) > 0xFFFF { '_' } else { ch })
-                .collect();
+            let jn: String =
+                name.chars().map(|ch| if (ch as u32) < 32 || "*/:;?\\".contains(ch) || (ch as u32) > 0xFFFF { '_' } else { ch }).collect();
             let base = py_slice_to(&jn, 64);
             let mut cand = base.clone();
             let mut i = 1;
@@ -254,7 +252,11 @@ impl Tree {
     }
 
     fn name(&self, n: usize, tree: usize) -> &[u8] {
-        if tree == ISO { &self.nodes[n].iso_name } else { &self.nodes[n].jol_name }
+        if tree == ISO {
+            &self.nodes[n].iso_name
+        } else {
+            &self.nodes[n].jol_name
+        }
     }
 
     /// ISO9660 9.3: sort by name then extension, padded with spaces (0x20 < any d-char)
@@ -377,16 +379,7 @@ impl Tree {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn volume_descriptor(
-        &self,
-        joliet: bool,
-        volid: &str,
-        vol_sectors: u32,
-        pt_size: u32,
-        l_lba: u32,
-        m_lba: u32,
-        now: i64,
-    ) -> Vec<u8> {
+    fn volume_descriptor(&self, joliet: bool, volid: &str, vol_sectors: u32, pt_size: u32, l_lba: u32, m_lba: u32, now: i64) -> Vec<u8> {
         let tree = if joliet { JOL } else { ISO };
         let pad: &dyn Fn(&str, usize) -> Vec<u8> = if joliet { &pad_j } else { &pad_a };
         let mut b = vec![0u8; SECTOR as usize];

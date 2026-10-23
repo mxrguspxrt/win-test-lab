@@ -1,4 +1,5 @@
 {
+  "$schema": "../../wtl-rs/schema/run.schema.json",
   "lab": "school",
   "name": "school-smoke",
   "wait": 120,

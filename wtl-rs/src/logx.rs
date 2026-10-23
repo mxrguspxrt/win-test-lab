@@ -9,7 +9,11 @@ fn color() -> bool {
 }
 
 fn paint(code: &str) -> &str {
-    if color() { code } else { "" }
+    if color() {
+        code
+    } else {
+        ""
+    }
 }
 
 fn stamp() -> String {

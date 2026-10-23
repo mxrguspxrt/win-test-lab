@@ -85,7 +85,9 @@ mod imp {
     }
 
     pub fn alive(pid: u32) -> bool {
-        let Ok(p) = libc::pid_t::try_from(pid) else { return false };
+        let Ok(p) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
         if unsafe { libc::kill(p, 0) } != 0 {
             // EPERM: it exists, it is just not ours
             return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
@@ -102,7 +104,9 @@ mod imp {
     }
 
     pub fn kill(pid: u32, hard: bool) -> bool {
-        let Ok(p) = libc::pid_t::try_from(pid) else { return false };
+        let Ok(p) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
         unsafe { libc::kill(p, if hard { libc::SIGKILL } else { libc::SIGTERM }) == 0 }
     }
 }
@@ -113,8 +117,8 @@ mod imp {
     use std::process::Command;
     use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, TerminateProcess, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
-        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        GetExitCodeProcess, OpenProcess, TerminateProcess, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_TERMINATE,
     };
 
     pub fn detach(cmd: &mut Command) {

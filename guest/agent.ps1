@@ -105,7 +105,7 @@ function Find-JobDrive([int]$WaitSecs = $JobPollSecs) {
     }
 }
 
-# AD lab mode: a CD (lab.iso from lab.sh) with \LAB\lab.ps1 + \LAB\lab.json
+# AD lab mode: a CD (the control disc the host's `lab` writes) with \LAB\lab.ps1 + \LAB\lab.json
 function Find-LabDir {
     for ($i = 0; $i -lt 3; $i++) {
         foreach ($root in (Get-CdDrives)) {
@@ -292,7 +292,7 @@ function Invoke-Agent {
         . (Join-Path $labDir 'lab.ps1')
         $labResult = Invoke-Lab $labDir
         if ($labResult -ne 'ready') { Wait-Forever }   # rebooting, or LAB_FAIL already reported
-        $jobWait = 0   # lab.sh puts the job (if any) on the same CD
+        $jobWait = 0   # a lab machine has no job disc: don't wait for one
     }
 
     Send-WtlEvent 'JOB_WAIT'

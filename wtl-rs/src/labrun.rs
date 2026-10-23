@@ -1,8 +1,5 @@
-//! The N-machine lab runner (the JSON format: `labs/<name>.json` + a run `<app>.json`).
-//!
-//! It sits beside the two-machine [`crate::lab`] runner and shares all the plumbing
-//! (`qemu`, `qmp`, `serialwait`, `outputs`, `mkiso`, `sys`); the `.conf` path in `lab.rs` is
-//! untouched. `lab run FOO.json` and `lab <cmd> LAB.json` route here by file extension.
+//! The lab runner: a lab (`labs/<name>.json`) and a run config (`<app>.json`), see
+//! [`crate::labdef`]. [`crate::lab`] is its command line.
 //!
 //! A lab is one DC plus one or more domain-joined members, all on one private multicast LAN
 //! (`-netdev dgram`, which joins N VMs with no root). It is built once into a frozen 0 state
@@ -14,8 +11,8 @@
 //! channel into a booted guest (mounts are read-only ISOs), so there is no host-enforced
 //! barrier *between* different steps across machines — the simple model the user asked for.
 
-use crate::labdef::{self, Lab, Role, Run, RunStep, StepAs};
 use crate::lab::{build_base_images, find_root, indent_file, pick_vnc_display, read_trim, sock_path, write_file, BaseBuild};
+use crate::labdef::{self, Lab, Role, Run, RunStep, StepAs};
 use crate::logx::{err, log, ok, warn};
 use crate::oslist::{self, OsInfo};
 use crate::qemu::{self, Env, Lan, Opts};
@@ -32,8 +29,7 @@ use std::time::{Duration, Instant};
 /// and never routed off the host). Labs are isolated by their unique `lan_port`, not the group.
 const LAN_GROUP: &str = "239.77.30.1";
 
-/// Ends `lab` with this exit code; the reason has already been printed. (Same contract as
-/// lab.rs's private Exit, duplicated so the two runners stay independent.)
+/// Ends `lab` with this exit code; the reason has already been printed.
 #[derive(Debug)]
 struct Exit(i32);
 impl std::fmt::Display for Exit {
@@ -45,8 +41,8 @@ impl std::error::Error for Exit {}
 
 // --------------------------------------------------------------- the control-disc lab.json
 
-/// `LAB\lab.json` on a machine's control disc, read by guest/lab.ps1. `fmt: "multi"` tells
-/// the guest this is a multi-machine lab (the two-machine format has no `fmt`).
+/// `LAB\lab.json` on a machine's control disc, read by guest/lab.ps1. `fmt: "multi"` names
+/// this format; guest/lab.ps1 refuses anything else (e.g. a disc from an older `lab`).
 #[derive(Serialize)]
 struct LabJson<'a> {
     fmt: &'a str,
@@ -200,14 +196,7 @@ fn base_name(vm: &Vm) -> String {
 
 /// Build a [`MultiLab`] and dispatch CMD; returns the exit code. `lab_file` is the lab JSON;
 /// `config`/`run` are set for `run`.
-pub fn run(
-    cmd: &'static str,
-    lab_file: &Path,
-    config: Option<PathBuf>,
-    run: Option<Run>,
-    lab: Lab,
-    opts: &RunOpts,
-) -> i32 {
+pub fn run(cmd: &'static str, lab_file: &Path, config: Option<PathBuf>, run: Option<Run>, lab: Lab, opts: &RunOpts) -> i32 {
     match MultiLab::new(cmd, lab_file, config, run, lab, opts).and_then(|mut l| l.dispatch()) {
         Ok(code) => code,
         Err(e) => match e.downcast_ref::<Exit>() {
@@ -485,7 +474,9 @@ impl MultiLab {
     }
 
     fn freeze_off(&self, vm: &str) -> Result<bool> {
-        let Some(pid) = self.read_pid(vm) else { return Ok(true) };
+        let Some(pid) = self.read_pid(vm) else {
+            return Ok(true);
+        };
         self.qmp_cmd(vm, "system_powerdown");
         let mut i = 0;
         while sys::pid_alive(pid) && i < 1800 {
@@ -518,7 +509,8 @@ impl MultiLab {
     fn status(&self) {
         println!("lab {} ({}): domain {}, {} machines", self.name, self.lab_file.display(), self.lab.domain, self.vms.len());
         if self.zero_done.is_file() {
-            let z: ZeroState = std::fs::read_to_string(&self.zero_done).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+            let z: ZeroState =
+                std::fs::read_to_string(&self.zero_done).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
             println!("  0 state: ready ({})", z.built_at);
         } else {
             println!("  0 state: not built yet (lab prepare {}, or just lab run ...)", self.name);
@@ -762,7 +754,7 @@ impl MultiLab {
             cpus: Some(vm.cpus.clone()),
             disk,
             cds,
-            lan: Some(Lan::Mcast { group: LAN_GROUP.into(), port: self.lab.lan_port }),
+            lan: Some(Lan { group: LAN_GROUP.into(), port: self.lab.lan_port }),
             lan_mac: Some(vm.mac.clone()),
             // the DC is isolated (no internet); members keep user-mode NAT
             no_usernet: vm.role == Role::Dc,
@@ -780,7 +772,8 @@ impl MultiLab {
             o.vnc = Some(pick_vnc_display().context("no free VNC display (ports 5900-5999 all in use)")?);
         }
         let argv = qemu::command(&self.env, &o)?;
-        let pid = qemu::start(&argv, &self.st(&format!("{}.qemu.log", vm.name))).with_context(|| format!("qemu ({}) failed to start", vm.name))?;
+        let pid = qemu::start(&argv, &self.st(&format!("{}.qemu.log", vm.name)))
+            .with_context(|| format!("qemu ({}) failed to start", vm.name))?;
         write_file(&self.st(&format!("{}.pid", vm.name)), format!("{}\n", pid))?;
         let vnc = match o.vnc {
             Some(n) => format!("VNC 127.0.0.1:{}", 5900 + n),
@@ -877,7 +870,11 @@ impl MultiLab {
                 log(&format!("screenshot: {}", png.display()));
             }
         }
-        log(&format!("logs: {} (guest: C:\\WTL\\agent.log); the VMs keep running - lab restore {}", self.st(&format!("{}.serial.log", vm)).display(), self.name));
+        log(&format!(
+            "logs: {} (guest: C:\\WTL\\agent.log); the VMs keep running - lab restore {}",
+            self.st(&format!("{}.serial.log", vm)).display(),
+            self.name
+        ));
         Exit(if o == Outcome::Timeout { 3 } else { 2 }).into()
     }
 
@@ -932,7 +929,7 @@ impl MultiLab {
             self.wait_ev(m, "LAB_IDLE", "LAB_FAIL,ERROR", m)?;
         }
         self.settle(20.0)?; // let first logons finish (profile, group policy) before the freeze
-        // power off: members first, DC last
+                            // power off: members first, DC last
         let mut order = self.vm_names();
         order.sort_by_key(|n| if self.vm(n).role == Role::Dc { 1 } else { 0 });
         for vm in &order {
@@ -964,7 +961,14 @@ impl MultiLab {
                 None => format!("{}\\Administrator", self.lab.netbios),
             };
             let role = if v.role == Role::Dc { "DC    " } else { "member" };
-            eprintln!("    {} {:<15} {}  {}  {}", role, v.name, v.ip, read_trim(&self.st(&format!("{}.vnc", v.name))).unwrap_or_default(), who);
+            eprintln!(
+                "    {} {:<15} {}  {}  {}",
+                role,
+                v.name,
+                v.ip,
+                read_trim(&self.st(&format!("{}.vnc", v.name))).unwrap_or_default(),
+                who
+            );
         }
         eprintln!("  back to the 0 state: lab restore {}      another run: lab run CONFIG", self.name);
     }
@@ -1094,10 +1098,8 @@ impl MultiLab {
         let g = |k: &str| ev.as_ref().and_then(|e| e.get(k)).unwrap_or("").to_string();
         let (n, script, exit) = (g("n"), g("script"), g("exit"));
         // which host-side step is this (per-machine 1-based index) -> its expect_exit
-        let expect = util::py_int(&n)
-            .and_then(|idx| self.vm(vm).steps.iter().find(|(i, _)| *i == idx))
-            .map(|(_, s)| s.expect_exit)
-            .unwrap_or(0);
+        let expect =
+            util::py_int(&n).and_then(|idx| self.vm(vm).steps.iter().find(|(i, _)| *i == idx)).map(|(_, s)| s.expect_exit).unwrap_or(0);
         let who = g("as");
         let ok_exit = util::py_int(&exit) == Some(expect) || (exit == "running" && self.step_keeps_running(vm, &n));
         if ok_exit {
@@ -1119,10 +1121,7 @@ impl MultiLab {
     }
 
     fn step_keeps_running(&self, vm: &str, n: &str) -> bool {
-        util::py_int(n)
-            .and_then(|idx| self.vm(vm).steps.iter().find(|(i, _)| *i == idx))
-            .map(|(_, s)| s.keep_running)
-            .unwrap_or(false)
+        util::py_int(n).and_then(|idx| self.vm(vm).steps.iter().find(|(i, _)| *i == idx)).map(|(_, s)| s.keep_running).unwrap_or(false)
     }
 }
 
@@ -1133,7 +1132,7 @@ pub fn load_lab(path: &Path) -> Result<Lab> {
     labdef::LabDef::load(path)
 }
 
-/// Resolve the run file against its lab (found at labs/<lab>.json under the root). Returns the
+/// Resolve the run file against its lab (found at `labs/<lab>.json` under the root). Returns the
 /// lab file path, the resolved lab, and the resolved run.
 pub fn load_run(config: &Path) -> Result<(PathBuf, Lab, Run)> {
     let root = find_root()?;

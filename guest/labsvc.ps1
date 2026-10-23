@@ -1,13 +1,14 @@
 # labsvc.ps1 - win-test-lab privileged worker (guest side), runs as SYSTEM.
 #
 # PowerShell 4.0 compatible (Server 2012 R2 baseline). No PS5+ features.
-# Baked into the 0 state: copied to C:\WTL by build-image, started by the scheduled task
-# "WTL-Svc" (created as admin during the client join phase) at every boot, running as SYSTEM.
+# Baked into the 0 state: copied from the control disc to C:\WTL during the 0-state build and
+# started at every boot by the scheduled task "WTL-Svc" (registered while still Administrator),
+# running as SYSTEM.
 #
-# It does the things a limited LAB\student cannot: assign fixed drive letters to the mounted
-# discs, and run "run_as_admin" steps with full privilege (SYSTEM = the lab's "root"). It talks
-# only to the filesystem, never the serial port (the student agent owns COM1 and does the
-# reporting), via a simple request/response queue under C:\WTL\svc:
+# It does the things the logged-on domain user cannot: assign fixed drive letters to the mounted
+# discs, run "system" steps with full privilege, and run steps as another lab user (with that
+# user's password). It talks only to the filesystem, never the serial port (the logged-on
+# user's agent owns COM1 and does the reporting), via a request/response queue under C:\WTL\svc:
 #
 #   request  C:\WTL\svc\<id>.req.json   {"action":"mount","letter":"X"}
 #                                       {"action":"run","path":"X:\\a.bat","cwd":"X:\\","timeout":60,"out":"...","err":"..."}

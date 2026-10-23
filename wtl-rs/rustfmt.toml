@@ -1,0 +1,3 @@
+# The code is written with long lines (one log message / match arm per line); keep that.
+max_width = 140
+use_small_heuristics = "Max"

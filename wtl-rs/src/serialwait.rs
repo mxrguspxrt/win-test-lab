@@ -13,7 +13,7 @@ fn is_space(c: char) -> bool {
 }
 
 /// Find the first `WTL <EVENT>` on a line (not glued to a preceding word character).
-/// Returns (event, "WTL EVENT<rest of line>").
+/// Returns `(event, "WTL EVENT<rest of line>")`.
 pub fn find_event(s: &str) -> Option<(&str, String)> {
     let b = s.as_bytes();
     let mut from = 0;
@@ -220,9 +220,8 @@ pub struct Cli {
 }
 
 pub fn cli(a: &Cli) -> i32 {
-    let names = |v: &[String]| -> Vec<String> {
-        v.iter().map(|x| crate::util::py_strip(x).to_string()).filter(|x| !x.is_empty()).collect()
-    };
+    let names =
+        |v: &[String]| -> Vec<String> { v.iter().map(|x| crate::util::py_strip(x).to_string()).filter(|x| !x.is_empty()).collect() };
     let (until, fail) = (names(&a.until), names(&a.fail));
     if until.is_empty() && fail.is_empty() {
         eprintln!("serialwait: need --until and/or --fail");

@@ -103,9 +103,7 @@ pub fn seed_vars(root: &Path) -> HashMap<String, String> {
 impl Env {
     /// Build from a variable map made by [`seed_vars`] (+ whatever a lab file set).
     pub fn from_vars(root: &Path, vars: &HashMap<String, String>) -> Result<Env> {
-        let get = |k: &str| -> String {
-            vars.get(k).cloned().or_else(|| std::env::var(k).ok()).unwrap_or_default()
-        };
+        let get = |k: &str| -> String { vars.get(k).cloned().or_else(|| std::env::var(k).ok()).unwrap_or_default() };
         let nonempty = |k: &str| Some(get(k)).filter(|v| !v.is_empty());
         let accel = match nonempty("WTL_ACCEL") {
             Some(a) => Accel::parse(&a).ok_or_else(|| anyhow!("WTL_ACCEL={} is not one of kvm, whpx, hvf, tcg", a))?,
@@ -143,16 +141,15 @@ impl Env {
     }
 }
 
-/// Where the private VM-to-VM LAN plugs in.
+/// The private VM-to-VM LAN: a UDP multicast group on loopback (`-netdev dgram`). It joins
+/// any number of VMs without root; every machine of a lab uses the same group and port, and
+/// different labs use different ports.
 #[derive(Clone, Debug)]
-pub enum Lan {
-    /// listens on 127.0.0.1:PORT (the two-machine `.conf` lab: `-netdev stream` server)
-    Server(u16),
-    /// connects to 127.0.0.1:PORT (and reconnects)
-    Client(u16),
-    /// a UDP multicast group on loopback (`-netdev dgram`): joins N machines without root, so
-    /// several VMs share one private LAN. Every machine of a lab uses the same group+port.
-    Mcast { group: String, port: u16 },
+pub struct Lan {
+    /// multicast group address, e.g. 239.77.30.1
+    pub group: String,
+    /// UDP port (the lab's `network.lan_port`)
+    pub port: u16,
 }
 
 /// The options lib/common.sh qemu_cmd took.
@@ -221,10 +218,7 @@ pub fn command(env: &Env, o: &Opts) -> Result<Vec<String>> {
     push(&["-rtc", "base=localtime", "-vga", "std", "-usb", "-device", "usb-tablet"]);
     push(&["-device", "ich9-ahci,id=ahci"]);
     let cache = o.cache.as_deref().unwrap_or("writeback");
-    push(&[
-        "-drive",
-        &format!("id=disk0,if=none,format=qcow2,file={},cache={},discard=unmap,detect-zeroes=unmap", qesc(&o.disk), cache),
-    ]);
+    push(&["-drive", &format!("id=disk0,if=none,format=qcow2,file={},cache={},discard=unmap,detect-zeroes=unmap", qesc(&o.disk), cache)]);
     push(&["-device", "ide-hd,drive=disk0,bus=ahci.0"]);
     for (i, c) in o.cds.iter().enumerate() {
         push(&["-drive", &format!("file={},media=cdrom,if=ide,index={},readonly=on", qesc(c), i)]);
@@ -236,17 +230,12 @@ pub fn command(env: &Env, o: &Opts) -> Result<Vec<String>> {
         }
         push(&["-netdev", &net, "-device", &format!("{},netdev=net0", env.nic)]);
     }
-    if let Some(lan) = &o.lan {
-        let addr = |p: u16| format!("addr.type=inet,addr.host=127.0.0.1,addr.port={}", p);
-        let nd = match lan {
-            Lan::Server(p) => format!("stream,id=lan0,server=on,{}", addr(*p)),
-            Lan::Client(p) => format!("stream,id=lan0,server=off,reconnect-ms=1000,{}", addr(*p)),
-            // one multicast group carries the whole lab LAN; each VM both sends to and
-            // receives on 127.0.0.1:PORT of group GROUP (verified to join N VMs with no root)
-            Lan::Mcast { group, port } => format!(
-                "dgram,id=lan0,remote.type=inet,remote.host={group},remote.port={port},local.type=inet,local.host=127.0.0.1,local.port={port}"
-            ),
-        };
+    if let Some(Lan { group, port }) = &o.lan {
+        // one multicast group carries the whole lab LAN; each VM both sends to and receives
+        // on 127.0.0.1:PORT of group GROUP
+        let nd = format!(
+            "dgram,id=lan0,remote.type=inet,remote.host={group},remote.port={port},local.type=inet,local.host=127.0.0.1,local.port={port}"
+        );
         let mac = o.lan_mac.as_ref().map(|m| format!(",mac={}", m)).unwrap_or_default();
         push(&["-netdev", &nd, "-device", &format!("{},netdev=lan0{}", env.nic, mac)]);
     }
@@ -336,25 +325,25 @@ mod tests {
         e
     }
 
-    /// Same argv lab.sh produced for the 2019 client (see labs/state/2019/client.qemu.log.cmdline).
+    /// The whole argv of a member, as a shell line (what <vm>.qemu.log.cmdline holds).
     #[test]
-    fn matches_bash_client_cmdline() {
-        let s = "/home/dte/Documents/ISO images/win-test-lab/labs/state/2019";
+    fn member_cmdline() {
+        let s = "/home/dte/Documents/ISO images/win-test-lab/labs/state/school";
         let o = Opts {
-            name: "lab-2019-client".into(),
+            name: "lab-school-CL1".into(),
             mem: "4096".into(),
-            disk: format!("{}/client.qcow2", s).into(),
-            cds: vec![format!("{}/client.iso", s).into(), format!("{}/mount-X.iso", s).into()],
-            serial: Some(format!("{}/client.serial.log", s).into()),
-            qmp: Some(Addr::Unix(format!("{}/client.qmp", s).into())),
+            disk: format!("{}/CL1.qcow2", s).into(),
+            cds: vec![format!("{}/CL1.iso", s).into(), format!("{}/mount-CL1-X.iso", s).into()],
+            serial: Some(format!("{}/CL1.serial.log", s).into()),
+            qmp: Some(Addr::Unix(format!("{}/CL1.qmp", s).into())),
             vnc: Some(11),
-            lan: Some(Lan::Client(47019)),
-            lan_mac: Some("52:54:00:4c:41:20".into()),
+            lan: Some(Lan { group: "239.77.30.1".into(), port: 47030 }),
+            lan_mac: Some("52:54:00:4c:41:11".into()),
             no_shutdown: true,
             ..Default::default()
         };
         let got: Vec<String> = command(&env(), &o).unwrap().iter().map(|a| shell_quote(a)).collect();
-        let want = r"qemu-system-x86_64 -name lab-2019-client -machine pc -m 4096 -smp 2 -enable-kvm -cpu host\,hv_relaxed\,hv_spinlocks=0x1fff\,hv_vapic\,hv_time -rtc base=localtime -vga std -usb -device usb-tablet -device ich9-ahci\,id=ahci -drive id=disk0\,if=none\,format=qcow2\,file=/home/dte/Documents/ISO\ images/win-test-lab/labs/state/2019/client.qcow2\,cache=writeback\,discard=unmap\,detect-zeroes=unmap -device ide-hd\,drive=disk0\,bus=ahci.0 -drive file=/home/dte/Documents/ISO\ images/win-test-lab/labs/state/2019/client.iso\,media=cdrom\,if=ide\,index=0\,readonly=on -drive file=/home/dte/Documents/ISO\ images/win-test-lab/labs/state/2019/mount-X.iso\,media=cdrom\,if=ide\,index=1\,readonly=on -netdev user\,id=net0 -device e1000\,netdev=net0 -netdev stream\,id=lan0\,server=off\,reconnect-ms=1000\,addr.type=inet\,addr.host=127.0.0.1\,addr.port=47019 -device e1000\,netdev=lan0\,mac=52:54:00:4c:41:20 -serial file:/home/dte/Documents/ISO\ images/win-test-lab/labs/state/2019/client.serial.log -qmp unix:/home/dte/Documents/ISO\ images/win-test-lab/labs/state/2019/client.qmp\,server=on\,wait=off -boot order=c -display none -vnc 127.0.0.1:11 -no-shutdown";
+        let want = r"qemu-system-x86_64 -name lab-school-CL1 -machine pc -m 4096 -smp 2 -enable-kvm -cpu host\,hv_relaxed\,hv_spinlocks=0x1fff\,hv_vapic\,hv_time -rtc base=localtime -vga std -usb -device usb-tablet -device ich9-ahci\,id=ahci -drive id=disk0\,if=none\,format=qcow2\,file=/home/dte/Documents/ISO\ images/win-test-lab/labs/state/school/CL1.qcow2\,cache=writeback\,discard=unmap\,detect-zeroes=unmap -device ide-hd\,drive=disk0\,bus=ahci.0 -drive file=/home/dte/Documents/ISO\ images/win-test-lab/labs/state/school/CL1.iso\,media=cdrom\,if=ide\,index=0\,readonly=on -drive file=/home/dte/Documents/ISO\ images/win-test-lab/labs/state/school/mount-CL1-X.iso\,media=cdrom\,if=ide\,index=1\,readonly=on -netdev user\,id=net0 -device e1000\,netdev=net0 -netdev dgram\,id=lan0\,remote.type=inet\,remote.host=239.77.30.1\,remote.port=47030\,local.type=inet\,local.host=127.0.0.1\,local.port=47030 -device e1000\,netdev=lan0\,mac=52:54:00:4c:41:11 -serial file:/home/dte/Documents/ISO\ images/win-test-lab/labs/state/school/CL1.serial.log -qmp unix:/home/dte/Documents/ISO\ images/win-test-lab/labs/state/school/CL1.qmp\,server=on\,wait=off -boot order=c -display none -vnc 127.0.0.1:11 -no-shutdown";
         assert_eq!(got.join(" "), want);
     }
 
@@ -362,17 +351,18 @@ mod tests {
     fn dc_and_accels() {
         let mut e = env();
         let o = Opts {
-            name: "lab-2019-dc".into(),
+            name: "lab-school-DC1".into(),
             mem: "3072".into(),
-            disk: "/s/dc.qcow2".into(),
-            cds: vec!["/s/dc.iso".into()],
-            lan: Some(Lan::Server(47019)),
+            disk: "/s/DC1.qcow2".into(),
+            cds: vec!["/s/DC1.iso".into()],
+            lan: Some(Lan { group: "239.77.30.1".into(), port: 47030 }),
             lan_mac: Some("52:54:00:4c:41:10".into()),
             no_usernet: true,
             ..Default::default()
         };
         let a = command(&e, &o).unwrap().join(" ");
-        assert!(a.contains("-netdev stream,id=lan0,server=on,addr.type=inet,addr.host=127.0.0.1,addr.port=47019 -device e1000,netdev=lan0,mac=52:54:00:4c:41:10"));
+        assert!(a.contains("-device e1000,netdev=lan0,mac=52:54:00:4c:41:10"), "{}", a);
+        // the DC is isolated: no user-mode NAT
         assert!(!a.contains("net0"));
         e.accel = Accel::Tcg;
         assert!(command(&e, &o).unwrap().join(" ").contains(" -smp 2 -cpu max -rtc"));
@@ -392,7 +382,7 @@ mod tests {
             mem: "4096".into(),
             cpus: Some("4".into()),
             disk: "/s/CL1.qcow2".into(),
-            lan: Some(Lan::Mcast { group: "239.77.30.1".into(), port: 47030 }),
+            lan: Some(Lan { group: "239.77.30.1".into(), port: 47030 }),
             lan_mac: Some("52:54:00:4c:41:11".into()),
             ..Default::default()
         };

@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # tests/all.sh - run every win-test-lab test that needs no VM / no Windows.
 #   tests/all.sh
-# Covers: the Rust `lab` (cargo test: unit tests, the run-config spec, the fake-QEMU lab
-# suite), PowerShell lint, a bash syntax check of the scripts, the example configs and
-# lab definitions, and the fake-qemu suite for build-image.sh / launch-test.sh.
-# Exit 0 = all green.
+# Covers: the Rust `lab` (cargo test: unit tests and the fake-QEMU lab suite), PowerShell
+# lint, a bash syntax check of the scripts, the labs and example run configs, and the
+# fake-qemu suite for build-image.sh / launch-test.sh. Exit 0 = all green.
 set -uo pipefail
 TESTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$TESTS/.." && pwd)"
@@ -29,18 +28,7 @@ done
 step "PowerShell lint (guest/*.ps1)"
 if python3 tests/ps_lint.py guest/*.ps1; then :; else rc=1; fi
 
-step "example configs validate"
-LAB="$ROOT/wtl-rs/target/debug/wtl-rs"
-if [ -x "$LAB" ]; then
-    for c in examples/configs/*.conf; do
-        [ -f "$c" ] || continue
-        if "$LAB" labconf check "$c" >/dev/null; then echo "ok  $c"; else echo "FAIL $c"; rc=1; fi
-    done
-else
-    echo "SKIP $LAB not built"
-fi
-
-step "lab definitions resolve (tests/check-labs.sh)"
+step "labs and example run configs resolve (tests/check-labs.sh)"
 if bash tests/check-labs.sh; then :; else rc=1; fi
 
 step "image catalog (images-list.conf) resolves to present ISOs"

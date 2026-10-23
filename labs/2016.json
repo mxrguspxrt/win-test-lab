@@ -1,0 +1,15 @@
+{
+  "$schema": "../wtl-rs/schema/lab.schema.json",
+  "domain": "lab.local",
+  "netbios": "LAB",
+  "admin_password": "WinTest!2026",
+  "network": { "subnet": "10.77.16", "lan_port": 47016 },
+  "machines": {
+    "DC2016": { "os": "2016", "role": "dc" },
+    "CL2016": { "os": "2016", "logon": "student" }
+  },
+  "users": {
+    "student":  { "password": "Pupil!2026" },
+    "labadmin": { "password": "DomAdm!2026", "groups": ["Domain Admins"] }
+  }
+}

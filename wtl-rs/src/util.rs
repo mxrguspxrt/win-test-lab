@@ -1,5 +1,7 @@
-//! Small helpers that mirror the Python standard-library behaviour the host scripts relied
-//! on (str.strip, repr, int(), os.path.normpath, urllib.parse.unquote), plus `du`/`which`.
+//! Small string and path helpers. Several mirror the Python standard library (str.strip,
+//! int(), os.path.normpath, urllib.parse.unquote), because the serial protocol and the ISO
+//! writer must match the Python tools build-image.sh / launch-test.sh still use; plus
+//! `du`- and `which`-like helpers.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -11,38 +13,6 @@ pub fn py_isspace(c: char) -> bool {
 /// Python's `str.strip()`.
 pub fn py_strip(s: &str) -> &str {
     s.trim_matches(py_isspace)
-}
-
-/// Python's `repr(str)` (close enough for error messages).
-pub fn py_repr(s: &str) -> String {
-    let q = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push(q);
-    for c in s.chars() {
-        let u = c as u32;
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ if c == q => {
-                out.push('\\');
-                out.push(c);
-            }
-            _ if u < 0x20 || (0x7f..0xa1).contains(&u) || u == 0xad => out.push_str(&format!("\\x{:02x}", u)),
-            _ if (c.is_whitespace() && c != ' ')
-                || (0x200b..=0x200f).contains(&u)
-                || (0x2028..=0x202e).contains(&u)
-                || (0x2060..=0x2064).contains(&u)
-                || u == 0xfeff =>
-            {
-                out.push_str(&format!("\\u{:04x}", u))
-            }
-            _ => out.push(c),
-        }
-    }
-    out.push(q);
-    out
 }
 
 /// Python's `int(str)` for base-10 ASCII input (sign, surrounding whitespace, `1_000`).
@@ -155,11 +125,6 @@ pub fn py_slice_to(s: &str, n: isize) -> String {
     s.chars().take(end as usize).collect()
 }
 
-/// Python-style `s.rsplit(sep, 1)` (None if sep is absent).
-pub fn rsplit1(s: &str, sep: char) -> Option<(&str, &str)> {
-    s.rfind(sep).map(|i| (&s[..i], &s[i + sep.len_utf8()..]))
-}
-
 /// `urllib.parse.unquote` (UTF-8, invalid sequences replaced, a stray '%' kept).
 pub fn url_unquote(s: &str) -> String {
     percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned()
@@ -253,15 +218,6 @@ fn is_executable(p: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn repr_like_python() {
-        assert_eq!(py_repr("foo"), "'foo'");
-        assert_eq!(py_repr("it's"), "\"it's\"");
-        assert_eq!(py_repr("a'b\"c"), "'a\\'b\"c'");
-        assert_eq!(py_repr("X:\\a.txt"), "'X:\\\\a.txt'");
-        assert_eq!(py_repr("\u{feff}v\t"), "'\\ufeffv\\t'");
-    }
 
     #[test]
     fn int_like_python() {
