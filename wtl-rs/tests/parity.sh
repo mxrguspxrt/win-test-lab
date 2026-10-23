@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# tests/parity.sh - compare wtl-rs with the Python originals in ../lib on this machine.
+# tests/parity.sh - compare wtl-rs with the Python tools in ../lib that build-image.sh and
+# launch-test.sh still use, so both sides write the same discs and read the same output.
 #   wtl-rs/tests/parity.sh            (needs python3; builds wtl-rs first)
-# Checks: labconf json/check output + exit codes (valid and invalid configs), mkiso images
-# byte for byte (only the volume-descriptor timestamps may differ), outputs.py decoding.
+# Checks: mkiso images byte for byte (only the volume-descriptor timestamps may differ) and
+# outputs.py decoding of real serial logs. (The run-config parser used to be compared with
+# lib/labconf.py; that file is gone and tests/labconf.rs is now the spec.)
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
@@ -13,58 +15,6 @@ trap 'rm -rf "$TMP"' EXIT
 rc=0 n=0
 pass() { n=$((n + 1)); }
 fail() { echo "FAIL $*"; rc=1; }
-
-# ---------------------------------------------------------------- labconf
-same_cmd() { # label, then: command run as  <tool> ARGS  for both
-    local label="$1"; shift
-    local po pe pc ro re rc_
-    po="$(cd "$TMP/c" && python3 "$ROOT/lib/labconf.py" "$@" 2>"$TMP/pe")"; pc=$?
-    ro="$(cd "$TMP/c" && "$RS" labconf "$@" 2>"$TMP/re")"; rc_=$?
-    pe="$(cat "$TMP/pe")"; re="$(cat "$TMP/re")"
-    if [[ "$po" == "$ro" && "$pc" == "$rc_" && "$pe" == "$re" ]]; then pass
-    else fail "labconf $label: python($pc) [$po] [$pe] vs rust($rc_) [$ro] [$re]"; fi
-}
-mkdir -p "$TMP/c/sub"
-for c in "$ROOT"/examples/configs/*.conf; do
-    same_cmd "json $(basename "$c")" json "$c"
-    same_cmd "check $(basename "$c")" check "$c"
-done
-same_cmd "layered" json "$ROOT/examples/configs/2019-student-only.conf" "$ROOT/examples/configs/win10-smoke.conf"
-i=0
-while IFS= read -r body; do
-    i=$((i + 1))
-    printf '%b' "$body" >"$TMP/c/case$i.conf"
-    same_cmd "case$i ($body)" json "case$i.conf"
-    printf '%b' "$body" >"$TMP/c/sub/rel$i.conf"
-    same_cmd "sub/rel$i" check "sub/rel$i.conf"
-done <<'EOF'
-version=2019\nmount=/a:X, ../b/./c:z\nrun_as_admin=X:\\setup.bat, Z:/go.ps1\nrun_as_student=x:\\run.EXE\nname=demo\n
-version = 2019 # c\r\nmount = rel/dir:X\r\nrun_as_admin = X:\\\\a.bat,, X:\\b.cmd\r\nwait = 5\r\ntimeout_min=+9\r\n
-version=2019\nrun_as_admin=C:\\Windows\\System32\\whoami.exe\nname=\n
-mount=/a:X\nrun_as_student=X:\\a.bat\n
-version=2019\nfoo=bar\n
-version=2019\nmount=/a:X\n
-version=2019\nmount=/a\nrun_as_student=C:\\x.bat\n
-version=2019\nmount=:X\nrun_as_student=C:\\x.bat\n
-version=2019\nmount=/a:C\nrun_as_student=C:\\x.bat\n
-version=2019\nmount=/a:d\nrun_as_student=C:\\x.bat\n
-version=2019\nmount=/a:X,/b:x\nrun_as_student=X:\\x.bat\n
-version=2019\nmount=/a:XY\nrun_as_student=C:\\x.bat\n
-version=2019\nmount=/a:X\nrun_as_student=X:\\a.txt\n
-version=2019\nmount=/a:X\nrun_as_student=Z:\\a.bat\n
-version=2019\nmount=/a:X\nrun_as_student=run.bat\n
-version=2019\nmount=/a:W,/b:X,/c:Y,/d:Z\nrun_as_student=W:\\a.bat\n
-version=2019\nmount /a:X\n
-version=20 19\nrun_as_student=C:\\a.bat\n
-version=2019\nname=it's\nrun_as_student=C:\\a.bat\n
-version=2019\nrun_as_student=C:\\it's.bat\nrun_as_admin=Q:\\x.bat\n
-\xef\xbb\xbfversion=2019\nrun_as_student=C:\\a.bat\n
-EOF
-same_cmd "missing file" json "$TMP/c/nope.conf"
-# usage: same exit code (the help text itself names wtl-rs instead of labconf.py)
-python3 "$ROOT/lib/labconf.py" json 2>/dev/null; pc=$?
-"$RS" labconf json 2>/dev/null; rc_=$?
-[[ $pc == "$rc_" ]] && pass || fail "labconf usage: exit python $pc rust $rc_"
 
 # ---------------------------------------------------------------- mkiso
 mask() { # ISO -> copy with the PVD/SVD creation+modification times and root-record dates zeroed
@@ -109,7 +59,7 @@ same_iso "lib/" "$ROOT/lib" "a long volume label, with commas"
 same_iso "missing dir" "$TMP/none" "X"
 
 # ---------------------------------------------------------------- outputs
-for s in "$ROOT"/labs/state/*/client.serial.log "$ROOT"/labs/state/*/runs/*/client.serial.log; do
+for s in "$ROOT"/labs/state/*/*.serial.log "$ROOT"/labs/state/*/runs/*/*.serial.log "$ROOT"/labs/state/*/runs/*/*/serial.log; do
     [[ -s "$s" ]] || continue
     rm -rf "$TMP/po" "$TMP/ro"
     pj="$(python3 "$ROOT/lib/outputs.py" "$s" "$TMP/po")"; rj="$("$RS" outputs "$s" "$TMP/ro")"
