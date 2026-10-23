@@ -55,7 +55,7 @@ trap 'exit 130' INT TERM
 
 # copy project (without heavy / stateful dirs; iso-files holds multi-GB installer ISOs)
 ( cd "$ROOT" && for e in * .[!.]*; do
-    case "$e" in images|iso-files|runs|results|tests|.git|'*'|'.[!.]*') continue ;; esac
+    case "$e" in images|iso-files|runs|results|tests|wtl-rs|.git|'*'|'.[!.]*') continue ;; esac
     cp -a "$e" "$LAB/" 2>/dev/null
   done )
 mkdir -p "$LAB/tests"

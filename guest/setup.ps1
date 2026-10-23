@@ -512,8 +512,6 @@ function Invoke-WuLoop($State) {
 
 function Complete-Build($State) {
     Remove-RegValue $RunKey 'WTL-Build'
-    Set-RegValue $RunKey 'WTL-Agent' "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $WtlDir\agent.ps1" 'String'
-    Write-Log 'agent autostart installed (HKLM Run WTL-Agent)'
 
     Start-Heartbeat
     try {
@@ -540,7 +538,12 @@ function Complete-Build($State) {
     $State.finished = (Get-Date).ToString('s')
     Save-State $State
 
+    # The agent autostart goes in LAST, after BUILD_DONE: Explorer may still be working through
+    # this logon's Run keys, and an agent started now would hold COM1 open, so the BUILD_DONE
+    # line (written by open-write-close) would be lost and the host would see only a shutdown.
     Send-WtlEvent -EventName 'BUILD_DONE'
+    Set-RegValue $RunKey 'WTL-Agent' "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $WtlDir\agent.ps1" 'String'
+    try { [System.IO.File]::AppendAllText($LogFile, (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + " agent autostart installed (HKLM Run WTL-Agent)`r`n") } catch { }
     Start-Sleep -Seconds 2
     try { Stop-Computer -Force -ErrorAction Stop } catch { Invoke-Native 'shutdown.exe' @('/s', '/t', '0', '/f') }
 }

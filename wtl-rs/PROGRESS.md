@@ -1,0 +1,49 @@
+# wtl-rs progress
+
+Hand-over notes: the current state, decisions and gotchas. User docs: ../README.md,
+../docs/CONFIG.md; design: ../SPEC.md; contributor notes: ../docs/AGENTS.md.
+
+## State (2026-10-23)
+
+- The host side is Rust only. `lab` = `wtl-rs` (`~/.local/bin/lab` -> target/release/wtl-rs).
+  lab.sh, lib/labconf.py, tests/test_labconf.py and lib/msdl.py are gone.
+- JSON is the one format: `labs/*.json` (school, 2012, 2016, 2019, win10, win11) and
+  `examples/configs/*.json`. The `.conf` runner, its parsers (labconf.rs, shconf.rs) and the
+  `.conf` -> JSON importers were removed; so was the two-machine `-netdev stream` LAN.
+- Labs: one DC + N members on a `-netdev dgram` multicast LAN; computer name = machine key
+  (the DC renames before promotion, members via `Add-Computer -NewName`); missing groups are
+  created; missing base images are installed with build-image.sh; every run writes
+  `runs/<id>/result.json`.
+- Verified on KVM: the school lab (2019 DC + 2012 + 2016) built from nothing (base images,
+  0 state) and its smoke run passes (ALL STEPS OK, 6 steps on 3 machines).
+- No-VM checks: cargo test (unit + 15 fake_lab scenarios), clippy clean, fmt, rustdoc with
+  `-D warnings`, cross-checks for Windows / macOS, tests/parity.sh, tests/all.sh.
+
+## Next (ask the user first)
+
+- Port build-image.sh / launch-test.sh / lib/isoinfo.py to Rust, so installing base images
+  needs no bash or Python (then Windows/macOS hosts need nothing but QEMU).
+- Never run on a real Windows or macOS host; only cross-`cargo check`ed. On WHPX,
+  `-accel whpx,kernel-irqchip=off -cpu max` may need `WTL_CPU`.
+
+## Decisions
+
+- Crates for the generic parts, in-tree code for the win-test-lab logic (ISO writer, QMP,
+  serial protocol, runner).
+- Steps are guest-driven: each machine gets its ordered step list on its control disc; there
+  is no barrier between different machines' steps (the host has no write channel into a
+  booted guest; mounts are read-only ISOs).
+- Errors are anyhow; the runner ends with an internal `Exit(code)` once it printed the reason:
+  2 lab error, 3 timeout. clap usage errors exit 2 under `lab`, 64 for the other tools.
+- Serial offsets are kept in memory per VM; a half-written line is re-read by the next wait.
+- `pyjson` writes Python-`json.dumps`-style ASCII JSON: lab.json must be ASCII for
+  PowerShell 4, and the outputs summary is compared byte for byte with lib/outputs.py.
+- `WTL_TEST_FAST=1` skips the fixed settle sleeps (fake-QEMU tests only).
+
+## Gotchas
+
+- The Bash tool's sandbox is broken on this machine: run commands with the Terminal panel
+  tools. The terminal hook rejects lines with `!`, a leading `#` word, or `(...)` glob-like
+  groups, and multi-line commands; put scripts in `target/tmp/` and run them.
+- A fake VM must not exit within 0.5 s of starting (`qemu::start` treats that as a failure).
+- rustfmt.toml keeps the long-line style (max_width 140).

@@ -1,13 +1,14 @@
 # labsvc.ps1 - win-test-lab privileged worker (guest side), runs as SYSTEM.
 #
 # PowerShell 4.0 compatible (Server 2012 R2 baseline). No PS5+ features.
-# Baked into the 0 state: copied to C:\WTL by build-image, started by the scheduled task
-# "WTL-Svc" (created as admin during the client join phase) at every boot, running as SYSTEM.
+# Baked into the 0 state: copied from the control disc to C:\WTL during the 0-state build and
+# started at every boot by the scheduled task "WTL-Svc" (registered while still Administrator),
+# running as SYSTEM.
 #
-# It does the things a limited LAB\student cannot: assign fixed drive letters to the mounted
-# discs, and run "run_as_admin" steps with full privilege (SYSTEM = the lab's "root"). It talks
-# only to the filesystem, never the serial port (the student agent owns COM1 and does the
-# reporting), via a simple request/response queue under C:\WTL\svc:
+# It does the things the logged-on domain user cannot: assign fixed drive letters to the mounted
+# discs, run "system" steps with full privilege, and run steps as another lab user (with that
+# user's password). It talks only to the filesystem, never the serial port (the logged-on
+# user's agent owns COM1 and does the reporting), via a request/response queue under C:\WTL\svc:
 #
 #   request  C:\WTL\svc\<id>.req.json   {"action":"mount","letter":"X"}
 #                                       {"action":"run","path":"X:\\a.bat","cwd":"X:\\","timeout":60,"out":"...","err":"..."}
@@ -37,23 +38,51 @@ function Set-MountLetter([string]$Letter) {
     return $target
 }
 
+# Build the (file, argLine) a script path turns into: .ps1 via powershell, .bat/.cmd via cmd,
+# .msi via msiexec, anything else run directly. $UserArgs are the step's own arguments.
+function Resolve-SvcLaunch([string]$Path, [string]$UserArgs) {
+    $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    $file = $Path; $argLine = ''
+    if ($ext -eq '.ps1') {
+        $file = 'powershell.exe'; $argLine = '-NoProfile -ExecutionPolicy Bypass -File "' + $Path + '"'
+        if ($UserArgs) { $argLine += ' ' + $UserArgs }
+    } elseif ($ext -eq '.bat' -or $ext -eq '.cmd') {
+        $file = $env:ComSpec; $argLine = '/d /c ""' + $Path + '"'
+        if ($UserArgs) { $argLine += ' ' + $UserArgs }
+        $argLine += '"'
+    } elseif ($ext -eq '.msi') {
+        $file = 'msiexec.exe'; $argLine = '/i "' + $Path + '" /qn /norestart'
+        if ($UserArgs) { $argLine += ' ' + $UserArgs }
+    } elseif ($UserArgs) {
+        $argLine = $UserArgs
+    }
+    return @($file, $argLine)
+}
+
 function Invoke-SvcRun($Req) {
     $path = [string]$Req.path
     $cwd = [string]$Req.cwd
     $timeout = 60; if ($Req.timeout) { try { $timeout = [int]$Req.timeout } catch { } }
     $outFile = [string]$Req.out
     $errFile = [string]$Req.err
+    $userArgs = [string]$Req.args
+    $runUser = [string]$Req.user          # run as this account instead of SYSTEM (optional)
+    $runPass = [string]$Req.password
+    $runDomain = [string]$Req.domain
+    $keepRunning = $false; if ($Req.keep_running) { $keepRunning = [bool]$Req.keep_running }
     $inFile = Join-Path $SvcDir 'empty.in'
     foreach ($f in @($outFile, $errFile)) { if ($f -and (Test-Path $f)) { Remove-Item $f -Force } }
     [System.IO.File]::WriteAllText($inFile, '')
 
-    $ext = [System.IO.Path]::GetExtension($path).ToLowerInvariant()
-    $file = $path; $argLine = ''
-    if ($ext -eq '.ps1') {
-        $file = 'powershell.exe'; $argLine = '-NoProfile -ExecutionPolicy Bypass -File "' + $path + '"'
-    } elseif ($ext -eq '.bat' -or $ext -eq '.cmd') {
-        $file = $env:ComSpec; $argLine = '/d /c ""' + $path + '""'
+    $resolved = Resolve-SvcLaunch $path $userArgs
+    $file = $resolved[0]; $argLine = $resolved[1]
+
+    # run as another user (not logged on): SYSTEM launches it with that account's credentials
+    # via ProcessStartInfo (CreateProcessWithLogonW); output still captured. No GUI (session 0).
+    if ($runUser) {
+        return (Invoke-SvcRunAs $file $argLine $cwd $outFile $errFile $runUser $runPass $runDomain $timeout $keepRunning)
     }
+
     $sp = @{ FilePath = $file; PassThru = $true; NoNewWindow = $true;
              RedirectStandardOutput = $outFile; RedirectStandardError = $errFile; RedirectStandardInput = $inFile }
     if ($cwd -and (Test-Path -LiteralPath $cwd)) { $sp['WorkingDirectory'] = $cwd }
@@ -68,12 +97,73 @@ function Invoke-SvcRun($Req) {
         Start-Sleep -Milliseconds 250
     }
     if ($timedOut) {
+        if ($keepRunning) {
+            return @{ ok = $true; running = $true; secs = [Math]::Round(([DateTime]::Now - $t0).TotalSeconds, 1) }
+        }
         try { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null } catch { }
         try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
         return @{ ok = $true; timed_out = $true; secs = [Math]::Round(([DateTime]::Now - $t0).TotalSeconds, 1) }
     }
     $code = -1
     try { $proc.WaitForExit(); $code = $proc.ExitCode } catch { }
+    return @{ ok = $true; exit = $code; secs = [Math]::Round(([DateTime]::Now - $t0).TotalSeconds, 1) }
+}
+
+# Run a program as another domain user (not the logged-on one). SYSTEM has SeAssignPrimaryToken,
+# so ProcessStartInfo with UserName/Password uses CreateProcessWithLogonW. Output is redirected
+# to files. The process runs in session 0 with no desktop (fine for console programs / installers).
+function Invoke-SvcRunAs([string]$File, [string]$ArgLine, [string]$Cwd, [string]$OutFile, [string]$ErrFile,
+                         [string]$User, [string]$Pass, [string]$Domain, [int]$Timeout, [bool]$KeepRunning) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $File
+    $psi.Arguments = $ArgLine
+    if ($Cwd -and (Test-Path -LiteralPath $Cwd)) { $psi.WorkingDirectory = $Cwd }
+    $psi.UserName = $User
+    if ($Domain) { $psi.Domain = $Domain }
+    $sec = New-Object System.Security.SecureString
+    foreach ($ch in $Pass.ToCharArray()) { $sec.AppendChar($ch) }
+    $psi.Password = $sec
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $t0 = [DateTime]::Now
+    $proc = $null
+    try { $proc = [System.Diagnostics.Process]::Start($psi) } catch {
+        return @{ ok = $false; error = "run as ${Domain}\${User} failed: $($_.Exception.Message)" }
+    }
+    if ($proc -eq $null) { return @{ ok = $false; error = "run as ${Domain}\${User}: Process.Start returned null" } }
+    # drain the pipes on background threads so a chatty program cannot deadlock
+    $outBuf = New-Object System.Text.StringBuilder
+    $errBuf = New-Object System.Text.StringBuilder
+    $null = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -Action { if ($EventArgs.Data -ne $null) { [void]$Event.MessageData.Append($EventArgs.Data + "`r`n") } } -MessageData $outBuf
+    $null = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -Action { if ($EventArgs.Data -ne $null) { [void]$Event.MessageData.Append($EventArgs.Data + "`r`n") } } -MessageData $errBuf
+    $proc.BeginOutputReadLine()
+    $proc.BeginErrorReadLine()
+    $deadline = $t0.AddSeconds([Math]::Max(5, $Timeout))
+    $timedOut = $false
+    while (-not $proc.HasExited) {
+        if ([DateTime]::Now -ge $deadline) { $timedOut = $true; break }
+        Start-Sleep -Milliseconds 250
+    }
+    $flush = {
+        try { [System.IO.File]::WriteAllText($OutFile, $outBuf.ToString()) } catch { }
+        try { [System.IO.File]::WriteAllText($ErrFile, $errBuf.ToString()) } catch { }
+    }
+    if ($timedOut -and $KeepRunning) {
+        & $flush
+        return @{ ok = $true; running = $true; secs = [Math]::Round(([DateTime]::Now - $t0).TotalSeconds, 1) }
+    }
+    if ($timedOut) {
+        try { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null } catch { }
+        try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
+        & $flush
+        return @{ ok = $true; timed_out = $true; secs = [Math]::Round(([DateTime]::Now - $t0).TotalSeconds, 1) }
+    }
+    $code = -1
+    try { $proc.WaitForExit(); $code = $proc.ExitCode } catch { }
+    Start-Sleep -Milliseconds 100
+    & $flush
     return @{ ok = $true; exit = $code; secs = [Math]::Round(([DateTime]::Now - $t0).TotalSeconds, 1) }
 }
 

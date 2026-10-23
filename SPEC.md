@@ -1,221 +1,213 @@
-# win-test-lab — internal contract (SPEC)
+# win-test-lab: how it works (SPEC)
 
-Goal: on a Linux host with QEMU/KVM, build fully-updated Windows Server base images
-unattended, then per test run:
+The internal contract between the host program, the guest scripts and the files they share.
+For using the lab see [README.md](README.md) and [docs/CONFIG.md](docs/CONFIG.md).
 
-    ./launch-test.sh program.zip program.exe 2012 --port 5000 --test python-test.py
+## Pieces
 
-boots a throwaway copy of the 2012 image, Administrator auto-logs in, the guest agent
-copies program.zip to the Desktop, extracts it, starts program.exe, reports over the
-serial port, then the host runs python-test.py against forwarded ports and collects results.
+    wtl-rs/                Rust host program `wtl-rs` (also runs as `lab`): the AD lab runner
+      src/lab.rs           `lab` command line; finding the checkout; driving build-image.sh
+      src/labdef.rs        the JSON lab / run formats, validation, JSON Schema
+      src/labrun.rs        the runner: 0 state, boot, control discs, steps, results
+      src/qemu.rs          WTL_* settings and the QEMU command line
+      src/qmp.rs           QEMU monitor client (status, powerdown, quit, screendump -> PNG)
+      src/serialwait.rs    wait for WTL events in a serial log
+      src/outputs.rs       decode program output sent over serial
+      src/mkiso.rs         ISO9660 + Joliet writer (control and mount discs) and reader
+      src/oslist.rs        the OS table lib/oslist.conf
+      src/sys.rs           process liveness / stop, detached spawn, Ctrl-C
+      schema/              generated JSON Schemas of the two formats (`wtl-rs schema`)
+      tests/fake_lab.rs    end-to-end suite: wtl-rs lab against a fake QEMU + qemu-img
+    labs/<name>.json       lab definitions; labs/state/<name>/ their 0 state, runs, logs
+    examples/configs/      example run configs
+    guest/lab.ps1          guest side of the lab (rename, DC promotion, join, run steps)
+    guest/labsvc.ps1       SYSTEM worker on each machine (mounts, steps as system / as a user)
+    guest/agent.ps1        logon agent: owns COM1, dot-sources lab.ps1 from the control disc
+    guest/setup.ps1        first-logon setup of a base image (build phase)
+    guest/autounattend*.xml.tmpl   unattended Windows Setup answer files (BIOS / UEFI)
+    build-image.sh         unattended Windows install -> images/<name>.qcow2
+    launch-test.sh         separate single-VM tester (no domain; see the end of this file)
+    download-isos.sh, setup-host.sh, lib/common.sh, lib/*.py, lib/rename-isos.sh
+                           host scripts and Python helpers of build-image.sh / launch-test.sh
+    lib/oslist.conf        OS table (read by both the Rust and the bash side)
+    images-list.conf       which ISO file serves which OS key (optional; else found by build)
+    tests/                 all.sh (every no-VM test), ps_lint.py (PowerShell 4 lint),
+                           run-tests.sh + fake-qemu (build-image.sh / launch-test.sh suite),
+                           check-labs.sh, check-catalog.sh
 
-No component may assume internet inside the build sandbox. Host tools available on the
-user's machine after `setup-host.sh`: bash, python3 (3.8+ stdlib only), qemu-system-x86_64,
-qemu-img. NO xorriso/genisoimage/7z dependency — ISOs are written by `lib/mkiso.py`.
+Host requirements: `qemu-system-x86_64`, `qemu-img`, `/dev/kvm` (Linux), OVMF for UEFI
+guests, and bash + python3 (stdlib only) for installing base images. No root, no Samba, no
+xorriso/genisoimage: discs are written by the program itself.
 
-## Layout (root = win-test-lab/)
+## Settings (environment)
 
-    setup-host.sh          apt install qemu-system-x86 qemu-utils python3; check /dev/kvm + kvm group
-    download-isos.sh       fetch missing eval ISOs into $WTL_ISO_DIR (best effort, fwlinks)
-    build-image.sh <os>... unattended install + Windows Update -> images/<os>.qcow2
-    launch-test.sh         run one test (see CLI)
-    lib/common.sh          shared bash: config load, logging, os lookup, qemu cmdline builder
-    lib/oslist.conf        OS table (see below)
-    lib/mkiso.py           pure-python ISO9660 + Joliet writer
-    lib/isoinfo.py         pure-python UDF reader: list files, read sources/install.wim XML, pick image index
-    lib/qmp.py             QMP client: screendump (writes PNG), system_powerdown, quit
-    lib/serialwait.py      wait for WTL events in a serial log file
-    guest/autounattend.xml.tmpl
-    guest/setup.ps1        build phase (runs at first logon, survives reboots)
-    guest/agent.ps1        test phase agent (runs at every logon)
-    examples/demo/         program.bat + echo-server.ps1 (zip-able demo "program")
-    examples/python-test.py
-    tests/                 fake-qemu, fake-qemu-img, run-tests.sh (host logic tests w/o KVM)
-    images/                base images <os>.qcow2 (+ <os>.json metadata)
-    runs/                  per-run overlays (deleted after run unless --keep)
-    results/<YYYYmmdd-HHMMSS>-<os>/   per-run outputs
+| variable | default | meaning |
+|----------|---------|---------|
+| `WTL_ROOT` | found from the binary's location (or the cwd) | the win-test-lab folder |
+| `WTL_ISO_DIR` | `<root>/iso-files` | installer ISOs |
+| `WTL_IMAGES_DIR` | `<root>/images` | base images `<os>-dc.qcow2`, `<os>-client.qcow2` |
+| `WTL_QEMU`, `WTL_QEMU_IMG` | `qemu-system-x86_64`, `qemu-img` | the QEMU programs |
+| `WTL_ACCEL` | kvm / whpx / hvf by host | `kvm`, `whpx`, `hvf` or `tcg`; `WTL_NO_KVM=1` = tcg |
+| `WTL_CPU` | `host,hv_*` on KVM, `max` otherwise | the `-cpu` value |
+| `WTL_CPUS` | 2 | vCPUs when a machine sets none |
+| `WTL_NIC` | `e1000` | NIC model |
+| `WTL_QMP` | `unix` (`tcp` on Windows) | QEMU monitor transport |
+| `WTL_OVMF_CODE`, `WTL_OVMF_VARS` | `/usr/share/OVMF/OVMF_{CODE,VARS}_4M.fd` | UEFI firmware |
+| `WTL_DISPLAY` | `gtk` (`cocoa` on macOS) | display used by `--show` |
+| `WTL_PASSWORD` | `WinTest!2026` | local Administrator password baked into base images |
+| `WTL_TEST_FAST=1` | | skip fixed settle sleeps (fake-QEMU tests only) |
 
-## Environment overrides (all optional)
+## Base images
 
-    WTL_ISO_DIR      default: parent dir of win-test-lab (the user's "ISO images" folder)
-    WTL_IMAGES_DIR   default: <root>/images
-    WTL_QEMU         default: qemu-system-x86_64
-    WTL_QEMU_IMG     default: qemu-img
-    WTL_NO_KVM=1     omit -enable-kvm/-cpu host (tests set this)
-    WTL_MEM          default 4096 (MB)      WTL_CPUS default 2
-    WTL_PASSWORD     default "WinTest!2026" (Administrator)
+One unattended Windows install per OS and role: `images/<os>-dc.qcow2` for domain
+controllers and `images/<os>-client.qcow2` for members (a clone of a DC cannot join its own
+domain, so the two are separate installs; members of the same OS share one image).
+`lab` runs `build-image.sh <os> --name <os>-dc|<os>-client --computer-name DC<os>|CL<os>
+--no-updates` for every missing image of a lab, in parallel, logging to
+`labs/state/<lab>/build-<image>.log`.
 
-## lib/oslist.conf
+build-image.sh: renders `guest/autounattend*.xml.tmpl`, puts it with `guest/*.ps1` and a
+`WTL/build.json` on an `WTL_BUILD` disc, boots the installer ISO + that disc, waits for
+`WTL BUILD_DONE` on the serial log and for the guest to power off, then renames
+`<image>.qcow2.partial` to `<image>.qcow2` and writes `<image>.json`. In the guest,
+`setup.ps1` runs at first logon: autologon, firewall off, power settings, optional Windows
+Update rounds, then installs the agent autostart (HKLM Run `WTL-Agent` -> `C:\WTL\agent.ps1`)
+**after** sending `BUILD_DONE` (an agent started earlier would hold COM1), and shuts down.
 
-Whitespace-separated, `#` comments. Columns:
+## The 0 state
 
-    key  iso_glob                                   edition_id      inst_type  fallback_index  min_disk_gb  display
-    2012 *9600*SERVER_EVAL*.[iI][sS][oO]          ServerStandard  Server     2   60  Windows Server 2012 R2
-    2016 *14393*SERVER_EVAL*.[iI][sS][oO]         ServerStandard  Server     2   60  Windows Server 2016
-    2019 *17763*SERVER_EVAL*.[iI][sS][oO]         ServerStandard  Server     2   60  Windows Server 2019
-    2022 *20348*SERVER_EVAL*.[iI][sS][oO]         ServerStandard  Server     2   60  Windows Server 2022
-    2025 *26100*SERVER_EVAL*.[iI][sS][oO]         ServerStandard  Server     2   80  Windows Server 2025
+`labs/state/<lab>/<machine>-0.qcow2`: a qcow2 overlay per machine on its base image. It is
+built once (`lab prepare`, or the first `lab run`) by booting the overlays themselves:
 
-Aliases accepted on CLI: 2012r2 -> 2012. `all` = every key whose base image exists (launch-test)
-or whose ISO exists (build-image). If several ISOs match a glob, pick the newest mtime;
-`--iso PATH` overrides. Note: existing ISO "2022server.iso" doesn't match 20348 glob — the
-lookup must also fall back to isoinfo (read WIM XML <BUILD>) over all *.iso in WTL_ISO_DIR
-when the glob matches nothing. (2012 R2 build = 9600, 2016 = 14393, 2019 = 17763,
-2022 = 20348, 2025 = 26100.) Skip ISOs that have no sources/install.wim (e.g. LOF/FOD disc).
+1. Each machine gets a control disc (`<machine>.iso`, label `WTL_LAB`, drive D:) with
+   `LAB\lab.ps1`, `LAB\labsvc.ps1` and `LAB\lab.json` (below). The agent finds it at logon
+   and dot-sources `lab.ps1`.
+2. DC: rename to the machine name + reboot; static IP; AD DS + new forest + reboot; create
+   the groups and users; `LAB_DC_READY`; register the SYSTEM worker.
+3. Members (in parallel): static IP with the DC as DNS; wait for the DC; register the SYSTEM
+   worker; `Add-Computer -NewName <machine>` (join + rename, one reboot, retried for 20 min
+   while the new DC finishes its first boot); autologon as the machine's `logon` user;
+   `LAB_JOINED`; reboot; logged on -> `LAB_CLIENT_READY`; `LAB_IDLE`.
+4. The host powers every machine off with ACPI (members first, then the DC; a second press
+   after 60 s if a user session delays it) and writes `0-state.json`.
 
-## lib/isoinfo.py CLI
+The guest keeps its progress in `C:\WTL\lab-state.json` (`phase`: new, promoted, ready,
+joined), so every reboot continues where it stopped. `lab rebuild` deletes the `-0.qcow2`
+files and `0-state.json`; the base images stay.
 
-    isoinfo.py ls ISO [PATH]                 list dir (UDF; fall back to ISO9660)
-    isoinfo.py wim ISO                       JSON list of images: index,name,edition_id,installation_type,build,spbuild,arch
-    isoinfo.py pick ISO EDITION INST_TYPE    print index of matching image, exit 1 if none
-    isoinfo.py build ISO                     print major build of image 1 (e.g. 9600)
+## A run
 
-Windows ISOs are UDF-bridge: the ISO9660 tree only has README.TXT; real tree is UDF
-(2.01/2.50, may use metadata partition on newer media). install.wim may be install.esd on
-some media (ESD header is also "MSWIM\0\0\0"; XML location same header field).
+`lab run CONFIG`: restore (QMP quit, delete `<machine>.qcow2`), create new throwaway
+overlays `<machine>.qcow2` on the 0-state disks, write each machine's control disc with
+`run` filled in, write one mount disc per drive a machine's steps use
+(`mount-<machine>-<letter>.iso`, label `WTL<LETTER>`, read-only), boot all machines (DC
+first), wait for `LAB_DC_READY` and every member's `LAB_CLIENT_READY`, then read the serial
+logs of all machines that have steps, round-robin, until each sent `LAB_RUN_DONE`. A
+machine that powers itself off while being waited for is reset; a member that does not log
+on within 5 min is reset (up to 3 times; domain autologon sometimes stops at the sign-in
+screen).
 
-## lib/mkiso.py CLI
+Each step is checked against its `expect_exit` (or `exit=running` with `keep_running`).
+Results go to `runs/<id>/` (see docs/CONFIG.md): `result.json`, `config.json`, and per
+machine the decoded `stepNout/err.txt`, `serial.log`, `screen.png`. The VMs keep running;
+`lab up` is the same without steps.
 
-    mkiso.py -o out.iso -V VOLID  SRC_DIR
+Exit codes: 0 all steps passed, 1 a step failed, 2 lab error (bad config, `LAB_FAIL`, a VM
+exited, an `ERROR` event; a screenshot `<machine>-fail.png` is taken), 3 timeout.
 
-Writes ISO9660 (level 2 names, uppercase) + Joliet (long names, original case) with
-directories. Must be readable by Windows Setup (autounattend.xml at root is found by
-Setup on any removable/CD media, name is case-insensitive) and by isoinfo.py.
+## The control disc's lab.json
 
-## Build phase (build-image.sh <os> [--iso PATH] [--no-updates] [--disk-gb N] [--show] [--timeout-h H] [--force])
+Pure ASCII (PowerShell 4 reads it without a BOM), one per machine:
 
-1. Create images/<os>.qcow2.partial (qcow2, min_disk_gb).
-2. Stage dir -> mkiso.py -> runs/build-<os>/unattend.iso (vol id WTL_BUILD), contents:
-       autounattend.xml            (template rendered: @IMAGE_INDEX@ @PASSWORD@ @COMPUTERNAME@ = WTL-<OS>)
-       WTL/setup.ps1  WTL/agent.ps1  WTL/build.json  {"os":"2012","updates":true,"password":"..."}
-3. QEMU boots: install ISO + unattend ISO, `-boot once=d`, serial to runs/build-<os>/serial.log.
-4. Host waits (serialwait) for `WTL BUILD_DONE` and then for qemu process exit (guest shuts
-   itself down). Progress events echoed to the terminal. On `WTL BUILD_FAIL` or timeout
-   (default 12h): screenshot, kill, keep .partial, exit non-zero.
-5. Rename .partial -> images/<os>.qcow2, write images/<os>.json {os, iso, built_at, updates}.
-   `qemu-img` is never required to inspect it later.
+```json
+{
+ "fmt": "multi", "role": "dc|member", "machine": "CL1",
+ "ip": "10.77.30.20", "prefix": 24, "dc_ip": "10.77.30.10", "lan_mac": "52:54:00:4c:41:11",
+ "domain": "lab.local", "netbios": "LAB", "admin_password": "...",
+ "users": [{"name": "student1", "password": "...", "groups": ["Students"]}],
+ "logon_user": "student1", "logon_password": "...",
+ "shutdown_when_ready": false,
+ "run": null | {
+   "mounts": [{"host": "/abs/host/path", "letter": "X"}],
+   "steps": [{"n": 1, "as_": "system|logon|user", "user": "", "password": "",
+              "path": "X:\\setup.bat", "args": "", "keep_running": false, "wait": 120}],
+   "wait": 120 }
+}
+```
 
-Guest side (setup.ps1, PowerShell 4.0 compatible — Server 2012 R2 baseline):
-  first run (FirstLogonCommands finds X:\WTL\setup.ps1 on any CD drive):
-  copies WTL\* to C:\WTL, sets permanent autologon (Winlogon registry AutoAdminLogon=1,
-  DefaultUserName=Administrator, DefaultPassword), disables firewall (all profiles),
-  disables Server Manager at logon, IE ESC off, power plan high performance, never sleep/
-  screen-off, disables Windows Update automatic install & reboots (AUOptions=1 / NoAutoUpdate),
-  disables "Shutdown Event Tracker", sets HKLM Run key `WTL-Build` -> setup.ps1 (resume
-  after reboot). Then Windows Update loop using Microsoft.Update.Session COM:
-  search "IsInstalled=0 and Type='Software' and IsHidden=0", accept EULAs, download, install,
-  report `WTL WU_ROUND n found=x installed=y reboot=true|false` ; reboot if needed (run key
-  resumes); stop when 0 found twice in a row or 30 rounds. Errors per round logged, not fatal,
-  except 3 consecutive failed rounds -> continue to finish anyway with WU_GAVEUP event.
-  finish: remove Run `WTL-Build`, add Run `WTL-Agent` ->
-  `powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\WTL\agent.ps1`,
-  cleanup (Dism /Online /Cleanup-Image /StartComponentCleanup best effort, clear temp),
-  emit `WTL BUILD_DONE`, `Stop-Computer -Force`.
+`run` is set only for `lab run`, and only on machines that have steps. `as_` is resolved per
+machine: a step `as` the machine's own logon user is `logon` (its desktop session); another
+lab user is `user` with that user's password (started by the SYSTEM worker with
+`ProcessStartInfo` credentials, no desktop); `system` is the SYSTEM worker. lab.ps1 refuses
+a disc whose `fmt` is not `multi`.
 
-## Test phase (launch-test.sh)
+## Privileges in the guest
 
-    launch-test.sh ZIP EXE OS [options]
-      ZIP           path to zip on host
-      EXE           file name or relative path inside the zip (e.g. program.exe or bin/program.exe)
-      OS            key / alias / "all" (runs sequentially, summary table at end)
-    options:
-      --test FILE       host-side test script (python3 FILE; .sh run with bash). Optional.
-      --port P[:H]      forward guest TCP port P to host port H (default H=P). Repeatable.
-      --args "..."      command-line args for EXE
-      --wait-port P     agent waits until guest port P is listening before reporting READY (default: first --port)
-      --timeout S       overall seconds before failure (default 900)
-      --show            show VM window (gtk). Default headless (-display none) + VNC on 127.0.0.1:59xx printed
-      --keep            keep VM running after test (prints how to connect) and keep overlay
-      --test-arg A      extra arg passed to test script (repeatable)
+The logged-on user runs `agent.ps1` (which owns COM1) and `lab.ps1`. A scheduled task
+`WTL-Svc` (ONSTART, SYSTEM, registered while still Administrator) runs `C:\WTL\labsvc.ps1`,
+which does what that user cannot: assign mount discs their drive letters, run `system`
+steps and steps as another user. They talk through files: `C:\WTL\svc\<id>.req.json` ->
+`C:\WTL\svc\<id>.res.json` (`{"ok":true,"exit":N,"secs":S}`, `{"ok":true,"timed_out":true}`,
+`{"ok":true,"running":true}` or `{"ok":false,"error":"..."}`). Step output is captured to
+`C:\WTL\run\stepN.out/err` and sent over serial by the agent's session.
 
-Steps:
-1. Validate zip/exe(name present in zip via python zipfile), base image exists.
-2. Overlay: runs/<run>/disk.qcow2 backed by images/<os>.qcow2 (`qemu-img create -f qcow2 -F qcow2 -b`).
-3. Job dir -> mkiso.py -> runs/<run>/job.iso (vol id WTL_JOB) containing:
-       JOB.JSON     {"run_id","zip_name","exe","args","wait_ports":[...],"timeout"}
-       PAYLOAD.ZIP  (copy of ZIP)
-4. QEMU: disk on AHCI, install media absent, job.iso as CD, e1000 user net with
-   hostfwd=tcp:127.0.0.1:H-:P for each port, serial file runs/<run>/serial.log,
-   QMP unix socket runs/<run>/qmp.sock.
-5. Wait for events: AGENT_START (boot timeout), then LAUNCHED, then READY (port listening)
-   or LAUNCH_FAIL/ERROR -> fail. PROC_EXIT before READY -> fail.
-6. Run test script with env:
-       WTL_HOST=127.0.0.1  WTL_PORT=<host port of first --port>  WTL_PORT_<P>=<H> for each
-       WTL_OS=<key>  WTL_RESULTS=<results dir>  WTL_RUN_ID
-   stdout/stderr tee'd to results/.../test.log. Exit code recorded.
-7. Screenshot (qmp screendump -> screen.png), copy serial.log, write result.json
-   {os, run_id, status: pass|fail|error|timeout, test_exit, durations, events}.
-   Power off (qmp quit), delete overlay unless --keep.
-Exit: 0 pass; 1 test failed; 2 setup/launch error; 3 timeout. For `all`: worst code.
+## The network
 
-## Serial protocol (guest -> host, COM1, 115200 8N1, text lines, CRLF ok)
+Every machine of a lab has a second NIC on one private LAN: QEMU `-netdev dgram` on the UDP
+multicast group 239.77.30.1 (administratively scoped, never routed off the host), port
+`network.lan_port`, local address 127.0.0.1. Any number of VMs join it without root; labs
+are kept apart by their ports. MAC `52:54:00:4c:41:<10+i>`, static IPs from the lab file.
+The DC is the DNS server and has no other NIC (no internet); members also have QEMU
+user-mode NAT for internet access.
+
+## Serial protocol (guest -> host)
+
+COM1, a file on the host (`labs/state/<lab>/<machine>.serial.log`), text lines:
 
     WTL <EVENT> [key=value ...] [| free text]
-Values with spaces must be URL-escaped (%20). Host ignores non-WTL lines (still logged).
-Events: AGENT_START os=<caption> build=<n>; JOB_WAIT; JOB_FOUND drive=D:; COPIED path=...;
-EXTRACTED dir=...; LAUNCHED pid=N exe=...; READY port=P; PROC_EXIT code=N;
-LOG | text; ERROR | text; LAUNCH_FAIL | text; WU_ROUND ...; WU_GAVEUP; BUILD_DONE; BUILD_FAIL | text.
 
-## agent.ps1 (PowerShell 4.0, .NET 4.5 — must not use PS5+ features: no Expand-Archive,
-no class keyword, no ::new(), no -AsHashtable, no Get-CimInstance-only paths that PS4 lacks is fine)
-- Opens COM1 via System.IO.Ports.SerialPort (fallback: log only), logs also C:\WTL\agent.log.
-- Emits AGENT_START. Polls up to 600s every 2s all drives (DriveType CD-ROM) for \JOB.JSON.
-  None -> LOG | no job, exit quietly (normal for manual boots).
-- Copies PAYLOAD.ZIP to "$env:USERPROFILE\Desktop\<zip_name>", extracts with
-  [System.IO.Compression.ZipFile]::ExtractToDirectory into Desktop\<zip stem>\ (remove existing first).
-- Resolves EXE: relative path inside extract dir; else first recursive match by file name.
-- Start-Process -PassThru -WorkingDirectory <exe dir> [-ArgumentList args]. .bat/.cmd/.ps1 ok
-  (.ps1 via powershell -ExecutionPolicy Bypass -File).
-- LAUNCHED; then for each wait_port poll TcpClient 127.0.0.1:P until open (within timeout)
-  -> READY port=P; if no wait_ports -> READY after 3s. If process exits first -> PROC_EXIT code.
-- Afterwards keeps monitoring; emits PROC_EXIT when program exits; stays alive.
+Values with characters outside `A-Za-z0-9._~:\/+,@()-` are URL-escaped. Lines without
+`WTL ` are ignored (BIOS noise, reboots). Only the agent writes COM1.
 
-## Exit mode (added 2026-10-21)
+| event | sent by | meaning |
+|-------|---------|---------|
+| `AGENT_START os=.. build=..` | agent.ps1 | someone logged on |
+| `LAB_START role= phase= user=` | lab.ps1 | lab.ps1 started, with its saved phase |
+| `LAB_PHASE \| text` | lab.ps1 | progress |
+| `LAB_REBOOT phase=..` | lab.ps1 | about to reboot |
+| `LAB_DC_READY domain= netbios= dc= ip=` | DC | domain up, users created |
+| `LAB_JOINED domain= autologon=` | member | joined, rebooting into the autologon |
+| `LAB_CLIENT_READY user= domain= computer= dc= ip=` | member | logged on as its logon user |
+| `LAB_IDLE` | member | 0-state build: ready to be powered off |
+| `LAB_MOUNT letter= host=` | lab.ps1 | a mount disc has its drive letter |
+| `OUTPUT stream=stepNout\|stepNerr seq=N \| base64` | lab.ps1 | step output, 768-byte chunks (max 256 KiB per stream) |
+| `OUTPUT_END stream= bytes= sent= truncated=0\|1` | lab.ps1 | end of a stream |
+| `LAB_STEP machine= as= n= script= exit=N\|running\|timeout\|launchfail secs=` | lab.ps1 | a step finished |
+| `LAB_RUN_DONE machine= steps=` | lab.ps1 | all of this machine's steps finished |
+| `LAB_FAIL \| message (line N)` | lab.ps1 | the lab script failed; ends the run with exit 2 |
 
-JOB.JSON gets "mode": "exit"|"server" (launch-test default: exit when no --port).
-In exit mode "timeout" = program run limit (--run-timeout). agent.ps1 Invoke-RunToExit runs
-the EXE with stdout/stderr redirected to C:\WTL\run\*.txt (stdin = empty file), waits, then sends
-`WTL OUTPUT stream=stdout|stderr seq=N | <base64 of <=768 bytes>` (cap 256 KiB per stream),
-`WTL OUTPUT_END stream=.. bytes=.. sent=.. truncated=0|1`, then `WTL PROC_EXIT code=N secs=S`
-or `WTL PROC_TIMEOUT secs=S` (tree killed). Error dialogs off (SetErrorMode 0x8003, WER DontShowUI).
-Host: lib/outputs.py decodes into results/<run>/stdout.txt + stderr.txt; result.json gets
-"mode", "program" {exit_code, exit_hex, exit_name, timed_out, ...}, "expect_exit".
-Pass rule: test script exit 0 (and exit code == --expect-exit if given); with no --test:
-exit code == --expect-exit (default 0). PROC_TIMEOUT -> status timeout, exit 3.
+Build phase: `LOG`, `WU_ROUND`, `WU_GAVEUP`, `BUILD_DONE`, `BUILD_FAIL`.
 
-## AD lab (added 2026-10-22)
+## Guest PowerShell
 
-lab.sh builds a 2-VM Active Directory lab and runs programs/scripts on the client.
+All guest scripts must run on PowerShell 4.0 / .NET 4.5 (Server 2012 R2): no
+`Expand-Archive`, no `::new()`, no classes, no `-AsHashtable`. `tests/ps_lint.py` checks a
+subset. `lab.ps1` and `labsvc.ps1` are read from the control disc at every boot, but
+`labsvc.ps1` is copied to `C:\WTL` (and the `WTL-Svc` task registered) during the 0-state
+build: changes to it need `lab rebuild`.
 
-- labs/<v>.conf (bash key=value): LAB_OS/LAB_CLIENT_OS, LAB_DOMAIN/LAB_NETBIOS, LAB_DC_NAME/
-  LAB_CLIENT_NAME, LAB_NET (DC=.10 client=.20), LAB_PREFIX, LAB_LAN_PORT, LAB_USER/_PASSWORD,
-  LAB_ADMIN_USER/_PASSWORD, LAB_DC_MEM/LAB_CLIENT_MEM. Passwords must not contain the account name.
-- Separate base installs images/<v>-dc.qcow2 + <v>-client.qcow2 (a clone of a DC can't join its
-  own domain). build-image.sh gained --name NAME and --computer-name CN for this.
-- Private VM-to-VM net: qemu_cmd --lan server:PORT|client:PORT (netdev stream on 127.0.0.1:PORT),
-  --lan-mac MAC, --no-usernet (DC has no NAT; client keeps user NAT + optional --fwd).
-- 0 state: lab prepare boots DC+client once; guest/lab.ps1 (dot-sourced by agent.ps1 when a CD
-  has \LAB\lab.ps1 + \LAB\lab.json) promotes the DC (Install-ADDSForest), creates users, joins the
-  client (Add-Computer, retries ~20 min for the DC's slow first boot), sets student autologon via
-  the LSA secret DefaultPassword + registry, registers the SYSTEM task WTL-Svc, then LAB_IDLE and
-  a clean ACPI power-off. Disks frozen as labs/state/<v>/{dc,client}-0.qcow2. Events: LAB_START,
-  LAB_PHASE, LAB_REBOOT, LAB_DC_READY, LAB_JOINED, LAB_CLIENT_READY, LAB_IDLE, LAB_FAIL.
-- A run: throwaway overlays on the 0-state disks; lab restore / next run deletes them. A run is
-  always driven by a config: `lab run CONFIG [CONFIG...] [--show --wait S --timeout-min M]`
-  (lib/labconf.py parses examples/configs/*.conf, merged left->right, -> JSON). mounts + ordered
-  steps. Each mount HOSTPATH:LETTER -> a read-only ISO labelled WTL<LETTER> (extra CD on the
-  client), given its fixed drive letter in the guest. Mounts are a snapshot at launch (no
-  Samba/root needed). steps is an ordered list of {who: admin|student, path}, built from the
-  run_as_admin / run_as_student lines IN THE ORDER WRITTEN (the two keys may interleave). Steps:
-  guest/lab.ps1 Invoke-LabRun walks the list in order; admin steps go to guest/labsvc.ps1 (SYSTEM
-  worker, started by the WTL-Svc ONSTART task, request/response JSON under C:\WTL\svc) so no
-  reboot/password-juggling; student steps run in the student session.
-    Each step -> WTL LAB_STEP as=admin|student n=N script=.. exit=N|timeout|launchfail secs=S, with
-    output as OUTPUT stream=stepNout|stepNerr. Ends with LAB_RUN_DONE admin=A student=S.
-    lib/outputs.py decodes any stream name to <stream>.txt. Exit: 0 all steps ok, 1 a step failed.
-  (The separate launch-test.sh single-VM tester - zip+exe, JOB.JSON, guest/agent.ps1 - is below.)
-- Drive letters: C: system, D: the lab control disc; mounts use X/Y/Z (labconf rejects C/D and
-  >3 mounts, since the client has 4 IDE CD slots and the control disc takes one).
+## The single-VM tester (launch-test.sh)
 
-Tests (no VM): tests/all.sh = bash -n + ps_lint + test_labconf.py + example-config validation +
-run-tests.sh (fake-qemu). ps_lint.py enforces PowerShell 4.0; all guest/*.ps1 must pass.
+Separate from the lab and older: one throwaway copy of a base image, no domain.
+
+    ./launch-test.sh program.zip program.exe 2019 [--port 5000] [--test check.py] [--args ".."] [--expect-exit N]
+
+It writes a `WTL_JOB` disc with `JOB.JSON` + `PAYLOAD.ZIP`; `agent.ps1` copies the zip to the
+Desktop, extracts it, starts the program and reports `JOB_FOUND`, `COPIED`, `EXTRACTED`,
+`LAUNCHED`, `READY port=P` (server mode, once the port listens) or `OUTPUT` + `PROC_EXIT
+code=N secs=S` / `PROC_TIMEOUT` (exit mode, without `--port`). The host then runs the test
+script with `WTL_HOST`, `WTL_PORT`, `WTL_OS`, `WTL_RESULTS`, `WTL_RUN_ID` (exit mode:
+`WTL_EXIT_CODE`, `WTL_STDOUT`, `WTL_STDERR`) and writes `results/<run>/result.json`,
+`test.log`, `serial.log`, `screen.png`. Exit 0 pass, 1 test failed, 2 setup error, 3 timeout.
+It uses lib/common.sh and lib/{mkiso,qmp,serialwait,outputs}.py; `examples/demo`,
+`examples/python-test.py`, `examples/fetch-ria` and `examples/fetch-test.py` are its examples.

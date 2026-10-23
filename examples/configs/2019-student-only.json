@@ -1,0 +1,9 @@
+{
+  "$schema": "../../wtl-rs/schema/run.schema.json",
+  "lab": "2019",
+  "name": "student-only",
+  "mount": { "X": "../smoke-test/out" },
+  "steps": [
+    { "run": "X:/smoke.exe" }
+  ]
+}

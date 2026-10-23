@@ -31,7 +31,9 @@ edition, not Server Core).
 A disc with no `sources/install.wim` (for example a Features-on-Demand / LOF disc) is not an
 installation ISO and is skipped.
 
-## Clients other than Windows Server
+## Windows 10 / 11 members
 
-The lab's DC and client are the same Windows Server image by default. A Windows 10/11 client
-is possible but not wired up yet - see `labs/*.conf` and open an issue/PR.
+A lab member may run Windows 10 or 11 (`"os": "win10"` / `"win11"`, see `labs/win10.json`);
+the DC must be a Windows Server. Use the regular retail x64 ISO (Pro edition is installed
+with Microsoft's generic key; it is not activated). Windows 11 boots UEFI, so the host needs
+OVMF (`./setup-host.sh` installs it).

@@ -1,0 +1,14 @@
+{
+  "$schema": "../../wtl-rs/schema/run.schema.json",
+  "lab": "school",
+  "name": "school-smoke",
+  "wait": 120,
+  "timeout_min": 90,
+  "mount": { "X": "../smoke-test/out" },
+  "steps": [
+    { "on": "all",          "as": "system",   "run": "X:/setup.bat" },
+    { "on": "CL1",          "as": "student1", "run": "X:/smoke.exe" },
+    { "on": ["CL1", "CL2"],                   "run": "X:/smoke.exe" },
+    { "on": "DC1",          "as": "system",   "run": "X:/smoke.exe", "expect_exit": 0 }
+  ]
+}

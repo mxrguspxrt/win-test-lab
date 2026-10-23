@@ -1,0 +1,1168 @@
+//! The lab runner: a lab (`labs/<name>.json`) and a run config (`<app>.json`), see
+//! [`crate::labdef`]. [`crate::lab`] is its command line.
+//!
+//! A lab is one DC plus one or more domain-joined members, all on one private multicast LAN
+//! (`-netdev dgram`, which joins N VMs with no root). It is built once into a frozen 0 state
+//! (`labs/state/<lab>/<machine>-0.qcow2`) and every run starts from throwaway overlays on top.
+//!
+//! Steps are **guest-driven**: each machine gets its ordered step list on its control disc and
+//! runs its own steps top to bottom, reporting each over its serial log. A step that targets
+//! several machines runs on them in parallel; per-machine order is kept. The host has no write
+//! channel into a booted guest (mounts are read-only ISOs), so there is no host-enforced
+//! barrier *between* different steps across machines — the simple model the user asked for.
+
+use crate::lab::{build_base_images, find_root, indent_file, pick_vnc_display, read_trim, sock_path, write_file, BaseBuild};
+use crate::labdef::{self, Lab, Role, Run, RunStep, StepAs};
+use crate::logx::{err, log, ok, warn};
+use crate::oslist::{self, OsInfo};
+use crate::qemu::{self, Env, Lan, Opts};
+use crate::qmp::{Addr, Qmp};
+use crate::serialwait::{Outcome, Wait};
+use crate::{mkiso, outputs, pyjson, sys, util};
+use anyhow::{anyhow, bail, Context, Result};
+use serde::Serialize;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// Administratively-scoped IPv4 multicast group for the lab LAN (239.0.0.0/8 is site-local
+/// and never routed off the host). Labs are isolated by their unique `lan_port`, not the group.
+const LAN_GROUP: &str = "239.77.30.1";
+
+/// Ends `lab` with this exit code; the reason has already been printed.
+#[derive(Debug)]
+struct Exit(i32);
+impl std::fmt::Display for Exit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "exit {}", self.0)
+    }
+}
+impl std::error::Error for Exit {}
+
+// --------------------------------------------------------------- the control-disc lab.json
+
+/// `LAB\lab.json` on a machine's control disc, read by guest/lab.ps1. `fmt: "multi"` names
+/// this format; guest/lab.ps1 refuses anything else (e.g. a disc from an older `lab`).
+#[derive(Serialize)]
+struct LabJson<'a> {
+    fmt: &'a str,
+    role: &'a str,
+    machine: &'a str,
+    ip: &'a str,
+    prefix: i64,
+    dc_ip: &'a str,
+    lan_mac: &'a str,
+    domain: &'a str,
+    netbios: &'a str,
+    admin_password: &'a str,
+    /// every lab user (created on the DC; each member only needs its own logon user, but the
+    /// list is small and identical on every disc)
+    users: Vec<LabUser<'a>>,
+    logon_user: &'a str,
+    logon_password: &'a str,
+    shutdown_when_ready: bool,
+    /// the per-machine run (null during the 0-state build and for `up`)
+    run: Option<LabRun<'a>>,
+}
+
+#[derive(Serialize)]
+struct LabUser<'a> {
+    name: &'a str,
+    password: &'a str,
+    groups: Vec<&'a str>,
+}
+
+#[derive(Serialize)]
+struct LabRun<'a> {
+    /// the drive letters this machine mounts (a subset of the run's mounts: those its steps use)
+    mounts: Vec<LabMount<'a>>,
+    steps: Vec<LabStep<'a>>,
+    wait: i64,
+}
+
+#[derive(Serialize)]
+struct LabMount<'a> {
+    host: &'a str,
+    letter: &'a str,
+}
+
+/// One step as the guest sees it on a given machine.
+#[derive(Serialize)]
+struct LabStep<'a> {
+    /// 1-based index within this machine's step list
+    n: i64,
+    /// "system" | "logon" | "user"
+    as_: &'a str,
+    /// for "user": the account to run as (and its password); empty otherwise
+    user: &'a str,
+    password: &'a str,
+    path: &'a str,
+    args: &'a str,
+    keep_running: bool,
+    wait: i64,
+}
+
+// --------------------------------------------------------------- VM bookkeeping
+
+/// One machine's runtime identity (name == the QEMU/state id).
+struct Vm {
+    name: String,
+    role: Role,
+    os: OsInfo,
+    mem: String,
+    cpus: String,
+    ip: String,
+    mac: String,
+    logon: Option<String>,
+    /// this machine's steps (host-side), in order, with their 1-based index
+    steps: Vec<(i64, RunStep)>,
+    /// drive letters this machine's steps use (host path, letter)
+    mounts: Vec<(String, String)>,
+}
+
+/// 0-state marker, written when the build is complete.
+#[derive(Serialize, serde::Deserialize, Default)]
+struct ZeroState {
+    #[serde(default)]
+    lab: String,
+    #[serde(default)]
+    built_at: String,
+    #[serde(default)]
+    machines: Vec<String>,
+}
+
+/// One step's outcome, written into runs/<id>/result.json.
+#[derive(Serialize, Clone)]
+struct StepResult {
+    machine: String,
+    /// who ran it: "system", "logon" (the machine's own user), or a user name
+    user: String,
+    /// per-machine 1-based step index
+    n: i64,
+    script: String,
+    /// the guest's reported exit: a number, or "running"/"timeout"/"launchfail"
+    exit: String,
+    expect_exit: i64,
+    secs: f64,
+    ok: bool,
+}
+
+/// The whole run's summary, written as runs/<id>/result.json.
+#[derive(Serialize)]
+struct RunResult {
+    lab: String,
+    config: String,
+    run_id: String,
+    /// "ok" if every step met its expect_exit, else "failed"
+    status: String,
+    steps: Vec<StepResult>,
+}
+
+pub struct MultiLab {
+    root: PathBuf,
+    env: Env,
+    /// the WTL_* settings (defaults + environment), passed on to build-image.sh
+    vars: HashMap<String, String>,
+    /// install base images with Windows Update (--updates)
+    updates: bool,
+    cmd: &'static str,
+    name: String,
+    lab_file: PathBuf,
+    lab: Lab,
+    /// the run config file (absolute), if any
+    config: Option<PathBuf>,
+    show: bool,
+    wait_s: i64,
+    timeout_min: i64,
+    state: PathBuf,
+    zero_done: PathBuf,
+    deadline: Instant,
+    vms: Vec<Vm>,
+    /// serial-log offset per machine (each wait continues where the last stopped)
+    offsets: HashMap<String, u64>,
+    qmp_tcp: bool,
+}
+
+impl Vm {
+    fn has_steps(&self) -> bool {
+        !self.steps.is_empty()
+    }
+}
+
+/// The base image name for a machine: `<os>-dc` or `<os>-client`.
+fn base_name(vm: &Vm) -> String {
+    format!("{}-{}", vm.os.key, if vm.role == Role::Dc { "dc" } else { "client" })
+}
+
+/// Build a [`MultiLab`] and dispatch CMD; returns the exit code. `lab_file` is the lab JSON;
+/// `config`/`run` are set for `run`.
+pub fn run(cmd: &'static str, lab_file: &Path, config: Option<PathBuf>, run: Option<Run>, lab: Lab, opts: &RunOpts) -> i32 {
+    match MultiLab::new(cmd, lab_file, config, run, lab, opts).and_then(|mut l| l.dispatch()) {
+        Ok(code) => code,
+        Err(e) => match e.downcast_ref::<Exit>() {
+            Some(Exit(code)) => *code,
+            None => {
+                err(&format!("{:#}", e));
+                2
+            }
+        },
+    }
+}
+
+/// Command-line options that apply to a JSON lab.
+pub struct RunOpts {
+    /// open the VM windows instead of VNC
+    pub show: bool,
+    /// install missing base images with Windows Update (hours)
+    pub updates: bool,
+    /// --wait: overrides the run's `wait`
+    pub wait: Option<i64>,
+    /// --timeout-min: overrides the run's `timeout_min`
+    pub timeout_min: Option<i64>,
+}
+
+impl MultiLab {
+    fn new(cmd: &'static str, lab_file: &Path, config: Option<PathBuf>, run: Option<Run>, lab: Lab, opts: &RunOpts) -> Result<MultiLab> {
+        let (show, updates, wait_override, timeout_override) = (opts.show, opts.updates, opts.wait, opts.timeout_min);
+        let root = find_root()?;
+        let name = util::stem(util::basename(&lab_file.to_string_lossy())).to_string();
+        if !util::is_safe_name(&name) {
+            bail!("bad lab name {:?} (from {})", name, lab_file.display());
+        }
+        let mut vars = qemu::seed_vars(&root);
+        // the JSON lab carries its own admin password; keep WTL_PASSWORD only as the fallback
+        // Env still needs the WTL_* machinery, so build it from the seeded vars.
+        vars.insert("WTL_PASSWORD".into(), lab.admin_password.clone());
+        let env = Env::from_vars(&root, &vars)?;
+        let wtl_qmp = std::env::var("WTL_QMP").unwrap_or_default();
+        let qmp_tcp = match wtl_qmp.as_str() {
+            "tcp" => true,
+            "unix" => false,
+            "" => !cfg!(unix),
+            other => bail!("WTL_QMP={} must be tcp or unix", other),
+        };
+
+        let oslist = root.join("lib").join("oslist.conf");
+        let state = root.join("labs").join("state").join(&name);
+        std::fs::create_dir_all(&state).with_context(|| format!("cannot create {}", state.display()))?;
+
+        let wait_s = wait_override.or_else(|| run.as_ref().map(|r| r.wait)).unwrap_or(60);
+        let timeout_min = timeout_override.or_else(|| run.as_ref().map(|r| r.timeout_min)).unwrap_or(120);
+        if wait_s <= 0 {
+            bail!("--wait must be a positive integer");
+        }
+
+        // one Vm per machine, in lab order, with its resolved OS and its steps/mounts
+        let mut vms = Vec::new();
+        for (i, m) in lab.machines.iter().enumerate() {
+            let os = oslist::lookup(&oslist, &m.os)
+                .ok_or_else(|| anyhow!("{}: machine {}: unknown os {:?} (see lib/oslist.conf)", lab_file.display(), m.name, m.os))?;
+            if m.role == Role::Dc && os.kind != "server" {
+                bail!("{}: machine {}: os {} is a client OS and cannot be the domain controller", lab_file.display(), m.name, m.os);
+            }
+            let idx = 0x10 + i; // MAC/host-id suffix, DC/first = 0x10
+            vms.push(Vm {
+                name: m.name.clone(),
+                role: m.role,
+                os,
+                mem: m.mem.to_string(),
+                cpus: m.cpus.to_string(),
+                ip: m.ip.clone(),
+                mac: format!("52:54:00:4c:41:{:02x}", idx),
+                logon: m.logon.clone(),
+                steps: Vec::new(),
+                mounts: Vec::new(),
+            });
+        }
+        // distribute the run's steps to the machines they target (keeping per-machine order)
+        if let Some(r) = &run {
+            let mut counter: HashMap<String, i64> = HashMap::new();
+            for step in &r.steps {
+                for mname in &step.on {
+                    let n = counter.entry(mname.clone()).or_insert(0);
+                    *n += 1;
+                    let vm = vms.iter_mut().find(|v| &v.name == mname).expect("resolve checked targets");
+                    vm.steps.push((*n, step.clone()));
+                }
+            }
+            // each machine mounts only the drives its own steps use
+            for vm in &mut vms {
+                for (_, st) in &vm.steps {
+                    let letter = st.run[..1].to_uppercase();
+                    if letter == "C" {
+                        continue;
+                    }
+                    if !vm.mounts.iter().any(|(l, _)| *l == letter) {
+                        if let Some((_, host)) = r.mounts.iter().find(|(l, _)| *l == letter) {
+                            vm.mounts.push((letter, host.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        let now = Instant::now();
+        let limit = Duration::from_secs((timeout_min.max(0) as u64).saturating_mul(60));
+        Ok(MultiLab {
+            zero_done: state.join("0-state.json"),
+            root,
+            env,
+            vars,
+            updates,
+            cmd,
+            name,
+            lab_file: lab_file.to_path_buf(),
+            lab,
+            config,
+            show,
+            wait_s,
+            timeout_min,
+            state,
+            deadline: now.checked_add(limit).unwrap_or(now + Duration::from_secs(100 * 365 * 86400)),
+            vms,
+            offsets: HashMap::new(),
+            qmp_tcp,
+        })
+    }
+
+    fn st(&self, f: &str) -> PathBuf {
+        self.state.join(f)
+    }
+    fn zero_disk(&self, vm: &str) -> PathBuf {
+        self.st(&format!("{}-0.qcow2", vm))
+    }
+    fn run_disk(&self, vm: &str) -> PathBuf {
+        self.st(&format!("{}.qcow2", vm))
+    }
+    fn vm_names(&self) -> Vec<String> {
+        self.vms.iter().map(|v| v.name.clone()).collect()
+    }
+    fn vm(&self, name: &str) -> &Vm {
+        self.vms.iter().find(|v| v.name == name).expect("known vm")
+    }
+    fn dc_name(&self) -> String {
+        self.vms.iter().find(|v| v.role == Role::Dc).expect("one dc").name.clone()
+    }
+
+    // ---------------------------------------------------------------- QMP (per machine)
+
+    fn read_pid(&self, vm: &str) -> Option<u32> {
+        read_trim(&self.st(&format!("{}.pid", vm)))?.trim().parse().ok()
+    }
+    fn vm_pid(&self, vm: &str) -> Option<u32> {
+        self.read_pid(vm).filter(|p| sys::pid_alive(*p))
+    }
+
+    fn qmp_addr(&self, vm: &str) -> Addr {
+        if let Some(a) = read_trim(&self.st(&format!("{}.qmp.addr", vm))).filter(|a| !a.is_empty()) {
+            return Addr::parse(&a);
+        }
+        Addr::Unix(sock_path(self.st(&format!("{}.qmp", vm)), &format!("lab-{}-{}", self.name, vm)))
+    }
+
+    fn new_qmp_addr(&self, vm: &str) -> Result<Addr> {
+        let addr_file = self.st(&format!("{}.qmp.addr", vm));
+        if self.qmp_tcp {
+            let port = crate::lab::free_port().context("no free TCP port for QMP")?;
+            let a = Addr::Tcp(format!("127.0.0.1:{}", port));
+            write_file(&addr_file, format!("{}\n", a))?;
+            return Ok(a);
+        }
+        let _ = std::fs::remove_file(&addr_file);
+        let a = self.qmp_addr(vm);
+        if let Addr::Unix(p) = &a {
+            let _ = std::fs::remove_file(p);
+        }
+        Ok(a)
+    }
+
+    fn qmp(&self, vm: &str) -> Option<Qmp> {
+        Qmp::connect(&self.qmp_addr(vm), Duration::from_secs(10)).ok()
+    }
+    fn vm_status(&self, vm: &str) -> String {
+        self.qmp(vm).and_then(|mut q| q.status().ok()).unwrap_or_default()
+    }
+    fn qmp_quit(&self, vm: &str) -> bool {
+        self.qmp(vm).is_some_and(|mut q| q.quit().is_ok())
+    }
+    fn qmp_cmd(&self, vm: &str, name: &str) {
+        if let Some(mut q) = self.qmp(vm) {
+            let _ = q.cmd(name, None);
+        }
+    }
+    fn screendump(&self, vm: &str, out: &Path) -> bool {
+        self.qmp(vm).is_some_and(|mut q| q.screendump(out).is_ok())
+    }
+
+    // ---------------------------------------------------------------- waiting
+
+    fn interrupted(&self) -> anyhow::Error {
+        eprintln!();
+        warn(&format!("interrupted; VMs may still be running (lab status {} / lab restore {})", self.name, self.name));
+        Exit(2).into()
+    }
+    fn nap(&self, secs: f64) -> Result<()> {
+        if sys::nap(secs) {
+            Ok(())
+        } else {
+            Err(self.interrupted())
+        }
+    }
+    fn settle(&self, secs: f64) -> Result<()> {
+        if self.env.fast {
+            Ok(())
+        } else {
+            self.nap(secs)
+        }
+    }
+    fn remaining(&self) -> f64 {
+        self.deadline.saturating_duration_since(Instant::now()).as_secs_f64()
+    }
+
+    // ---------------------------------------------------------------- stop / restore / status
+
+    fn stop_vms(&self, hard: bool) -> Result<()> {
+        // members first, DC last (so the DC is still up while members log off)
+        let mut order = self.vm_names();
+        order.sort_by_key(|n| if self.vm(n).role == Role::Dc { 1 } else { 0 });
+        for vm in &order {
+            let Some(pid) = self.vm_pid(vm) else {
+                let _ = std::fs::remove_file(self.st(&format!("{}.pid", vm)));
+                continue;
+            };
+            if hard {
+                if !self.qmp_quit(vm) {
+                    sys::terminate(pid);
+                }
+            } else {
+                self.qmp_cmd(vm, "system_powerdown");
+            }
+        }
+        for vm in &order {
+            let Some(pid) = self.vm_pid(vm) else {
+                let _ = std::fs::remove_file(self.st(&format!("{}.pid", vm)));
+                continue;
+            };
+            let mut i = 0;
+            while sys::pid_alive(pid) && i < 900 {
+                if self.vm_status(vm) == "shutdown" {
+                    break;
+                }
+                self.nap(0.2)?;
+                i += 1;
+            }
+            if sys::pid_alive(pid) {
+                if i >= 900 {
+                    warn(&format!("{} did not power off in 3 min, stopping it hard", vm));
+                }
+                if !self.qmp_quit(vm) {
+                    sys::kill_hard(pid);
+                }
+                self.nap(1.0)?;
+            }
+            let _ = std::fs::remove_file(self.st(&format!("{}.pid", vm)));
+        }
+        Ok(())
+    }
+
+    fn restore(&self) -> Result<()> {
+        self.stop_vms(true)?;
+        for vm in self.vm_names() {
+            let _ = std::fs::remove_file(self.run_disk(&vm));
+        }
+        Ok(())
+    }
+
+    fn freeze_off(&self, vm: &str) -> Result<bool> {
+        let Some(pid) = self.read_pid(vm) else {
+            return Ok(true);
+        };
+        self.qmp_cmd(vm, "system_powerdown");
+        let mut i = 0;
+        while sys::pid_alive(pid) && i < 1800 {
+            if self.vm_status(vm) == "shutdown" {
+                break;
+            }
+            if i == 300 {
+                self.qmp_cmd(vm, "system_powerdown");
+            }
+            self.nap(0.2)?;
+            i += 1;
+        }
+        if !sys::pid_alive(pid) {
+            return Ok(true);
+        }
+        if self.vm_status(vm) != "shutdown" && i >= 1800 {
+            return Ok(false);
+        }
+        if !self.qmp_quit(vm) {
+            sys::terminate(pid);
+        }
+        let mut j = 0;
+        while sys::pid_alive(pid) && j < 50 {
+            self.nap(0.2)?;
+            j += 1;
+        }
+        Ok(true)
+    }
+
+    fn status(&self) {
+        println!("lab {} ({}): domain {}, {} machines", self.name, self.lab_file.display(), self.lab.domain, self.vms.len());
+        if self.zero_done.is_file() {
+            let z: ZeroState =
+                std::fs::read_to_string(&self.zero_done).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+            println!("  0 state: ready ({})", z.built_at);
+        } else {
+            println!("  0 state: not built yet (lab prepare {}, or just lab run ...)", self.name);
+        }
+        for v in &self.vms {
+            let role = if v.role == Role::Dc { "dc" } else { "member" };
+            let pid = match self.vm_pid(&v.name) {
+                Some(p) => format!("running (pid {}) {}", p, read_trim(&self.st(&format!("{}.vnc", v.name))).unwrap_or_default()),
+                None => "off".into(),
+            };
+            println!("  {:<15} {:<6} {:<7} {} {}", v.name, role, v.os.key, v.ip, pid);
+        }
+        if let Some(last) = self.last_run() {
+            println!("  last run: {}", last.display());
+        }
+    }
+
+    fn last_run(&self) -> Option<PathBuf> {
+        let p = self.st("last");
+        let md = std::fs::symlink_metadata(&p).ok()?;
+        if md.file_type().is_symlink() {
+            return Some(util::canon(&p));
+        }
+        read_trim(&p).map(|t| util::canon(&self.state.join(t)))
+    }
+
+    fn set_last_run(&self, rel: &str) {
+        let p = self.st("last");
+        let _ = std::fs::remove_file(&p);
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(rel, &p).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(rel, &p).is_ok();
+        #[cfg(not(any(unix, windows)))]
+        let made = false;
+        if !made {
+            let _ = std::fs::write(&p, format!("{}\n", rel));
+        }
+    }
+
+    fn dispatch(&mut self) -> Result<i32> {
+        match self.cmd {
+            "stop" => {
+                self.stop_vms(false)?;
+                ok(&format!("lab {} is off", self.name));
+                return Ok(0);
+            }
+            "restore" => {
+                self.restore()?;
+                ok(&format!("lab {} is back at its 0 state (VMs off; next run/up starts clean)", self.name));
+                return Ok(0);
+            }
+            "status" => {
+                self.status();
+                return Ok(0);
+            }
+            "rebuild" => {
+                self.restore()?;
+                for vm in self.vm_names() {
+                    let _ = std::fs::remove_file(self.zero_disk(&vm));
+                }
+                let _ = std::fs::remove_file(&self.zero_done);
+                ok(&format!("lab {}: 0 state deleted; the next run builds a new domain (Windows installs kept)", self.name));
+                return Ok(0);
+            }
+            _ => {}
+        }
+        self.env.check_tools()?;
+        sys::install_interrupt_handler();
+        self.run_lab()
+    }
+
+    // ---------------------------------------------------------------- discs
+
+    /// The Windows install a machine boots from: images/<os>-dc.qcow2 for the DC,
+    /// images/<os>-client.qcow2 for a member. Machines with the same OS and role share one.
+    fn base_image(&self, vm: &Vm) -> PathBuf {
+        self.env.images_dir.join(format!("{}.qcow2", base_name(vm)))
+    }
+
+    /// Install Windows for every missing base image (build-image.sh, in parallel; one build
+    /// per image even when several machines share it).
+    fn build_bases(&self) -> Result<()> {
+        let mut builds: Vec<BaseBuild> = Vec::new();
+        for vm in &self.vms {
+            let image = base_name(vm);
+            if self.base_image(vm).is_file() || builds.iter().any(|b| b.image == image) {
+                continue;
+            }
+            // the computer name baked into the image; the lab renames each machine to its key
+            let prefix = if vm.role == Role::Dc { "DC" } else { "CL" };
+            builds.push(BaseBuild::new(&image, &vm.os.key, &image, &format!("{}{}", prefix, vm.os.key).to_uppercase()));
+        }
+        build_base_images(&self.root, &self.vars, &self.state, &builds, self.updates, self.show, &|s| self.nap(s))?;
+        let missing: Vec<String> =
+            self.vms.iter().map(|v| self.base_image(v)).filter(|b| !b.is_file()).map(|b| b.display().to_string()).collect();
+        if !missing.is_empty() {
+            bail!("Windows install failed, missing {} (logs: {}/build-*.log)", missing.join(", "), self.state.display());
+        }
+        Ok(())
+    }
+
+    /// One read-only ISO per drive letter a machine mounts, label WTL<LETTER>.
+    fn make_mount_isos(&self, vm: &Vm) -> Result<Vec<PathBuf>> {
+        let mut isos = Vec::new();
+        for (letter, host) in &vm.mounts {
+            let src = PathBuf::from(host);
+            if !src.is_dir() {
+                bail!("mount source is not a directory: {} (drive {}: on {})", host, letter, vm.name);
+            }
+            let iso = self.st(&format!("mount-{}-{}.iso", vm.name, letter));
+            mkiso::make_iso(&src, &iso, &format!("WTL{}", letter)).with_context(|| format!("mkiso drive {}: for {}", letter, vm.name))?;
+            isos.push(iso);
+            log(&format!("  {} mount {}: <- {} ({})", vm.name, letter, host, util::human_size(util::disk_usage(&src))));
+        }
+        Ok(isos)
+    }
+
+    /// The control disc for one machine: LAB\lab.ps1 + LAB\labsvc.ps1 + LAB\lab.json.
+    fn make_cd(&self, vm: &Vm, out: &Path, build: bool) -> Result<()> {
+        let stage = self.st(&format!("cd-{}", vm.name));
+        let _ = std::fs::remove_dir_all(&stage);
+        let labdir = stage.join("LAB");
+        std::fs::create_dir_all(&labdir).with_context(|| format!("cannot create {}", labdir.display()))?;
+        for f in ["lab.ps1", "labsvc.ps1"] {
+            let src = self.root.join("guest").join(f);
+            std::fs::copy(&src, labdir.join(f)).with_context(|| format!("cannot copy {}", src.display()))?;
+        }
+        let role = if vm.role == Role::Dc { "dc" } else { "member" };
+        let (logon_user, logon_password) = match &vm.logon {
+            Some(u) => (u.as_str(), self.lab.users.iter().find(|x| &x.name == u).map(|x| x.password.as_str()).unwrap_or("")),
+            None => ("", ""),
+        };
+        let users: Vec<LabUser> = self
+            .lab
+            .users
+            .iter()
+            .map(|u| LabUser { name: &u.name, password: &u.password, groups: u.groups.iter().map(String::as_str).collect() })
+            .collect();
+
+        // the run block (only on a real run, never during the build or `up`)
+        let run = if !build && self.cmd == "run" && vm.has_steps() {
+            let mounts = vm.mounts.iter().map(|(l, h)| LabMount { host: h, letter: l }).collect();
+            let steps = vm
+                .steps
+                .iter()
+                .map(|(n, s)| {
+                    let (as_, user, password) = self.step_identity(vm, s);
+                    LabStep {
+                        n: *n,
+                        as_,
+                        user,
+                        password,
+                        path: &s.run,
+                        args: s.args.as_deref().unwrap_or(""),
+                        keep_running: s.keep_running,
+                        wait: s.wait.unwrap_or(self.wait_s),
+                    }
+                })
+                .collect();
+            Some(LabRun { mounts, steps, wait: self.wait_s })
+        } else {
+            None
+        };
+
+        let j = LabJson {
+            fmt: "multi",
+            role,
+            machine: &vm.name,
+            ip: &vm.ip,
+            prefix: 24,
+            dc_ip: &self.vm(&self.dc_name()).ip,
+            lan_mac: &vm.mac,
+            domain: &self.lab.domain,
+            netbios: &self.lab.netbios,
+            admin_password: &self.lab.admin_password,
+            users,
+            logon_user,
+            logon_password,
+            shutdown_when_ready: build && vm.role != Role::Dc,
+            run,
+        };
+        write_file(&labdir.join("lab.json"), pyjson::dumps_indent(&j, 1))?;
+        mkiso::make_iso(&stage, out, "WTL_LAB").with_context(|| format!("mkiso {} failed", vm.name))?;
+        let _ = std::fs::remove_dir_all(&stage);
+        Ok(())
+    }
+
+    /// How a step runs on a machine: ("system"|"logon"|"user", user, password). A user that
+    /// equals the machine's own logon user is "logon" (its foreground session); any other is
+    /// "user", launched by the SYSTEM worker with that account's credentials.
+    fn step_identity<'a>(&'a self, vm: &'a Vm, s: &'a RunStep) -> (&'a str, &'a str, &'a str) {
+        match &s.as_ {
+            StepAs::System => ("system", "", ""),
+            StepAs::Logon => ("logon", "", ""),
+            StepAs::User(u) => {
+                if vm.logon.as_deref() == Some(u.as_str()) {
+                    ("logon", "", "")
+                } else {
+                    let pw = self.lab.users.iter().find(|x| &x.name == u).map(|x| x.password.as_str()).unwrap_or("");
+                    ("user", u.as_str(), pw)
+                }
+            }
+        }
+    }
+
+    fn uefi_vars(&self, vm: &Vm) -> Result<Option<PathBuf>> {
+        if vm.os.firmware != "uefi" {
+            return Ok(None);
+        }
+        let vars = self.st(&format!("{}-OVMF_VARS.fd", vm.name));
+        if !vars.is_file() {
+            std::fs::copy(&self.env.ovmf_vars, &vars).with_context(|| {
+                format!("cannot copy the UEFI vars template {} (install 'ovmf' or set WTL_OVMF_VARS)", self.env.ovmf_vars.display())
+            })?;
+        }
+        Ok(Some(vars))
+    }
+
+    // ---------------------------------------------------------------- boot
+
+    fn qemu_img_create(&self, backing: &Path, out: &Path) -> Result<()> {
+        use std::process::{Command, Stdio};
+        let st = Command::new(&self.env.qemu_img)
+            .args(["create", "-f", "qcow2", "-F", "qcow2", "-b"])
+            .arg(backing)
+            .arg(out)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .status();
+        match st {
+            Ok(s) if s.success() => Ok(()),
+            _ => bail!("qemu-img create {} failed", out.display()),
+        }
+    }
+
+    fn start_vm(&self, vm: &Vm, disk: PathBuf, cds: Vec<PathBuf>) -> Result<()> {
+        let mut o = Opts {
+            name: format!("lab-{}-{}", self.name, vm.name),
+            mem: vm.mem.clone(),
+            cpus: Some(vm.cpus.clone()),
+            disk,
+            cds,
+            lan: Some(Lan { group: LAN_GROUP.into(), port: self.lab.lan_port }),
+            lan_mac: Some(vm.mac.clone()),
+            // the DC is isolated (no internet); members keep user-mode NAT
+            no_usernet: vm.role == Role::Dc,
+            no_shutdown: true,
+            uefi: self.uefi_vars(vm)?,
+            ..Default::default()
+        };
+        o.qmp = Some(self.new_qmp_addr(&vm.name)?);
+        let serial = self.st(&format!("{}.serial.log", vm.name));
+        write_file(&serial, b"")?;
+        o.serial = Some(serial);
+        if self.show {
+            o.show = true;
+        } else {
+            o.vnc = Some(pick_vnc_display().context("no free VNC display (ports 5900-5999 all in use)")?);
+        }
+        let argv = qemu::command(&self.env, &o)?;
+        let pid = qemu::start(&argv, &self.st(&format!("{}.qemu.log", vm.name)))
+            .with_context(|| format!("qemu ({}) failed to start", vm.name))?;
+        write_file(&self.st(&format!("{}.pid", vm.name)), format!("{}\n", pid))?;
+        let vnc = match o.vnc {
+            Some(n) => format!("VNC 127.0.0.1:{}", 5900 + n),
+            None => "window".to_string(),
+        };
+        write_file(&self.st(&format!("{}.vnc", vm.name)), format!("{}\n", vnc))?;
+        log(&format!("  {} started ({})", vm.name, vnc));
+        Ok(())
+    }
+
+    /// Boot every machine (DC first so its LAN endpoint and DNS come up before members).
+    fn boot_lab(&mut self, build: bool) -> Result<()> {
+        self.offsets.clear();
+        // DC first, then members in lab order
+        let mut order = self.vm_names();
+        order.sort_by_key(|n| if self.vm(n).role == Role::Dc { 0 } else { 1 });
+        for (i, name) in order.iter().enumerate() {
+            let vm_idx = self.vms.iter().position(|v| &v.name == name).unwrap();
+            let (disk, cd, mut cds) = {
+                let vm = &self.vms[vm_idx];
+                let cd = self.st(&format!("{}.iso", vm.name));
+                // the build writes the domain straight into the frozen 0-state disk; a run
+                // writes to a throwaway overlay on top of it
+                let disk = if build { self.zero_disk(&vm.name) } else { self.run_disk(&vm.name) };
+                (disk, cd.clone(), vec![cd])
+            };
+            self.make_cd(&self.vms[vm_idx], &cd, build)?;
+            // mount discs only matter on a real run
+            if !build && self.cmd == "run" {
+                cds.extend(self.make_mount_isos(&self.vms[vm_idx])?);
+            }
+            self.start_vm(&self.vms[vm_idx], disk, cds)?;
+            if i == 0 {
+                self.settle(1.0)?; // let the DC's multicast endpoint come up first
+            }
+        }
+        Ok(())
+    }
+
+    fn serial_wait(&mut self, vm: &str, until: &[&str], fail: &[&str], timeout: f64) -> Result<Outcome> {
+        let mut off = self.offsets.get(vm).copied().unwrap_or(0);
+        let w = Wait { until, fail, timeout: Some(timeout), pid: self.read_pid(vm), progress: true, events_file: None };
+        let o = w.run(&self.st(&format!("{}.serial.log", vm)), &mut off);
+        self.offsets.insert(vm.to_string(), off);
+        if o == Outcome::Interrupted {
+            return Err(self.interrupted());
+        }
+        Ok(o)
+    }
+
+    fn reset_if_off(&self, vm: &str) -> bool {
+        let st = self.vm_status(vm);
+        if st == "shutdown" || st == "guest-panicked" {
+            warn(&format!("{} powered off on a reboot request; resetting it", vm));
+            self.qmp_cmd(vm, "system_reset");
+            return true;
+        }
+        false
+    }
+
+    /// Wait for one event on a machine's serial log (polling the power state so a guest that
+    /// powered off mid-wait is reset and the wait continues).
+    fn wait_ev(&mut self, vm: &str, until: &str, fail: &str, label: &str) -> Result<String> {
+        let u: Vec<&str> = until.split(',').collect();
+        let f: Vec<&str> = fail.split(',').collect();
+        loop {
+            let r = self.remaining().clamp(1.0, 30.0);
+            match self.serial_wait(vm, &u, &f, r)? {
+                Outcome::Until(line) => return Ok(line),
+                Outcome::Timeout => {
+                    self.reset_if_off(vm);
+                    if Instant::now() >= self.deadline {
+                        return Err(self.fail(vm, Outcome::Timeout, label));
+                    }
+                }
+                other => return Err(self.fail(vm, other, label)),
+            }
+        }
+    }
+
+    fn fail(&self, vm: &str, o: Outcome, label: &str) -> anyhow::Error {
+        match &o {
+            Outcome::Fail(line) => err(&format!("{}: {} reported: {}", label, vm, line)),
+            Outcome::Timeout => err(&format!("{}: timeout (--timeout-min {})", label, self.timeout_min)),
+            Outcome::Exited => {
+                err(&format!("{}: the {} VM exited", label, vm));
+                indent_file(&self.st(&format!("{}.qemu.log", vm)));
+            }
+            _ => err(&format!("{}: serial wait error", label)),
+        }
+        if self.vm_pid(vm).is_some() {
+            let png = self.st(&format!("{}-fail.png", vm));
+            if self.screendump(vm, &png) {
+                log(&format!("screenshot: {}", png.display()));
+            }
+        }
+        log(&format!(
+            "logs: {} (guest: C:\\WTL\\agent.log); the VMs keep running - lab restore {}",
+            self.st(&format!("{}.serial.log", vm)).display(),
+            self.name
+        ));
+        Exit(if o == Outcome::Timeout { 3 } else { 2 }).into()
+    }
+
+    fn wait_logon(&mut self, vm: &str, label: &str) -> Result<()> {
+        for attempt in 1..=3 {
+            let t = self.remaining().clamp(1.0, 300.0);
+            match self.serial_wait(vm, &["AGENT_START"], &["LAB_FAIL"], t)? {
+                Outcome::Until(_) => return Ok(()),
+                Outcome::Timeout if Instant::now() >= self.deadline => return Err(self.fail(vm, Outcome::Timeout, label)),
+                Outcome::Timeout => {}
+                other => return Err(self.fail(vm, other, label)),
+            }
+            if !self.reset_if_off(vm) {
+                warn(&format!("{}: no logon within 5 min (autologon stuck?) - resetting it ({}/3)", vm, attempt));
+                self.qmp_cmd(vm, "system_reset");
+            }
+        }
+        self.wait_ev(vm, "AGENT_START", "LAB_FAIL", label).map(|_| ())
+    }
+
+    // ---------------------------------------------------------------- 0 state
+
+    fn prepare(&mut self) -> Result<()> {
+        if self.zero_done.is_file() {
+            return Ok(());
+        }
+        log(&format!("=== building the 0 state of lab {} (domain {}; {} machines, once) ===", self.name, self.lab.domain, self.vms.len()));
+        self.restore()?;
+        self.build_bases()?;
+        for vm in self.vm_names() {
+            // the frozen 0-state disk is an overlay on the (read-only) base image; the build
+            // boots it directly so the domain/join is baked into the 0 state
+            let base = self.base_image(self.vm(&vm));
+            let _ = std::fs::remove_file(self.zero_disk(&vm));
+            self.qemu_img_create(&base, &self.zero_disk(&vm))?;
+        }
+        self.boot_lab(true)?;
+        let dc = self.dc_name();
+        log("creating the domain (DC: AD DS + forest + users, one reboot)");
+        let line = self.wait_ev(&dc, "LAB_DC_READY", "LAB_FAIL,ERROR", "domain controller")?;
+        ok(&format!("DC ready: {}", line));
+        // members: join, reboot, autologon, ready, then idle (shutdown_when_ready)
+        let members: Vec<String> = self.vms.iter().filter(|v| v.role == Role::Member).map(|v| v.name.clone()).collect();
+        for m in &members {
+            log(&format!("joining {} (one reboot, then autologon)", m));
+            self.wait_ev(m, "LAB_JOINED", "LAB_FAIL,ERROR", &format!("{} domain join", m))?;
+        }
+        for m in &members {
+            self.wait_logon(m, &format!("{} logon after the join", m))?;
+            let line = self.wait_ev(m, "LAB_CLIENT_READY", "LAB_FAIL,ERROR", m)?;
+            ok(&format!("{} ready: {}", m, line));
+            self.wait_ev(m, "LAB_IDLE", "LAB_FAIL,ERROR", m)?;
+        }
+        self.settle(20.0)?; // let first logons finish (profile, group policy) before the freeze
+                            // power off: members first, DC last
+        let mut order = self.vm_names();
+        order.sort_by_key(|n| if self.vm(n).role == Role::Dc { 1 } else { 0 });
+        for vm in &order {
+            log(&format!("shutting {} down cleanly", vm));
+            if !self.freeze_off(vm)? {
+                bail!("{} did not power off; 0 state not saved (lab rebuild {}, then retry)", vm, self.name);
+            }
+            let _ = std::fs::remove_file(self.st(&format!("{}.pid", vm)));
+            let _ = std::fs::remove_file(self.st(&format!("{}.iso", vm)));
+        }
+        let done = ZeroState {
+            lab: self.name.clone(),
+            built_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
+            machines: self.vm_names(),
+        };
+        write_file(&self.zero_done, pyjson::dumps(&done))?;
+        ok(&format!("0 state saved for lab {} ({} machines)", self.name, self.vms.len()));
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------- run / up
+
+    fn summary(&self) {
+        eprintln!();
+        eprintln!("  lab {}: domain {}", self.name, self.lab.domain);
+        for v in &self.vms {
+            let who = match &v.logon {
+                Some(u) => format!("logon {}\\{}", self.lab.netbios, u),
+                None => format!("{}\\Administrator", self.lab.netbios),
+            };
+            let role = if v.role == Role::Dc { "DC    " } else { "member" };
+            eprintln!(
+                "    {} {:<15} {}  {}  {}",
+                role,
+                v.name,
+                v.ip,
+                read_trim(&self.st(&format!("{}.vnc", v.name))).unwrap_or_default(),
+                who
+            );
+        }
+        eprintln!("  back to the 0 state: lab restore {}      another run: lab run CONFIG", self.name);
+    }
+
+    fn run_lab(&mut self) -> Result<i32> {
+        let run_id = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        self.prepare()?;
+        if self.cmd == "prepare" {
+            return Ok(0);
+        }
+        let res = self.state.join("runs").join(&run_id);
+        if self.cmd == "run" {
+            std::fs::create_dir_all(&res).with_context(|| format!("cannot create {}", res.display()))?;
+            self.set_last_run(&format!("runs/{}", run_id));
+        }
+        self.restore()?;
+        for vm in self.vm_names() {
+            self.qemu_img_create(&self.zero_disk(&vm), &self.run_disk(&vm))?;
+        }
+        // clear old mount discs
+        if let Ok(rd) = std::fs::read_dir(&self.state) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n.starts_with("mount-") && n.ends_with(".iso") {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        log(&format!("lab {}: booting {} machines from the 0 state", self.name, self.vms.len()));
+        self.boot_lab(false)?;
+        let dc = self.dc_name();
+        self.wait_ev(&dc, "LAB_DC_READY", "LAB_FAIL,ERROR", "domain controller")?;
+        ok("DC ready");
+        let members: Vec<String> = self.vms.iter().filter(|v| v.role == Role::Member).map(|v| v.name.clone()).collect();
+        for m in &members {
+            self.wait_logon(m, &format!("{} logon", m))?;
+            self.wait_ev(m, "LAB_CLIENT_READY", "LAB_FAIL,ERROR", m)?;
+            ok(&format!("{} ready", m));
+        }
+        if self.cmd == "up" {
+            self.summary();
+            return Ok(0);
+        }
+
+        // ---- config run: each machine with steps runs them and reports; multiplex the waits
+        let config = self.config.clone().unwrap_or_default();
+        let config_name = config.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        log(&format!("running {} (steps on {} machine(s))", config_name, self.vms.iter().filter(|v| v.has_steps()).count()));
+        let (status, step_results) = self.run_steps()?;
+
+        // decode each machine's output into runs/<id>/<machine>/
+        for v in &self.vms {
+            if !v.has_steps() {
+                continue;
+            }
+            let dir = res.join(&v.name);
+            let _ = std::fs::create_dir_all(&dir);
+            let serial = self.st(&format!("{}.serial.log", v.name));
+            let _ = outputs::decode(&serial, &dir);
+            let _ = std::fs::copy(&serial, dir.join("serial.log"));
+            let _ = self.screendump(&v.name, &dir.join("screen.png"));
+        }
+        self.settle(2.0)?;
+        if !config.as_os_str().is_empty() {
+            let _ = std::fs::copy(&config, res.join("config.json"));
+        }
+        // runs/<id>/result.json: every step with machine, user, exit, expect, duration
+        let summary = RunResult {
+            lab: self.name.clone(),
+            config: config_name.clone(),
+            run_id: run_id.clone(),
+            status: if status == 0 { "ok" } else { "failed" }.to_string(),
+            steps: step_results,
+        };
+        if let Ok(j) = serde_json::to_string_pretty(&summary) {
+            let _ = write_file(&res.join("result.json"), format!("{}\n", j));
+        }
+        self.summary();
+        eprintln!("  config: {}  ->  {}", config_name, if status == 0 { "ALL STEPS OK" } else { "A STEP FAILED" });
+        eprintln!("  results: {} (per machine: <name>/step*.txt, screen.png; result.json = summary)", res.display());
+        Ok(status)
+    }
+
+    /// Wait for every machine-with-steps to reach LAB_RUN_DONE, reporting LAB_STEP lines as
+    /// they arrive. The machines run concurrently, so poll each in a short round-robin slice.
+    fn run_steps(&mut self) -> Result<(i32, Vec<StepResult>)> {
+        let mut pending: Vec<String> = self.vms.iter().filter(|v| v.has_steps()).map(|v| v.name.clone()).collect();
+        if pending.is_empty() {
+            ok("no steps");
+            return Ok((0, Vec::new()));
+        }
+        let mut status = 0;
+        let mut results: Vec<StepResult> = Vec::new();
+        while !pending.is_empty() {
+            let mut still = Vec::new();
+            for vm in pending.clone() {
+                if Instant::now() >= self.deadline {
+                    return Err(self.fail(&vm, Outcome::Timeout, "config run"));
+                }
+                // a short slice per machine so all progress roughly together
+                match self.serial_wait(&vm, &["LAB_RUN_DONE", "LAB_STEP"], &["LAB_FAIL", "ERROR"], 2.0)? {
+                    Outcome::Until(line) if line.contains("LAB_RUN_DONE") => {
+                        ok(&format!("[{}] all steps done", vm));
+                    }
+                    Outcome::Until(line) => {
+                        // a LAB_STEP line: report it, keep waiting on this machine
+                        results.push(self.report_step(&vm, &line, &mut status));
+                        still.push(vm);
+                    }
+                    Outcome::Timeout => {
+                        self.reset_if_off(&vm);
+                        still.push(vm);
+                    }
+                    other => return Err(self.fail(&vm, other, "config run")),
+                }
+            }
+            pending = still;
+        }
+        // stable order: by machine, then step number
+        results.sort_by(|a, b| a.machine.cmp(&b.machine).then(a.n.cmp(&b.n)));
+        Ok((status, results))
+    }
+
+    /// Report one LAB_STEP line and return its record; mark the run failed if exit != expect_exit.
+    fn report_step(&self, vm: &str, line: &str, status: &mut i32) -> StepResult {
+        let ev = outputs::parse_event(line);
+        let g = |k: &str| ev.as_ref().and_then(|e| e.get(k)).unwrap_or("").to_string();
+        let (n, script, exit) = (g("n"), g("script"), g("exit"));
+        // which host-side step is this (per-machine 1-based index) -> its expect_exit
+        let expect =
+            util::py_int(&n).and_then(|idx| self.vm(vm).steps.iter().find(|(i, _)| *i == idx)).map(|(_, s)| s.expect_exit).unwrap_or(0);
+        let who = g("as");
+        let ok_exit = util::py_int(&exit) == Some(expect) || (exit == "running" && self.step_keeps_running(vm, &n));
+        if ok_exit {
+            ok(&format!("[{} {}] {} -> exit {}", vm, who, script, exit));
+        } else {
+            err(&format!("[{} {}] {} -> exit {} (want {})", vm, who, script, exit, expect));
+            *status = 1;
+        }
+        StepResult {
+            machine: vm.to_string(),
+            user: who,
+            n: util::py_int(&n).unwrap_or(0),
+            script,
+            exit,
+            expect_exit: expect,
+            secs: g("secs").parse().unwrap_or(0.0),
+            ok: ok_exit,
+        }
+    }
+
+    fn step_keeps_running(&self, vm: &str, n: &str) -> bool {
+        util::py_int(n).and_then(|idx| self.vm(vm).steps.iter().find(|(i, _)| *i == idx)).map(|(_, s)| s.keep_running).unwrap_or(false)
+    }
+}
+
+// --------------------------------------------------------------- loading / routing
+
+/// Load + resolve a lab JSON file.
+pub fn load_lab(path: &Path) -> Result<Lab> {
+    labdef::LabDef::load(path)
+}
+
+/// Resolve the run file against its lab (found at `labs/<lab>.json` under the root). Returns the
+/// lab file path, the resolved lab, and the resolved run.
+pub fn load_run(config: &Path) -> Result<(PathBuf, Lab, Run)> {
+    let root = find_root()?;
+    let text = std::fs::read_to_string(config).map_err(|e| anyhow!("{}: {}", config.display(), e))?;
+    let def = labdef::RunDef::parse(&text, &config.display().to_string())?;
+    let lab_file = root.join("labs").join(format!("{}.json", def.lab));
+    if !lab_file.is_file() {
+        bail!("{}: lab {:?} not found ({} missing)", config.display(), def.lab, lab_file.display());
+    }
+    let lab = labdef::LabDef::load(&lab_file)?;
+    let base_dir = util::abspath(config).parent().unwrap_or(Path::new(".")).to_path_buf();
+    let host_resolve = |h: &str| {
+        let p = Path::new(h);
+        if p.is_absolute() {
+            util::normpath(p).to_string_lossy().into_owned()
+        } else {
+            util::normpath(&base_dir.join(p)).to_string_lossy().into_owned()
+        }
+    };
+    let default_name = util::stem(util::basename(&config.to_string_lossy())).to_string();
+    let run = def.resolve(&config.display().to_string(), &default_name, &lab, host_resolve)?;
+    Ok((lab_file, lab, run))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lan_group_is_admin_scoped() {
+        assert!(LAN_GROUP.starts_with("239."));
+    }
+}
