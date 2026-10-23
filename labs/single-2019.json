@@ -1,0 +1,9 @@
+{
+  "$schema": "../wtl-rs/schema/lab.schema.json",
+  "machines": {
+    "WS2019": { "os": "2019", "logon": "tester" }
+  },
+  "users": {
+    "tester": { "password": "Test!2026" }
+  }
+}

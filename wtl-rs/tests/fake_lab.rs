@@ -141,6 +141,8 @@ struct Machine {
     serial: Option<PathBuf>,
     qmp: Option<String>,
     no_shutdown: bool,
+    /// the VM has a lab LAN NIC (-netdev dgram,id=lan0)
+    lan: bool,
 }
 
 struct Shared {
@@ -183,6 +185,7 @@ fn fake_qemu(args: &[String]) -> i32 {
             }
             "-serial" => m.serial = v.strip_prefix("file:").map(PathBuf::from),
             "-qmp" => m.qmp = Some(split_opts(&v)[0].clone()),
+            "-netdev" if v.starts_with("dgram,id=lan0") => m.lan = true,
             _ => {}
         }
     }
@@ -388,7 +391,15 @@ impl Guest {
     fn run_multi(&mut self, m: &Machine, cfg: &Value) -> Result<(), String> {
         let role = s(cfg, "role").to_string();
         let machine = s(cfg, "machine").to_string();
-        let user = format!("{}%5C{}", s(cfg, "netbios"), s(cfg, "logon_user"));
+        // like guest/lab.ps1: DOMAIN\user in AD mode, MACHINE\user (a local account) in a
+        // workgroup; Administrator when the machine has no logon user
+        let realm = if s(cfg, "mode") == "workgroup" { machine.clone() } else { s(cfg, "netbios").to_string() };
+        let logon = if s(cfg, "logon_user").is_empty() { "Administrator" } else { s(cfg, "logon_user") };
+        let user = format!("{}%5C{}", realm, logon);
+        // a workgroup machine without a lab LAN must not get a lab NIC
+        if !cfg.get("lan").and_then(Value::as_bool).unwrap_or(true) && m.lan {
+            return Err(format!("{}: lab.json says lan=false but QEMU got a lab NIC", machine));
+        }
         self.emit(&format!("WTL AGENT_START os=fake build=17763 machine={}", machine));
         if role == "dc" {
             let is_run = cfg.get("run").map(|r| !r.is_null()).unwrap_or(false);
@@ -578,6 +589,38 @@ impl Ctx {
             port = free_port()
         );
         std::fs::write(root.join("labs/fresh.json"), fresh).unwrap();
+        // workgroup mode: one machine, local users, no lab LAN
+        std::fs::write(
+            root.join("labs/solo.json"),
+            r#"{ "machines": { "WS1": { "os": "2019", "logon": "tester" } },
+  "users": { "tester": { "password": "Test!2026" }, "admin2": { "password": "Admin2!2026", "groups": ["Administrators"] } } }
+"#,
+        )
+        .unwrap();
+        // a lab carried by a project, outside win-test-lab: a 2016 DC (any Server may be the
+        // DC) + a 2019 member server, referred to by path from the project's run file
+        let proj = tmp.join("proj/wintest");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("lab.json"),
+            format!(
+                r#"{{ "domain": "corp.test", "netbios": "CORP",
+  "network": {{ "subnet": "10.77.96", "lan_port": {port} }},
+  "machines": {{ "DC1": {{ "os": "2012", "role": "dc" }}, "SRV1": {{ "os": "2019" }} }} }}
+"#,
+                port = free_port()
+            ),
+        )
+        .unwrap();
+        std::fs::write(proj.join("smoke.ps1"), "Write-Host smoke\r\nFAKE_EXIT=0\r\n").unwrap();
+        std::fs::write(
+            proj.join("run.json"),
+            r#"{ "lab": "./lab.json", "mount": { "X": "." },
+  "steps": [ { "on": "SRV1", "as": "system", "run": "X:/smoke.ps1" }, { "on": "DC1", "as": "system", "run": "X:/smoke.ps1" } ] }
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("images/2012-dc.qcow2"), "QFI\u{fb} fake base image\n").unwrap();
         let fake_build = "#!/bin/sh\n\
              # fake build-image.sh: OS --name NAME --computer-name CN [--no-updates] [--show]\n\
              echo \"$*\" >> \"$WTL_IMAGES_DIR/build-calls.log\"\n\
@@ -785,7 +828,7 @@ fn driver(args: &[String]) -> i32 {
         let i = run(cx, outs, &["status", "nope"], &[]);
         c.code(&outs[i].1, 2);
         c.has(&outs[i].1, "no lab ");
-        c.has(&outs[i].1, "(labs: fresh tri)");
+        c.has(&outs[i].1, "(labs: fresh solo tri)");
         // usage errors: clap's wording, exit 2
         let i = run(cx, outs, &["frobnicate", "tri"], &[]);
         c.code(&outs[i].1, 2);
@@ -1139,6 +1182,109 @@ fn driver(args: &[String]) -> i32 {
         c.code(&outs[i].1, 0);
         c.lacks(&outs[i].1, "installing Windows");
         let _ = run(cx, outs, &["restore", "fresh"], &[]);
+    });
+
+    scenario(&mut cx, "workgroup mode: one machine, local users, no lab LAN", &|cx, c, outs| {
+        let conf = cx.cfg(
+            "solo.json",
+            "{ \"lab\": \"solo\", \"mount\": { \"X\": \"../app\" }, \"steps\": [\n\
+               { \"as\": \"system\", \"run\": \"X:/setup.bat\" },\n\
+               { \"run\": \"X:/smoke.exe\" },\n\
+               { \"as\": \"admin2\", \"run\": \"X:/smoke.exe\" } ] }\n",
+        );
+        let i = run(cx, outs, &["run", &conf], &[]);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        for needle in [
+            "=== building the 0 state of lab solo (workgroup; 1 machines, once) ===",
+            "setting up WS1 (one reboot, then autologon)",
+            "WS1 ready: WTL LAB_CLIENT_READY user=WS1%5Ctester",
+            "[WS1 system] X:\\setup.bat -> exit 0",
+            "[WS1 logon] X:\\smoke.exe -> exit 0",
+            "[WS1 user] X:\\smoke.exe -> exit 0",
+            "  lab solo: workgroup",
+            "    single WS1             (NAT only)",
+            "logon WS1\\tester",
+            "config: solo.json  ->  ALL STEPS OK",
+        ] {
+            c.has(o, needle);
+        }
+        c.lacks(o, "DC ready");
+        let st = cx.state("solo");
+        let iso = IsoReader::open(&st.join("WS1.iso"), true).unwrap();
+        let j: Value = serde_json::from_slice(iso.read("LAB/lab.json").unwrap()).unwrap();
+        c.ok(
+            s(&j, "mode") == "workgroup" && j["lan"] == json!(false) && s(&j, "domain").is_empty() && s(&j, "dc_ip").is_empty(),
+            format!("lab.json {}", j),
+        );
+        c.ok(s(&j, "admin_password") == "WinTest!2026", "default admin password");
+        let step3 = j["run"]["steps"].as_array().unwrap().iter().find(|x| x["n"] == json!(3)).cloned().unwrap_or(Value::Null);
+        c.ok(step3["as_"] == json!("user") && step3["user"] == json!("admin2"), format!("step 3 {}", step3));
+        // QEMU: user-mode NAT, no lab NIC
+        let argv = std::fs::read_to_string(&cx.fake_log).unwrap_or_default();
+        let line = argv.lines().rfind(|l| l.contains("lab-solo-WS1")).unwrap_or("").replace('\u{1f}', " ");
+        c.ok(line.contains("user,id=net0") && !line.contains("lan0"), format!("WS1 argv: {}", line));
+        let i = run(cx, outs, &["status", "solo"], &[]);
+        c.has(&outs[i].1, "lab solo (");
+        c.has(&outs[i].1, "workgroup, 1 machines");
+        c.has(&outs[i].1, "  WS1             single 2019    - running");
+        let i = run(cx, outs, &["restore", "solo"], &[]);
+        c.code(&outs[i].1, 0);
+    });
+
+    scenario(&mut cx, "a project's own lab file: a 2012 DC + a 2019 member server", &|cx, c, outs| {
+        let conf = cx.tmp.join("proj/wintest/run.json").to_string_lossy().into_owned();
+        let i = run(cx, outs, &["run", &conf], &[]);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        c.has(o, "(domain corp.test; 2 machines, once)");
+        c.has(o, "[SRV1 system] X:\\smoke.ps1 -> exit 0");
+        c.has(o, "[DC1 system] X:\\smoke.ps1 -> exit 0");
+        // a member without a logon user logs on as the domain Administrator
+        c.has(o, "SRV1            10.77.96.20");
+        c.has(o, "CORP\\Administrator");
+        // the state is named after the file + a hash of its path (not just "lab")
+        let states: Vec<String> = std::fs::read_dir(cx.root.join("labs/state"))
+            .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        let st = states.iter().find(|n| n.starts_with("lab-") && n.len() == 12).cloned();
+        c.ok(st.is_some(), format!("no lab-<hash> state dir: {:?}", states));
+        if let Some(st) = st {
+            let dir = cx.root.join("labs/state").join(&st);
+            c.file(&dir.join("DC1-0.qcow2"));
+            c.has(o, &format!("lab restore {}", st));
+            // a 2012 DC and a 2019 member: images 2012-dc and 2019-client
+            c.content(
+                &dir.join("DC1-0.qcow2"),
+                format!("QFI\u{fb} fake qcow2 backing={}\n", cx.root.join("images/2012-dc.qcow2").display()).as_bytes(),
+            );
+            c.content(
+                &dir.join("SRV1-0.qcow2"),
+                format!("QFI\u{fb} fake qcow2 backing={}\n", cx.root.join("images/2019-client.qcow2").display()).as_bytes(),
+            );
+        }
+        // the project file is also accepted where a LAB goes
+        let i = run(cx, outs, &["restore", &conf], &[]);
+        c.code(&outs[i].1, 0);
+        c.ok(cx.live_fakes().is_empty(), format!("still running: {:?}", cx.live_fakes()));
+    });
+
+    scenario(&mut cx, "domain set without a DC is rejected before boot", &|cx, c, outs| {
+        let lab = cx.tmp.join("proj/nodc.json");
+        std::fs::write(&lab, r#"{ "domain": "x.test", "netbios": "X", "machines": { "A": { "os": "2019" } } }"#).unwrap();
+        let conf = cx.cfg(
+            "nodc-run.json",
+            &format!("{{ \"lab\": \"{}\", \"steps\": [ {{ \"as\": \"system\", \"run\": \"C:/x.bat\" }} ] }}", lab.display()),
+        );
+        let i = run(cx, outs, &["run", &conf], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "domain/netbios is set but no machine has role \"dc\"");
+        let missing =
+            cx.cfg("missing-run.json", "{ \"lab\": \"./nope/lab.json\", \"steps\": [ { \"as\": \"system\", \"run\": \"C:/x.bat\" } ] }");
+        let i = run(cx, outs, &["run", &missing], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "lab \"./nope/lab.json\" not found");
+        c.ok(cx.live_fakes().is_empty(), "a VM was started");
     });
 
     scenario(&mut cx, "JSON lab: unknown field is rejected before boot", &|cx, c, outs| {

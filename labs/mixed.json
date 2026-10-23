@@ -1,0 +1,14 @@
+{
+  "$schema": "../wtl-rs/schema/lab.schema.json",
+  "domain": "lab.local",
+  "netbios": "LAB",
+  "network": { "subnet": "10.77.40", "lan_port": 47040 },
+  "machines": {
+    "DC1":  { "os": "2012", "role": "dc" },
+    "SRV1": { "os": "2019", "logon": "operator" }
+  },
+  "users": {
+    "operator": { "password": "Oper!2026", "groups": ["Domain Admins"] },
+    "appuser":  { "password": "AppUser!2026" }
+  }
+}

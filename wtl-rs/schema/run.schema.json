@@ -15,7 +15,7 @@
       ]
     },
     "lab": {
-      "description": "The lab to boot: `labs/<lab>.json`.",
+      "description": "The lab to boot: a name (`labs/<lab>.json` in win-test-lab, e.g. `school`) or a path to a lab file, relative to this run file (e.g. `./lab.json`). A value with a `/` or `\\` or ending in `.json` is a path.",
       "type": "string"
     },
     "name": {
