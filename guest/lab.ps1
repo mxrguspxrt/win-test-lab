@@ -192,6 +192,199 @@ function New-LabLocalUsers($Cfg) {
     }
 }
 
+# ---------------------------------------------------------------- roles / features / setup
+#
+# Baked into the 0 state during the build. A member installs these in the "configure" phase,
+# logged on as the domain (or local) Administrator; the DC installs them inline after it has
+# created the users (it is already the domain Administrator). ad-ds is the DC promotion itself
+# and is skipped here. An unknown feature fails the build with the available list.
+
+function Measure-LabList($List) {
+    if ($List -eq $null) { return 0 }
+    return @($List | Where-Object { $_ -ne $null }).Count
+}
+
+# True if this machine has build-time configuration (roles, features or setup scripts) to apply.
+function Test-LabHasConfig($Cfg) {
+    return ((Measure-LabList $Cfg.roles) -gt 0 -or (Measure-LabList $Cfg.features) -gt 0 -or (Measure-LabList $Cfg.setup) -gt 0)
+}
+
+function Install-LabFeatures($Cfg) {
+    $feats = @($Cfg.features | Where-Object { $_ })
+    if ($feats.Count -eq 0) { return }
+    foreach ($f in $feats) {
+        if (-not (Get-WindowsFeature -Name $f -ErrorAction SilentlyContinue)) {
+            $avail = (Get-WindowsFeature | Where-Object { $_.Name } | ForEach-Object { [string]$_.Name }) -join ', '
+            throw "feature '$f' is not available on this OS. Available features: $avail"
+        }
+    }
+    Send-LabPhase ("installing features: " + ($feats -join ', '))
+    $r = Install-WindowsFeature -Name $feats -IncludeManagementTools
+    if (-not $r.Success) { throw ("Install-WindowsFeature (" + ($feats -join ', ') + ") failed, exit code " + $r.ExitCode) }
+    foreach ($f in $feats) { Send-WtlEvent 'LAB_FEATURE' @('name', $f) }
+}
+
+function Install-LabRoles($Cfg) {
+    foreach ($role in @($Cfg.roles | Where-Object { $_ })) {
+        switch ([string]$role) {
+            'ad-ds' { }   # the DC promotion already installed AD DS
+            'ad-cs' { Install-LabAdCs $Cfg }
+            'dhcp'  { Install-LabDhcp $Cfg }
+            'iis'   { Install-LabIis $Cfg }
+            default { throw "unknown role '$role'" }
+        }
+    }
+}
+
+# AD CS Enterprise Root CA (needs a domain; runs as a domain/enterprise admin). Idempotent: a
+# second build run finds the CA already installed and only (re)publishes templates + the GPO.
+function Install-LabAdCs($Cfg) {
+    $o = $Cfg.ad_cs
+    $caName = [string]$o.ca_name
+    $keyLen = 2048; if ($o.key_length) { try { $keyLen = [int]$o.key_length } catch { } }
+    $years = 5; if ($o.validity_years) { try { $years = [int]$o.validity_years } catch { } }
+    Send-WtlEvent 'LAB_ROLE' @('name', 'ad-cs', 'state', 'installing', 'ca', $caName)
+    $f = Install-WindowsFeature -Name ADCS-Cert-Authority -IncludeManagementTools
+    if (-not $f.Success) { throw "Install-WindowsFeature ADCS-Cert-Authority failed, exit code $($f.ExitCode)" }
+    Import-Module ADCSDeployment -ErrorAction SilentlyContinue
+    try {
+        Install-AdcsCertificationAuthority -CAType EnterpriseRootCA -CACommonName $caName `
+            -KeyLength $keyLen -HashAlgorithmName SHA256 -ValidityPeriod Years -ValidityPeriodUnits $years `
+            -Force -ErrorAction Stop
+    } catch {
+        $m = [string]$_.Exception.Message
+        # 0x80070542 / "already installed": fine on a rebuild
+        if ($m -notmatch 'already installed' -and $m -notmatch '0x80070542') { throw "Install-AdcsCertificationAuthority: $m" }
+    }
+    # wait for the CA service to answer
+    for ($i = 0; $i -lt 30; $i++) {
+        if (Test-LabNative 'certutil.exe' @('-ping')) { break }
+        Start-Sleep -Seconds 2
+    }
+    if ($o.autoenroll) { Enable-LabAutoEnroll $Cfg }
+    Send-WtlEvent 'LAB_ROLE' @('name', 'ad-cs', 'state', 'ready', 'ca', $caName)
+}
+
+# Publish the Workstation + User templates on the CA and link a domain GPO that turns on
+# computer and user certificate auto-enrollment. The default template ACLs already grant
+# Domain Computers / Domain Users Enroll + Autoenroll, so members pull certs on gpupdate.
+function Enable-LabAutoEnroll($Cfg) {
+    Import-Module ADCSAdministration -ErrorAction SilentlyContinue
+    foreach ($t in @('Workstation', 'User')) {
+        try { Add-CATemplate -Name $t -Force -ErrorAction Stop } catch { Send-LabPhase "publish template ${t}: $($_.Exception.Message)" }
+    }
+    # the GPO cmdlets come from GPMC; add it if the CA machine does not have it yet
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        $g = Install-WindowsFeature -Name GPMC
+        if (-not $g.Success) { Send-LabPhase "GPMC install failed, exit code $($g.ExitCode)"; return }
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+    $gpoName = 'WTL Certificate Auto-Enrollment'
+    $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+    if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
+    # AEPolicy 7 = enabled + renew expiring + update templates (computer and user)
+    Set-GPRegistryValue -Name $gpoName -Key 'HKLM\Software\Policies\Microsoft\Cryptography\AutoEnrollment' -ValueName 'AEPolicy' -Type DWord -Value 7 | Out-Null
+    Set-GPRegistryValue -Name $gpoName -Key 'HKCU\Software\Policies\Microsoft\Cryptography\AutoEnrollment' -ValueName 'AEPolicy' -Type DWord -Value 7 | Out-Null
+    $domainDn = (Get-ADDomain -ErrorAction SilentlyContinue).DistinguishedName
+    if ($domainDn) {
+        try { New-GPLink -Name $gpoName -Target $domainDn -LinkEnabled Yes -ErrorAction Stop | Out-Null } catch {
+            if ("$($_.Exception.Message)" -notmatch 'already linked') { Send-LabPhase "GPO link: $($_.Exception.Message)" }
+        }
+    }
+    Send-WtlEvent 'LAB_PHASE' @() "auto-enrollment GPO linked, templates Workstation + User published"
+}
+
+# DHCP server: a scope for the lab subnet, router + DNS = the DC, authorized in AD when there
+# is a domain.
+function Install-LabDhcp($Cfg) {
+    $d = $Cfg.dhcp
+    $start = [string]$d.start; $end = [string]$d.end; $mask = [string]$d.mask; $router = [string]$d.router
+    Send-WtlEvent 'LAB_ROLE' @('name', 'dhcp', 'state', 'installing', 'scope', "$start-$end")
+    $f = Install-WindowsFeature -Name DHCP -IncludeManagementTools
+    if (-not $f.Success) { throw "Install-WindowsFeature DHCP failed, exit code $($f.ExitCode)" }
+    Import-Module DhcpServer -ErrorAction SilentlyContinue
+    $have = Get-DhcpServerv4Scope -ErrorAction SilentlyContinue | Where-Object { [string]$_.StartRange -eq $start }
+    if (-not $have) {
+        Add-DhcpServerv4Scope -Name 'LabScope' -StartRange $start -EndRange $end -SubnetMask $mask -State Active -ErrorAction Stop
+    }
+    $scope = Get-DhcpServerv4Scope -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($scope -and $router) {
+        try { Set-DhcpServerv4OptionValue -ScopeId $scope.ScopeId -Router $router -DnsServer $router -ErrorAction Stop } catch { Send-LabPhase "DHCP options: $($_.Exception.Message)" }
+    }
+    if ([string]$Cfg.mode -ne 'workgroup') {
+        try { Add-DhcpServerInDC -DnsName ("$env:COMPUTERNAME." + [string]$Cfg.domain) -IPAddress ([string]$Cfg.ip) -ErrorAction Stop } catch {
+            if ("$($_.Exception.Message)" -notmatch 'already') { Send-LabPhase "DHCP authorize: $($_.Exception.Message)" }
+        }
+    }
+    # tell Server Manager the post-install config is done (no yellow bang on screenshots)
+    try {
+        $sm = 'HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\12'
+        if (Test-Path $sm) { Set-ItemProperty -Path $sm -Name 'ConfigurationState' -Value 2 -ErrorAction SilentlyContinue }
+    } catch { }
+    Send-WtlEvent 'LAB_ROLE' @('name', 'dhcp', 'state', 'ready', 'scope', "$start-$end")
+}
+
+# IIS: Web-Server + the management console (+ ASP.NET 4.5 where available), the default site
+# serving a test page at http://<machine>/.
+function Install-LabIis($Cfg) {
+    $o = $Cfg.iis
+    Send-WtlEvent 'LAB_ROLE' @('name', 'iis', 'state', 'installing')
+    $feats = @('Web-Server', 'Web-Mgmt-Console', 'Web-Default-Doc')
+    if (Get-WindowsFeature -Name Web-Asp-Net45 -ErrorAction SilentlyContinue) { $feats += 'Web-Asp-Net45' }
+    $r = Install-WindowsFeature -Name $feats -IncludeManagementTools
+    if (-not $r.Success) { throw "Install-WindowsFeature (IIS) failed, exit code $($r.ExitCode)" }
+    $path = [string]$o.site_path
+    if (-not $path) { $path = 'C:\inetpub\wwwroot' }
+    if (-not (Test-Path -LiteralPath $path)) { New-Item -ItemType Directory -Path $path -Force | Out-Null }
+    $index = Join-Path $path 'index.html'
+    if (-not (Test-Path -LiteralPath $index)) {
+        $html = "<html><head><title>win-test-lab</title></head><body><h1>win-test-lab</h1><p>IIS on $env:COMPUTERNAME is up.</p></body></html>"
+        [System.IO.File]::WriteAllText($index, $html)
+    }
+    try { iisreset.exe /start | Out-Null } catch { }
+    Send-WtlEvent 'LAB_ROLE' @('name', 'iis', 'state', 'ready', 'path', $path)
+}
+
+# Run the build-time setup scripts, in order, through the SYSTEM worker (so "system" has full
+# rights and an "as" user runs with its own token). A non-zero exit fails the build.
+function Invoke-LabSetup($Cfg, [string]$LabDir) {
+    $items = @($Cfg.setup | Where-Object { $_ })
+    if ($items.Count -eq 0) { return }
+    $runDir = 'C:\WTL\setup'
+    if (-not (Test-Path $runDir)) { New-Item -ItemType Directory -Path $runDir -Force | Out-Null }
+    $n = 0
+    foreach ($s in $items) {
+        $n++
+        $path = Join-Path $LabDir (([string]$s.file).Replace('/', '\'))
+        if (-not (Test-Path -LiteralPath $path)) { throw "setup script not found on the control disc: $($s.file)" }
+        $as = [string]$s.as_
+        if (-not $as) { $as = 'system' }
+        $out = Join-Path $runDir ("setup$n.out"); $err = Join-Path $runDir ("setup$n.err")
+        $req = @{ action = 'run'; path = $path; cwd = $LabDir; timeout = 600; out = $out; err = $err; args = [string]$s.args }
+        if ($as -eq 'user') {
+            $req['user'] = [string]$s.user
+            $req['password'] = [string]$s.password
+            $req['domain'] = [string]$Cfg.netbios
+            if ([string]$Cfg.mode -eq 'workgroup') { $req['domain'] = '.' }
+        }
+        Send-WtlEvent 'LAB_SETUP' @('n', $n, 'as', $as, 'script', ([string]$s.file), 'state', 'running')
+        $res = Invoke-SvcRequest $req 660
+        $tail = ''
+        try { if (Test-Path $err) { $tail = (Get-Content -LiteralPath $err -ErrorAction SilentlyContinue | Select-Object -Last 5) -join '; ' } } catch { }
+        if (-not $res.ok) { throw "setup script $($s.file) could not start: $($res.error)" }
+        if ($res.timed_out) { throw "setup script $($s.file) timed out" }
+        if ([int]$res.exit -ne 0) { throw "setup script $($s.file) failed with exit $($res.exit). $tail" }
+        Send-WtlEvent 'LAB_SETUP' @('n', $n, 'as', $as, 'script', ([string]$s.file), 'state', 'ok')
+    }
+}
+
+# Apply this machine's build-time configuration: roles, then features, then setup scripts.
+function Invoke-LabConfigure($Cfg, [string]$LabDir) {
+    Install-LabRoles $Cfg
+    Install-LabFeatures $Cfg
+    Invoke-LabSetup $Cfg $LabDir
+}
+
 # ---------------------------------------------------------------- domain controller
 
 function New-LabUser($Cfg, $U) {
@@ -217,7 +410,7 @@ function New-LabUser($Cfg, $U) {
     Send-LabPhase ("user $($Cfg.netbios)\$name" + $(if ($groups.Count) { ' in ' + ($groups -join ', ') } else { '' }))
 }
 
-function Invoke-LabDc($Cfg) {
+function Invoke-LabDc($Cfg, [string]$LabDir) {
     $phase = Get-LabPhase
     if ($phase -eq 'new') {
         # the machine key is the Windows computer name. Rename before promoting (a promoted DC
@@ -261,6 +454,13 @@ function Invoke-LabDc($Cfg) {
     }
     if ($phase -eq 'promoted') {
         foreach ($u in @($Cfg.users)) { New-LabUser $Cfg $u }
+        # the DC is already the domain Administrator: install its own roles/features/setup now
+        # (dc machines never carry a run during the build, so this is build-time only)
+        if (Test-LabHasConfig $Cfg) {
+            Register-LabSvc $LabDir
+            Send-WtlEvent 'LAB_CONFIGURE' @('machine', $env:COMPUTERNAME, 'role', 'dc')
+            Invoke-LabConfigure $Cfg $LabDir
+        }
         Set-LabPhase 'ready'
     }
     Send-WtlEvent 'LAB_DC_READY' @('domain', $d.DNSRoot, 'netbios', $d.NetBIOSName, 'dc', $env:COMPUTERNAME, 'ip', $Cfg.ip)
@@ -326,8 +526,15 @@ function Invoke-LabClient($Cfg, [string]$LabDir) {
                 Send-LabPhase "renaming this computer $env:COMPUTERNAME -> $want"
                 Rename-Computer -NewName $want -Force -ErrorAction Stop -WarningAction SilentlyContinue
             }
-            Set-LabAutoLogon $realm $user $pass
-            Set-LabPhase 'joined'
+            # a machine with build config stays Administrator for the configure phase, then
+            # switches to its final logon user; otherwise it logs straight on as that user
+            if (Test-LabHasConfig $Cfg) {
+                Set-LabAutoLogon $realm 'Administrator' ([string]$Cfg.admin_password)
+                Set-LabPhase 'configure'
+            } else {
+                Set-LabAutoLogon $realm $user $pass
+                Set-LabPhase 'joined'
+            }
             Send-WtlEvent 'LAB_JOINED' @('workgroup', $want, 'autologon', "$realm\$user")
             Restart-Computer -Force
             return 'reboot'
@@ -351,13 +558,32 @@ function Invoke-LabClient($Cfg, [string]$LabDir) {
                 Start-Sleep -Seconds 30
             }
         }
-        Set-LabAutoLogon $realm $user $pass
+        # a machine with build config stays the domain Administrator for the configure phase
+        # (roles like ad-cs/dhcp need that token), then switches to its final logon user
+        if (Test-LabHasConfig $Cfg) {
+            Set-LabAutoLogon ([string]$Cfg.netbios) 'Administrator' ([string]$Cfg.admin_password)
+        } else {
+            Set-LabAutoLogon $realm $user $pass
+        }
         # the first domain logon has no cached credentials: wait for the network before logging on
         $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon'
         if (-not (Test-Path $pol)) { New-Item -Path $pol -Force | Out-Null }
         New-ItemProperty -Path $pol -Name 'SyncForegroundPolicy' -Value 1 -PropertyType DWord -Force | Out-Null
-        Set-LabPhase 'joined'
+        if (Test-LabHasConfig $Cfg) { Set-LabPhase 'configure' } else { Set-LabPhase 'joined' }
         Send-WtlEvent 'LAB_JOINED' @('domain', $Cfg.domain, 'autologon', "$realm\$user")
+        Restart-Computer -Force
+        return 'reboot'
+    }
+
+    # phase 'configure' (build only): logged on as the Administrator, apply roles/features/setup,
+    # then switch autologon to the final logon user and reboot into 'joined'
+    if ($phase -eq 'configure') {
+        Wait-LabDc $Cfg
+        Send-WtlEvent 'LAB_CONFIGURE' @('machine', $env:COMPUTERNAME, 'role', 'member')
+        Invoke-LabConfigure $Cfg $LabDir
+        Set-LabAutoLogon $realm $user $pass
+        Set-LabPhase 'joined'
+        Send-WtlEvent 'LAB_CONFIGURED' @('machine', $env:COMPUTERNAME, 'autologon', "$realm\$user")
         Restart-Computer -Force
         return 'reboot'
     }
@@ -422,6 +648,15 @@ function Set-LabMounts($Mounts) {
 # workgroup mode - started by the worker with its password). Each LAB_STEP carries machine= so
 # the host can tell the machines' reports apart.
 
+# At run start in an AD lab, refresh group policy and pull any auto-enrollment certificates, so
+# steps that expect a machine/user cert find one. Best-effort; works from Server 2012 R2 on.
+function Update-LabPolicy($Cfg) {
+    if ([string]$Cfg.mode -eq 'workgroup') { return }
+    [void](Test-LabNative 'gpupdate.exe' @('/force'))
+    [void](Test-LabNative 'certutil.exe' @('-pulse'))
+    Send-WtlEvent 'LAB_POLICY' @('machine', [string]$Cfg.machine, 'state', 'refreshed')
+}
+
 function Invoke-LabMemberSteps($Cfg) {
     $run = $Cfg.run
     $machine = [string]$Cfg.machine
@@ -429,6 +664,7 @@ function Invoke-LabMemberSteps($Cfg) {
     $steps = @($run.steps | Where-Object { $_ })
     $defWait = 60; if ($run.wait) { try { $defWait = [int]$run.wait } catch { } }
 
+    Update-LabPolicy $Cfg
     Set-LabMounts $run.mounts
 
     $n = 0
@@ -536,7 +772,7 @@ function Invoke-LabMulti($Cfg, [string]$LabDir) {
     $role = [string]$Cfg.role
     if ($role -eq 'dc') {
         # the DC uses the same promotion path; Invoke-LabDc reads domain/netbios/users/ip/dc_ip
-        $r = Invoke-LabDc $Cfg
+        $r = Invoke-LabDc $Cfg $LabDir
         if ($r -ne 'ready') { return $r }
         # the DC also needs the SYSTEM worker baked, so it can run its own steps
         Register-LabSvc $LabDir

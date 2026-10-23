@@ -67,8 +67,55 @@ struct LabJson<'a> {
     logon_user: &'a str,
     logon_password: &'a str,
     shutdown_when_ready: bool,
+    /// this machine's server roles (`ad-ds` `ad-cs` `dhcp` `iis`), baked in during the build
+    roles: Vec<&'a str>,
+    /// Windows feature names to install during the build
+    features: Vec<&'a str>,
+    /// role options the guest needs during the build (null when the role is absent)
+    ad_cs: Option<LabAdCs<'a>>,
+    dhcp: Option<LabDhcp>,
+    iis: Option<LabIis<'a>>,
+    /// setup scripts run once during the build (empty on a run); staged on the control disc
+    setup: Vec<LabSetup<'a>>,
     /// the per-machine run (null during the 0-state build and for `up`)
     run: Option<LabRun<'a>>,
+}
+
+#[derive(Serialize)]
+struct LabAdCs<'a> {
+    ca_name: &'a str,
+    key_length: u32,
+    validity_years: u32,
+    autoenroll: bool,
+}
+
+#[derive(Serialize)]
+struct LabDhcp {
+    /// first and last IPs of the scope (full addresses, built from the subnet)
+    start: String,
+    end: String,
+    /// the scope's /24 mask
+    mask: String,
+    /// router + DNS for the scope (the DC's IP)
+    router: String,
+}
+
+#[derive(Serialize)]
+struct LabIis<'a> {
+    site_path: &'a str,
+}
+
+/// One setup script as the guest sees it: its path on the control disc (D:\LAB\setup\..) and
+/// how to run it.
+#[derive(Serialize)]
+struct LabSetup<'a> {
+    /// path on the staged control disc, e.g. `setup/configure.ps1` (under LAB\)
+    file: &'a str,
+    args: &'a str,
+    /// "system" or a user name
+    as_: &'a str,
+    user: &'a str,
+    password: &'a str,
 }
 
 #[derive(Serialize)]
@@ -121,6 +168,15 @@ struct Vm {
     ip: String,
     mac: String,
     logon: Option<String>,
+    /// server roles baked into the 0 state (in declaration order)
+    roles: Vec<labdef::LabRole>,
+    /// Windows features installed during the build
+    features: Vec<String>,
+    /// setup scripts run once during the build
+    setup: Vec<labdef::Setup>,
+    ad_cs: Option<labdef::AdCsOpts>,
+    dhcp: Option<labdef::DhcpOpts>,
+    iis: Option<labdef::IisOpts>,
     /// this machine's steps (host-side), in order, with their 1-based index
     steps: Vec<(i64, RunStep)>,
     /// drive letters this machine's steps use (host path, letter)
@@ -296,6 +352,22 @@ impl MultiLab {
             if m.role == Role::Dc && os.kind != "server" {
                 bail!("{}: machine {}: os {} is a client OS and cannot be the domain controller", lab_file.display(), m.name, m.os);
             }
+            // server roles and Windows features need a server OS (Install-WindowsFeature is not
+            // on a client)
+            if os.kind != "server" {
+                if let Some(r) = m.roles.first() {
+                    bail!("{}: machine {}: the {:?} role needs a server OS, but {} is a client OS", lab_file.display(), m.name, r.as_str(), m.os);
+                }
+                if let Some(f) = m.features.first() {
+                    bail!(
+                        "{}: machine {}: feature {:?} needs a server OS (Install-WindowsFeature), but {} is a client OS",
+                        lab_file.display(),
+                        m.name,
+                        f,
+                        m.os
+                    );
+                }
+            }
             let idx = 0x10 + i; // MAC/host-id suffix, DC/first = 0x10
             vms.push(Vm {
                 name: m.name.clone(),
@@ -306,6 +378,12 @@ impl MultiLab {
                 ip: m.ip.clone().unwrap_or_default(),
                 mac: format!("52:54:00:4c:41:{:02x}", idx),
                 logon: m.logon.clone(),
+                roles: m.roles.clone(),
+                features: m.features.clone(),
+                setup: m.setup.clone(),
+                ad_cs: m.ad_cs.clone(),
+                dhcp: m.dhcp.clone(),
+                iis: m.iis.clone(),
                 steps: Vec::new(),
                 mounts: Vec::new(),
             });
@@ -730,6 +808,35 @@ impl MultiLab {
         };
 
         let dc_ip = self.dc_name().map(|d| self.vm(&d).ip.clone()).unwrap_or_default();
+        // roles/features/options are baked into the 0 state, so they only matter on the build
+        // disc; the guest acts on them in phase "new". Keep them off the run disc.
+        let roles: Vec<&str> = if build { vm.roles.iter().map(|r| r.as_str()).collect() } else { Vec::new() };
+        let features: Vec<&str> = if build { vm.features.iter().map(String::as_str).collect() } else { Vec::new() };
+        let ad_cs = if build {
+            vm.ad_cs.as_ref().map(|o| LabAdCs {
+                ca_name: &o.ca_name,
+                key_length: o.key_length,
+                validity_years: o.validity_years,
+                autoenroll: o.autoenroll,
+            })
+        } else {
+            None
+        };
+        let subnet = self.lab.network.as_ref().map(|n| n.subnet.clone()).unwrap_or_default();
+        let dhcp = if build {
+            vm.dhcp.as_ref().map(|o| LabDhcp {
+                start: format!("{}.{}", subnet, o.start),
+                end: format!("{}.{}", subnet, o.end),
+                mask: "255.255.255.0".into(),
+                router: dc_ip.clone(),
+            })
+        } else {
+            None
+        };
+        let iis = if build { vm.iis.as_ref().map(|o| LabIis { site_path: &o.site_path }) } else { None };
+        // setup scripts: staged under LAB\setup\ on the build disc, with their identity resolved
+        let setup = if build { self.stage_setup(vm, &labdir)? } else { Vec::new() };
+
         let j = LabJson {
             fmt: "multi",
             mode: if self.lab.is_ad() { "domain" } else { "workgroup" },
@@ -747,12 +854,45 @@ impl MultiLab {
             logon_user,
             logon_password,
             shutdown_when_ready: build && vm.role != Role::Dc,
+            roles,
+            features,
+            ad_cs,
+            dhcp,
+            iis,
+            setup,
             run,
         };
         write_file(&labdir.join("lab.json"), pyjson::dumps_indent(&j, 1))?;
         mkiso::make_iso(&stage, out, "WTL_LAB").with_context(|| format!("mkiso {} failed", vm.name))?;
         let _ = std::fs::remove_dir_all(&stage);
         Ok(())
+    }
+
+    /// Copy a machine's setup scripts (paths relative to the lab file) into the staged control
+    /// disc under `LAB\<run>` and return the guest-side descriptors (`file`, args, identity).
+    fn stage_setup<'a>(&'a self, vm: &'a Vm, labdir: &Path) -> Result<Vec<LabSetup<'a>>> {
+        let lab_dir = util::abspath(&self.lab_file).parent().map(Path::to_path_buf).unwrap_or_default();
+        let mut out = Vec::new();
+        for s in &vm.setup {
+            let src = lab_dir.join(&s.run);
+            if !src.is_file() {
+                bail!("{}: setup script {} not found ({})", vm.name, s.run, src.display());
+            }
+            let dst = labdir.join(&s.run);
+            if let Some(p) = dst.parent() {
+                std::fs::create_dir_all(p).with_context(|| format!("cannot create {}", p.display()))?;
+            }
+            std::fs::copy(&src, &dst).with_context(|| format!("cannot copy setup script {}", src.display()))?;
+            let (as_, user, password) = match &s.as_ {
+                StepAs::System | StepAs::Logon => ("system", "", ""),
+                StepAs::User(u) => {
+                    let pw = self.lab.users.iter().find(|x| &x.name == u).map(|x| x.password.as_str()).unwrap_or("");
+                    ("user", u.as_str(), pw)
+                }
+            };
+            out.push(LabSetup { file: &s.run, args: s.args.as_deref().unwrap_or(""), as_, user, password });
+        }
+        Ok(out)
     }
 
     /// How a step runs on a machine: ("system"|"logon"|"user", user, password). A user that

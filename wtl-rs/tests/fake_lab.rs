@@ -1287,7 +1287,7 @@ fn driver(args: &[String]) -> i32 {
         );
         let i = run(cx, outs, &["run", &conf], &[]);
         c.code(&outs[i].1, 2);
-        c.has(&outs[i].1, "domain/netbios is set but no machine has role \"dc\"");
+        c.has(&outs[i].1, "domain/netbios is set but no machine has the \"ad-ds\" role");
         let missing =
             cx.cfg("missing-run.json", "{ \"lab\": \"./nope/lab.json\", \"steps\": [ { \"as\": \"system\", \"run\": \"C:/x.bat\" } ] }");
         let i = run(cx, outs, &["run", &missing], &[]);
