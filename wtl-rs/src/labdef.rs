@@ -676,6 +676,7 @@ impl LabDef {
             let mut setup = Vec::new();
             for (si, sd) in m.setup.iter().enumerate() {
                 let run = sd.run.replace('\\', "/");
+                let run = run.strip_prefix("./").unwrap_or(&run).to_string();
                 let lower = run.to_lowercase();
                 if !SCRIPT_EXT.iter().any(|e| lower.ends_with(e)) {
                     bail!("{}: machine {}: setup[{}] run {:?} must end in .exe .bat .cmd .ps1 or .msi", path, name, si, sd.run);
@@ -1112,7 +1113,7 @@ mod tests {
         .unwrap();
         let s = &l.machine("S").unwrap().setup;
         assert_eq!(s.len(), 2);
-        assert_eq!(s[0].run, "./setup/a.ps1");
+        assert_eq!(s[0].run, "setup/a.ps1"); // leading "./" normalized away
         assert_eq!(s[0].as_, StepAs::System);
         assert_eq!(s[1].as_, StepAs::User("operator".into()));
         assert_eq!(s[1].args.as_deref(), Some("--go"));
