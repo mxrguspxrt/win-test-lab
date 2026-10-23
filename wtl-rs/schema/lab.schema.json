@@ -109,11 +109,77 @@
           "type": "string"
         },
         "role": {
-          "description": "`dc` or `member` (default `member`).",
-          "default": "member",
-          "allOf": [
+          "description": "The compact role alias: `dc` (= `roles: [\"ad-ds\"]`) or `member` (= no roles). Mutually exclusive with `roles`.",
+          "default": null,
+          "anyOf": [
             {
-              "$ref": "#/definitions/Role"
+              "$ref": "#/definitions/RoleAlias"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "roles": {
+          "description": "The server roles this machine runs (see [`LabRole`]): `ad-ds`, `ad-cs`, `dhcp`, `iis`. Mutually exclusive with `role`. Servers only.",
+          "default": null,
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/LabRole"
+          }
+        },
+        "features": {
+          "description": "Windows feature names to install during the build (`Install-WindowsFeature`), e.g. `Telnet-Client`. Servers only; an unknown name fails the build with the available list.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "setup": {
+          "description": "Setup scripts run once during the build, in order, after the join/roles/features.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SetupDef"
+          }
+        },
+        "ad_cs": {
+          "description": "`ad-cs` role options (ignored without the `ad-cs` role).",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AdCsDef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dhcp": {
+          "description": "`dhcp` role options (ignored without the `dhcp` role).",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DhcpDef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "iis": {
+          "description": "`iis` role options (ignored without the `iis` role).",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/IisDef"
+            },
+            {
+              "type": "null"
             }
           ]
         },
@@ -156,24 +222,160 @@
       },
       "additionalProperties": false
     },
-    "Role": {
-      "description": "What a machine is for.",
+    "RoleAlias": {
+      "description": "`role: \"dc\"` / `role: \"member\"` — the compact alias for `roles` (see [`LabRole`]).",
       "oneOf": [
         {
-          "description": "the domain controller (at most one per lab; one makes it an AD lab). A Windows Server.",
+          "description": "same as `roles: [\"ad-ds\"]`",
           "type": "string",
           "enum": [
             "dc"
           ]
         },
         {
-          "description": "a domain-joined member in AD mode, a standalone machine in workgroup mode (the default)",
+          "description": "same as `roles: []`",
           "type": "string",
           "enum": [
             "member"
           ]
         }
       ]
+    },
+    "LabRole": {
+      "description": "A server role baked into the 0 state. A machine lists the roles it runs in `roles`; the old `role: \"dc\"` is an alias for `roles: [\"ad-ds\"]` and `role: \"member\"` for no roles.",
+      "oneOf": [
+        {
+          "description": "Active Directory Domain Services: makes this machine the domain controller (one per AD lab; promotes a new forest). A Windows Server.",
+          "type": "string",
+          "enum": [
+            "ad-ds"
+          ]
+        },
+        {
+          "description": "AD Certificate Services: an Enterprise Root CA (needs the domain; installed as a domain admin after the join). A Windows Server.",
+          "type": "string",
+          "enum": [
+            "ad-cs"
+          ]
+        },
+        {
+          "description": "DHCP server: a scope for the lab subnet, authorized in AD when there is a domain. A Windows Server.",
+          "type": "string",
+          "enum": [
+            "dhcp"
+          ]
+        },
+        {
+          "description": "IIS web server: `Web-Server` + the common features, the default site serving a test page. A Windows Server.",
+          "type": "string",
+          "enum": [
+            "iis"
+          ]
+        }
+      ]
+    },
+    "SetupDef": {
+      "description": "One setup script, run once during the 0-state build (after the join, roles and features).",
+      "type": "object",
+      "required": [
+        "run"
+      ],
+      "properties": {
+        "run": {
+          "description": "the script to run, relative to the lab file: `.ps1 .bat .cmd .exe .msi`, e.g. `./setup/configure.ps1`. Staged onto the control disc and run during the build.",
+          "type": "string"
+        },
+        "args": {
+          "description": "command-line arguments",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "as": {
+          "description": "who to run it as: `system` (default) or a lab user (a domain user in AD mode)",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdCsDef": {
+      "description": "`ad_cs` options (an Enterprise Root CA). All optional; see the defaults in [`AdCsOpts`].",
+      "type": "object",
+      "properties": {
+        "ca_name": {
+          "description": "the CA's common name (default `<NETBIOS>-ROOT-CA`)",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key_length": {
+          "description": "the CA key length in bits (default 2048)",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "validity_years": {
+          "description": "the root certificate's validity in years (default 5)",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "autoenroll": {
+          "description": "link a domain GPO that turns on computer + user certificate auto-enrollment, and publish the Workstation/User templates enrollable by Domain Computers/Users (default true)",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "DhcpDef": {
+      "description": "`dhcp` options. See [`DhcpOpts`].",
+      "type": "object",
+      "properties": {
+        "range": {
+          "description": "the scope as last octets within the lab subnet, `.<start>-.<end>` (default `.100-.199`); router and DNS are the DC",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "IisDef": {
+      "description": "`iis` options. See [`IisOpts`].",
+      "type": "object",
+      "properties": {
+        "site_path": {
+          "description": "the default site's physical path (default `C:\\inetpub\\wwwroot`); a test page is written there if one is not present",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "UserDef": {
       "description": "One user (a domain user in AD mode, a local user on every machine in workgroup mode).",

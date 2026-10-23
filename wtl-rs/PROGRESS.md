@@ -33,6 +33,17 @@ Hand-over notes: the current state, decisions and gotchas. User docs: ../README.
   wintest/lab.json (install.ps1 + smoke.ps1, steps as SYSTEM / appuser / ops).
 - Docs: docs/USING.md (from your own project, CI, limits), CONFIG/SPEC/AGENTS updated.
 
+## Server roles (branch lab-roles, 2026-10-23)
+
+- `roles` (`ad-ds`, `ad-cs`, `dhcp`, `iis`; `role: "dc"` = `["ad-ds"]`), `features`, `setup`
+  scripts and `ad_cs`/`dhcp`/`iis` options per machine, applied in a build-only `configure`
+  phase and frozen into the 0 state. Validated before boot (one ad-ds, ad-cs needs AD,
+  server OS only, role xor roles).
+- Verified on KVM: `labs/pki.json` (2019 DC + DHCP, 2012 R2 CA + IIS, 2016 client) built from
+  base images; `examples/configs/pki-smoke.json` passes (computer + user cert from
+  PKI-ROOT-CA on CL1, http://CA1/ 200, DHCP scope on DC1).
+- Follow-ups: a standalone (workgroup) CA; more roles (e.g. `dns`, `file-server`).
+
 ## Next (ask the user first)
 
 - A `targets` matrix in one run file (run the same steps on several labs).

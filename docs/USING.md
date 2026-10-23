@@ -129,6 +129,40 @@ more members (clients `win10`/`win11`, more servers) as more machines.
 
 Every field of both files: [CONFIG.md](CONFIG.md).
 
+## Roles and your own setup
+
+A machine can carry server roles baked into the 0 state, extra Windows features, and your own
+setup scripts — so a run starts against a domain that already has a CA, a DHCP scope, a web
+server, and whatever your scripts arranged. This is for testing against realistic infra, not
+just a bare domain.
+
+```json
+{
+  "domain": "pki.local", "netbios": "PKI",
+  "network": { "subnet": "10.77.60", "lan_port": 47060 },
+  "machines": {
+    "DC1": { "os": "2019", "roles": ["ad-ds", "dhcp"], "dhcp": { "range": ".100-.199" } },
+    "CA1": { "os": "2012", "roles": ["ad-cs", "iis"], "ad_cs": { "ca_name": "PKI-ROOT-CA" },
+             "features": ["Telnet-Client"],
+             "setup": [ { "run": "./setup/configure-ca.ps1" } ] },
+    "CL1": { "os": "2016", "logon": "student" }
+  },
+  "users": { "student": { "password": "Pupil!2026" } }
+}
+```
+
+- `roles`: `ad-ds` (the DC), `ad-cs` (an Enterprise Root CA; every member auto-enrolls a
+  computer certificate and its users a user certificate), `dhcp`, `iis`. `role: "dc"` is still the short alias for `roles: ["ad-ds"]`.
+- `features`: any `Install-WindowsFeature` name; an unknown one fails the build with the list.
+- `setup`: your scripts (relative to the lab file), run once during the build after the join,
+  roles and features, as `system` or a lab user.
+
+Everything here is applied while the 0 state is built and frozen into it, so changing roles,
+features or a setup script means `lab rebuild <lab>` before the next run. `labs/pki.json` and
+`examples/configs/pki-smoke.json` in win-test-lab are a worked example (a CA, DHCP, IIS, and
+checks for the issued certificates, the web site and the scope). Full reference:
+[CONFIG.md](CONFIG.md).
+
 ## Several Windows versions
 
 One run file per version (they can share the scripts), and a loop:

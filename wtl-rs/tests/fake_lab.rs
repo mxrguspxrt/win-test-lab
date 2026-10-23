@@ -400,6 +400,11 @@ impl Guest {
         if !cfg.get("lan").and_then(Value::as_bool).unwrap_or(true) && m.lan {
             return Err(format!("{}: lab.json says lan=false but QEMU got a lab NIC", machine));
         }
+        // build-time config (roles beyond ad-ds, features or setup) baked into the 0 state
+        let arr = |k: &str| cfg.get(k).and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+        let roles_non_adds =
+            cfg.get("roles").and_then(Value::as_array).map(|a| a.iter().filter(|r| r.as_str() != Some("ad-ds")).count()).unwrap_or(0);
+        let has_config = roles_non_adds > 0 || arr("features") > 0 || arr("setup") > 0;
         self.emit(&format!("WTL AGENT_START os=fake build=17763 machine={}", machine));
         if role == "dc" {
             let is_run = cfg.get("run").map(|r| !r.is_null()).unwrap_or(false);
@@ -411,6 +416,10 @@ impl Guest {
                 self.emit("WTL LAB_REBOOT phase=rename");
                 self.raw("garbage after reboot \u{0}\r\n");
                 self.emit(&format!("WTL AGENT_START os=fake build=17763 machine={}", machine));
+                // the DC installs its own roles/features/setup inline before reporting ready
+                if has_config {
+                    self.do_configure(m, cfg, &machine, "dc")?;
+                }
             }
             self.emit(&format!("WTL LAB_START role=dc machine={} phase=ready user=LAB%5CAdministrator", machine));
             self.emit(&format!("WTL LAB_DC_READY domain={} dc={} computer={} | {}", s(cfg, "domain"), machine, machine, self.name));
@@ -423,12 +432,26 @@ impl Guest {
             return Err(format!("unknown role {}", role));
         }
         if cfg.get("shutdown_when_ready").and_then(Value::as_bool) == Some(true) {
-            // 0-state build: rename+join in one reboot, autologon, ready, idle
+            // 0-state build: rename+join in one reboot, autologon
             self.emit(&format!("WTL LAB_START role=member machine={} phase=join user={}%5CAdministrator", machine, s(cfg, "netbios")));
             self.emit(&format!("WTL LAB_JOINED domain={} machine={}", s(cfg, "domain"), machine));
             self.emit("WTL LAB_REBOOT | after the join (renamed)");
             self.raw("garbage after reboot \u{0}\r\n");
             self.emit(&format!("WTL AGENT_START os=fake build=17763 machine={}", machine));
+            // a member with config logs on as Administrator for the configure phase, then reboots
+            // into its logon user (one more reboot the host's wait_ev must ride through)
+            if has_config {
+                self.emit(&format!(
+                    "WTL LAB_START role=member machine={} phase=configure user={}%5CAdministrator",
+                    machine,
+                    s(cfg, "netbios")
+                ));
+                self.do_configure(m, cfg, &machine, "member")?;
+                self.emit(&format!("WTL LAB_CONFIGURED machine={} autologon={}", machine, user));
+                self.emit("WTL LAB_REBOOT | after configure");
+                self.raw("garbage after reboot \u{0}\r\n");
+                self.emit(&format!("WTL AGENT_START os=fake build=17763 machine={}", machine));
+            }
             self.emit(&format!("WTL LAB_START role=member machine={} phase=ready user={}", machine, user));
             self.emit(&format!("WTL LAB_CLIENT_READY user={} machine={} computer={}", user, machine, machine));
             self.emit("WTL LAB_IDLE");
@@ -438,6 +461,49 @@ impl Guest {
         self.emit(&format!("WTL LAB_CLIENT_READY user={} machine={} computer={}", user, machine, machine));
         if cfg.get("run").map(|r| !r.is_null()).unwrap_or(false) {
             return self.run_multi_steps(m, cfg, &machine);
+        }
+        Ok(())
+    }
+
+    /// The build-only "configure" phase: install roles (beyond ad-ds), features, then run the
+    /// setup scripts staged on the control disc. Mirrors guest/lab.ps1's Invoke-LabConfigure;
+    /// a setup script containing FAKE_LAB_FAIL fails the build.
+    fn do_configure(&mut self, m: &Machine, cfg: &Value, machine: &str, role: &str) -> Result<(), String> {
+        self.emit(&format!("WTL LAB_CONFIGURE machine={} role={}", machine, role));
+        for r in cfg.get("roles").and_then(Value::as_array).into_iter().flatten() {
+            let name = r.as_str().unwrap_or("");
+            if name == "ad-ds" {
+                continue;
+            }
+            // echo the resolved option values so the serial log proves what the build disc carried
+            let detail = match name {
+                "ad-cs" => format!(" ca={}", wtl_value(s(&cfg["ad_cs"], "ca_name"))),
+                "dhcp" => format!(" scope={}-{} router={}", s(&cfg["dhcp"], "start"), s(&cfg["dhcp"], "end"), s(&cfg["dhcp"], "router")),
+                _ => String::new(),
+            };
+            self.emit(&format!("WTL LAB_ROLE machine={} name={} state=installing", machine, name));
+            self.emit(&format!("WTL LAB_ROLE machine={} name={} state=ready{}", machine, name, detail));
+        }
+        for f in cfg.get("features").and_then(Value::as_array).into_iter().flatten() {
+            self.emit(&format!("WTL LAB_FEATURE machine={} name={}", machine, f.as_str().unwrap_or("")));
+        }
+        // setup scripts are staged under LAB\ on the control disc: read each from disc 0
+        let cd = m.cds.get(&0).ok_or("no control disc")?;
+        let iso = IsoReader::open(cd, true).map_err(|e| e.to_string())?;
+        let setup = cfg.get("setup").and_then(Value::as_array).cloned().unwrap_or_default();
+        for (i, st) in setup.iter().enumerate() {
+            let n = i + 1;
+            let file = s(st, "file");
+            let as_ = if !s(st, "as_").is_empty() { s(st, "as_") } else { s(st, "as") };
+            let body = iso
+                .read(&format!("LAB/{}", file.replace('\\', "/")))
+                .ok_or(format!("{}: setup script {} not staged on the control disc", machine, file))?;
+            let text = String::from_utf8_lossy(body);
+            self.emit(&format!("WTL LAB_SETUP machine={} n={} as={} script={} state=running", machine, n, as_, wtl_value(file)));
+            if text.contains("FAKE_LAB_FAIL") {
+                return Err(format!("{}: setup script {} failed (line 42)", machine, file));
+            }
+            self.emit(&format!("WTL LAB_SETUP machine={} n={} as={} script={} state=ok", machine, n, as_, wtl_value(file)));
         }
         Ok(())
     }
@@ -589,6 +655,28 @@ impl Ctx {
             port = free_port()
         );
         std::fs::write(root.join("labs/fresh.json"), fresh).unwrap();
+        // a roles lab: DC (ad-ds + dhcp) + a CA server (ad-cs + iis + a feature + setup scripts)
+        // + a plain member. Exercises the build-time "configure" phase and setup staging.
+        let roles = format!(
+            r#"{{
+  "domain": "pki.test", "netbios": "PKI",
+  "network": {{ "subnet": "10.77.95", "lan_port": {port} }},
+  "machines": {{
+    "DC": {{ "os": "2019", "roles": ["ad-ds", "dhcp"], "dhcp": {{ "range": ".100-.199" }} }},
+    "CA": {{ "os": "2019", "roles": ["ad-cs", "iis"], "features": ["Telnet-Client"],
+            "ad_cs": {{ "ca_name": "PKI-ROOT-CA" }},
+            "setup": [ {{ "run": "./setup/first.ps1" }}, {{ "run": "setup/second.bat", "as": "operator" }} ] }},
+    "CL": {{ "os": "2019", "logon": "operator" }}
+  }},
+  "users": {{ "operator": {{ "password": "Oper!2026", "groups": ["Domain Admins"] }} }}
+}}
+"#,
+            port = free_port()
+        );
+        std::fs::write(root.join("labs/roles.json"), roles).unwrap();
+        std::fs::create_dir_all(root.join("labs/setup")).unwrap();
+        std::fs::write(root.join("labs/setup/first.ps1"), "Write-Host configuring\r\n").unwrap();
+        std::fs::write(root.join("labs/setup/second.bat"), "@echo off\r\necho step two\r\n").unwrap();
         // workgroup mode: one machine, local users, no lab LAN
         std::fs::write(
             root.join("labs/solo.json"),
@@ -831,7 +919,7 @@ fn driver(args: &[String]) -> i32 {
         let i = run(cx, outs, &["status", "nope"], &[]);
         c.code(&outs[i].1, 2);
         c.has(&outs[i].1, "no lab ");
-        c.has(&outs[i].1, "(labs: fresh solo tri)");
+        c.has(&outs[i].1, "(labs: fresh roles solo tri)");
         // usage errors: clap's wording, exit 2
         let i = run(cx, outs, &["frobnicate", "tri"], &[]);
         c.code(&outs[i].1, 2);
@@ -1287,7 +1375,7 @@ fn driver(args: &[String]) -> i32 {
         );
         let i = run(cx, outs, &["run", &conf], &[]);
         c.code(&outs[i].1, 2);
-        c.has(&outs[i].1, "domain/netbios is set but no machine has role \"dc\"");
+        c.has(&outs[i].1, "domain/netbios is set but no machine has the \"ad-ds\" role");
         let missing =
             cx.cfg("missing-run.json", "{ \"lab\": \"./nope/lab.json\", \"steps\": [ { \"as\": \"system\", \"run\": \"C:/x.bat\" } ] }");
         let i = run(cx, outs, &["run", &missing], &[]);
@@ -1301,6 +1389,92 @@ fn driver(args: &[String]) -> i32 {
         let i = run(cx, outs, &["run", &bad], &[]);
         c.code(&outs[i].1, 2);
         c.has(&outs[i].1, "unknown field");
+    });
+
+    scenario(&mut cx, "roles: role+roles clash, ad-cs in a workgroup, features on a client", &|cx, c, outs| {
+        // setting both role and roles is an error
+        let both = cx.tmp.join("proj/both.json");
+        std::fs::write(&both, r#"{ "domain": "d.test", "netbios": "D", "network": {"subnet":"10.1.1","lan_port":41111}, "machines": { "DC": { "os": "2019", "role": "dc", "roles": ["ad-ds"] } } }"#).unwrap();
+        let conf = cx.cfg(
+            "both-run.json",
+            &format!(
+                "{{ \"lab\": \"{}\", \"steps\": [ {{ \"on\": \"DC\", \"as\": \"system\", \"run\": \"C:/x.bat\" }} ] }}",
+                both.display()
+            ),
+        );
+        let i = run(cx, outs, &["run", &conf], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "set either \"role\" or \"roles\"");
+        // ad-cs needs an AD lab (a standalone CA is not supported yet)
+        let wg = cx.tmp.join("proj/wgca.json");
+        std::fs::write(&wg, r#"{ "machines": { "S": { "os": "2019", "roles": ["ad-cs"] } } }"#).unwrap();
+        let conf = cx.cfg(
+            "wgca-run.json",
+            &format!("{{ \"lab\": \"{}\", \"steps\": [ {{ \"as\": \"system\", \"run\": \"C:/x.bat\" }} ] }}", wg.display()),
+        );
+        let i = run(cx, outs, &["run", &conf], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "the \"ad-cs\" role needs an AD lab");
+        // a client OS cannot carry a server role or a feature
+        let cl = cx.tmp.join("proj/clientrole.json");
+        std::fs::write(&cl, r#"{ "domain": "d.test", "netbios": "D", "network": {"subnet":"10.1.2","lan_port":41112}, "machines": { "DC": { "os": "2019", "role": "dc" }, "W": { "os": "win11", "roles": ["iis"] } } }"#).unwrap();
+        let conf = cx.cfg(
+            "clientrole-run.json",
+            &format!("{{ \"lab\": \"{}\", \"steps\": [ {{ \"on\": \"W\", \"as\": \"system\", \"run\": \"C:/x.bat\" }} ] }}", cl.display()),
+        );
+        let i = run(cx, outs, &["run", &conf], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "role needs a server OS");
+        c.ok(cx.live_fakes().is_empty(), "a VM was started for an invalid roles lab");
+    });
+
+    scenario(&mut cx, "roles: build the 0 state with dhcp/ad-cs/iis, features and ordered setup", &|cx, c, outs| {
+        let st = cx.state("roles");
+        let i = run(cx, outs, &["prepare", "roles"], &[]);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        for needle in [
+            "=== building the 0 state of lab roles (domain pki.test; 3 machines, once) ===",
+            // the DC installs ad-ds (inline) + dhcp; the CA member configures ad-cs + iis
+            "[guest] WTL LAB_CONFIGURE machine=DC role=dc",
+            "[guest] WTL LAB_ROLE machine=DC name=dhcp state=ready",
+            "[guest] WTL LAB_CONFIGURE machine=CA role=member",
+            // the resolved option values the build disc carried, echoed back by the fake guest
+            "[guest] WTL LAB_ROLE machine=DC name=dhcp state=ready scope=10.77.95.100-10.77.95.199 router=10.77.95.10",
+            "[guest] WTL LAB_ROLE machine=CA name=ad-cs state=ready ca=PKI-ROOT-CA",
+            "[guest] WTL LAB_ROLE machine=CA name=iis state=ready",
+            "[guest] WTL LAB_FEATURE machine=CA name=Telnet-Client",
+            // setup scripts staged on the control disc, run in order, the second as operator
+            "[guest] WTL LAB_SETUP machine=CA n=1 as=system script=setup/first.ps1 state=ok",
+            "[guest] WTL LAB_SETUP machine=CA n=2 as=user script=setup/second.bat state=ok",
+            "0 state saved for lab roles (3 machines)",
+        ] {
+            c.has(o, needle);
+        }
+        // first.ps1 before second.bat
+        c.ok(
+            o.text.find("script=setup/first.ps1 state=ok").unwrap_or(usize::MAX)
+                < o.text.find("script=setup/second.bat state=running").unwrap_or(0),
+            "setup scripts out of order",
+        );
+        c.file(&st.join("0-state.json"));
+        // the plain member CL carries no build config: no configure event for it
+        c.lacks(o, "LAB_CONFIGURE machine=CL");
+        let _ = run(cx, outs, &["restore", "roles"], &[]);
+    });
+
+    scenario(&mut cx, "roles: a failing setup script fails the build", &|cx, c, outs| {
+        // a fresh build is needed (prepare is a no-op once the 0 state exists)
+        let _ = run(cx, outs, &["rebuild", "roles"], &[]);
+        // point second.bat at a FAKE_LAB_FAIL body for this run
+        std::fs::write(cx.root.join("labs/setup/second.bat"), "FAKE_LAB_FAIL\r\n").unwrap();
+        let i = run(cx, outs, &["prepare", "roles"], &[]);
+        let o = &outs[i].1;
+        c.code(o, 2);
+        c.has(o, "CA: setup script setup/second.bat failed");
+        std::fs::write(cx.root.join("labs/setup/second.bat"), "@echo off\r\necho step two\r\n").unwrap();
+        let _ = run(cx, outs, &["restore", "roles"], &[]);
+        c.no_file(&cx.state("roles").join("0-state.json"));
     });
 
     let leaks = cx.live_fakes();
