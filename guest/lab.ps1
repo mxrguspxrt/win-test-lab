@@ -159,6 +159,14 @@ function Set-LabLocalAdmin($Cfg) {
     Set-LabAutoLogon $env:COMPUTERNAME 'Administrator' $pw
 }
 
+# Run a native command only for its exit code (its output, stderr included, is dropped). The
+# agent runs with ErrorActionPreference=Stop, under which a native command's stderr would throw.
+function Test-LabNative([string]$Exe, [string[]]$Arguments) {
+    $ErrorActionPreference = 'Continue'
+    $null = & $Exe @Arguments 2>&1
+    return ($LASTEXITCODE -eq 0)
+}
+
 # Workgroup mode: the lab's users as local accounts on this machine, in their (local) groups;
 # a group that does not exist is created. Passwords never expire.
 function New-LabLocalUsers($Cfg) {
@@ -166,11 +174,9 @@ function New-LabLocalUsers($Cfg) {
         if (-not $u) { continue }
         $name = [string]$u.name
         $pw = [string]$u.password
-        $null = & net.exe user $name 2>&1
-        if ($LASTEXITCODE -eq 0) { Invoke-LabNative 'net.exe' @('user', $name, $pw) }
+        if (Test-LabNative 'net.exe' @('user', $name)) { Invoke-LabNative 'net.exe' @('user', $name, $pw) }
         else { Invoke-LabNative 'net.exe' @('user', $name, $pw, '/add') }
-        $null = & net.exe user $name 2>&1
-        if ($LASTEXITCODE -ne 0) { throw "creating the local user $name failed (password too simple, or contains the user name?)" }
+        if (-not (Test-LabNative 'net.exe' @('user', $name))) { throw "creating the local user $name failed (password too simple, or contains the user name?)" }
         try {
             $acct = [ADSI]"WinNT://./$name,user"
             $acct.UserFlags.Value = $acct.UserFlags.Value -bor 0x10000   # DONT_EXPIRE_PASSWD
@@ -178,9 +184,9 @@ function New-LabLocalUsers($Cfg) {
         } catch { Send-LabPhase "user ${name}: could not set 'password never expires': $($_.Exception.Message)" }
         $groups = @($u.groups | Where-Object { $_ })
         foreach ($g in $groups) {
-            $null = & net.exe localgroup $g 2>&1
-            if ($LASTEXITCODE -ne 0) { Invoke-LabNative 'net.exe' @('localgroup', $g, '/add') }
-            $null = & net.exe localgroup $g $name /add 2>&1   # exit 2 = already a member
+            if (-not (Test-LabNative 'net.exe' @('localgroup', $g))) { Invoke-LabNative 'net.exe' @('localgroup', $g, '/add') }
+            [void](Test-LabNative 'net.exe' @('localgroup', $g, $name, '/add'))   # fails if already a member
+            if (-not (Test-LabNative 'net.exe' @('localgroup', $g))) { throw "creating the local group $g failed" }
         }
         Send-LabPhase ("local user $name" + $(if ($groups.Count) { ' in ' + ($groups -join ', ') } else { '' }))
     }
