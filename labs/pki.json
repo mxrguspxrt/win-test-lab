@@ -1,0 +1,14 @@
+{
+  "$schema": "../wtl-rs/schema/lab.schema.json",
+  "domain": "pki.local",
+  "netbios": "PKI",
+  "network": { "subnet": "10.77.60", "lan_port": 47060 },
+  "machines": {
+    "DC1": { "os": "2019", "roles": ["ad-ds", "dhcp"], "dhcp": { "range": ".100-.199" } },
+    "CA1": { "os": "2012", "roles": ["ad-cs", "iis"], "ad_cs": { "ca_name": "PKI-ROOT-CA", "autoenroll": true } },
+    "CL1": { "os": "2016", "logon": "student" }
+  },
+  "users": {
+    "student": { "password": "Pupil!2026", "groups": ["Domain Users"] }
+  }
+}

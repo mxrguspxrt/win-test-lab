@@ -1,0 +1,11 @@
+{
+  "$schema": "../../wtl-rs/schema/run.schema.json",
+  "lab": "pki",
+  "mount": { "X": "../pki" },
+  "steps": [
+    { "on": "DC1", "as": "system",  "run": "X:/dhcp-scope.ps1" },
+    { "on": "CL1", "as": "system",  "run": "X:/computer-cert.ps1" },
+    { "on": "CL1", "as": "student", "run": "X:/user-cert.ps1" },
+    { "on": "CL1", "as": "student", "run": "X:/web.ps1" }
+  ]
+}
