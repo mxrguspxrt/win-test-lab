@@ -13,6 +13,8 @@ pub struct OsInfo {
     pub kind: String,
     /// "bios" or "uefi"
     pub firmware: String,
+    /// "x64" or "arm64": the QEMU binary and machine, and the ISO it installs from
+    pub arch: String,
     pub fallback_index: String,
     pub min_disk_gb: String,
     pub display: String,
@@ -31,8 +33,12 @@ pub fn normalize(name: &str) -> String {
         "windows11" | "windows_11" => "win11".into(),
         _ => k,
     };
-    // variant aliases (win11_en_x64, win10_de_arm64, ...) fold to the base client key
-    if k.starts_with("win10_") {
+    // variant aliases fold to the base client key: win11_en_x64 -> win11, but anything that
+    // names arm64 (win11_arm64, win11_en_arm64, windows11-arm64) -> win11-arm64
+    let arm = k.contains("arm64") || k.contains("aarch64");
+    if (k.starts_with("win11") || k.starts_with("windows11") || k.starts_with("windows_11")) && arm {
+        "win11-arm64".into()
+    } else if k.starts_with("win10_") {
         "win10".into()
     } else if k.starts_with("win11_") {
         "win11".into()
@@ -58,9 +64,10 @@ pub fn parse_table(text: &str) -> Vec<OsInfo> {
             inst_type: col(3).replace('_', " "),
             kind: col(4),
             firmware: col(5),
-            fallback_index: col(6),
-            min_disk_gb: col(7),
-            display: if f.len() > 8 { f[8..].join(" ") } else { String::new() },
+            arch: col(6),
+            fallback_index: col(7),
+            min_disk_gb: col(8),
+            display: if f.len() > 9 { f[9..].join(" ") } else { String::new() },
         });
     }
     out
@@ -84,6 +91,10 @@ mod tests {
         assert_eq!(normalize("Windows11"), "win11");
         assert_eq!(normalize("win10_de_arm64"), "win10");
         assert_eq!(normalize("2019"), "2019");
+        assert_eq!(normalize("win11-arm64"), "win11-arm64");
+        assert_eq!(normalize("win11_en_arm64"), "win11-arm64");
+        assert_eq!(normalize("Windows11-ARM64"), "win11-arm64");
+        assert_eq!(normalize("win11_en_x64"), "win11");
     }
 
     #[test]
@@ -93,7 +104,14 @@ mod tests {
         assert_eq!((o.build.as_str(), o.kind.as_str(), o.firmware.as_str()), ("9600", "server", "bios"));
         assert_eq!(o.display, "Windows Server 2012 R2");
         let w = lookup(&p, "win11").unwrap();
-        assert_eq!((w.kind.as_str(), w.firmware.as_str()), ("client", "uefi"));
+        assert_eq!((w.kind.as_str(), w.firmware.as_str(), w.arch.as_str()), ("client", "uefi", "x64"));
+        let a = lookup(&p, "win11-arm64").unwrap();
+        assert_eq!((a.build.as_str(), a.firmware.as_str(), a.arch.as_str()), ("26300", "uefi", "arm64"));
+        assert_eq!(a.display, "Windows 11 Pro on Arm");
+        for o in parse_table(&std::fs::read_to_string(&p).unwrap()) {
+            assert!(o.arch == "x64" || o.arch == "arm64", "{}: arch {:?}", o.key, o.arch);
+            assert!(o.min_disk_gb.parse::<u32>().is_ok(), "{}: min_disk_gb {:?}", o.key, o.min_disk_gb);
+        }
         assert!(lookup(&p, "xp").is_none());
     }
 }

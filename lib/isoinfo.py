@@ -11,6 +11,7 @@ CLI:
     isoinfo.py wim ISO                      JSON list of images
     isoinfo.py pick ISO EDITION INST_TYPE   print index of matching image (exit 1 if none)
     isoinfo.py build ISO                    print major build of image 1
+    isoinfo.py arch ISO                     print the architecture of image 1: x64, arm64, x86
 
 Exit codes: 0 ok, 1 no match (pick), 2 no install.wim/esd on media,
 3 unreadable media / path not found, 64 usage.
@@ -552,6 +553,10 @@ def wim_images(media):
     return imgs
 
 
+# WIM <ARCH> values (PROCESSOR_ARCHITECTURE_*)
+ARCH_NAMES = {0: "x86", 9: "x64", 12: "arm64"}
+
+
 def pick(imgs, edition, inst_type):
     """Exact EditionID match first; then EDITION+"Eval" (evaluation media report
     e.g. ServerStandardEval). InstallationType must match exactly (case-insensitive):
@@ -614,6 +619,12 @@ def main(argv):
                 sys.stderr.write("isoinfo: no build number in WIM XML\n")
                 return 2
             print(imgs[0]["build"])
+            return 0
+        if cmd == "arch":
+            if not imgs or imgs[0]["arch"] is None:
+                sys.stderr.write("isoinfo: no architecture in WIM XML\n")
+                return 2
+            print(ARCH_NAMES.get(imgs[0]["arch"], str(imgs[0]["arch"])))
             return 0
         sys.stderr.write("isoinfo: unknown command %s\n" % cmd)
         return 64

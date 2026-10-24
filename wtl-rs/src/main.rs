@@ -2,6 +2,8 @@
 //!
 //!     wtl-rs lab CMD ...          the AD lab runner; also what runs when the binary is
 //!                                 invoked as `lab` (e.g. via a symlink)
+//!     wtl-rs build-image OS ...  install Windows into images/<name>.qcow2 (what `lab` runs
+//!                                 for a missing base image)
 //!     wtl-rs schema [DIR]         write the JSON Schema of the lab and run files
 //!     wtl-rs mkiso -o OUT.iso -V VOLID SRC_DIR
 //!     wtl-rs qmp SOCK CMD ...     talk to a running VM's QEMU monitor
@@ -23,6 +25,7 @@ enum Tool {
     /// the AD lab runner: run / up / restore / stop / status / prepare / rebuild. A copy or
     /// symlink of this binary named `lab` behaves as `wtl-rs lab`.
     Lab(lab::Cli),
+    BuildImage(lab::BuildCli),
     Schema(schema::Cli),
     Mkiso(mkiso::Cli),
     Qmp(qmp::Cli),
@@ -65,7 +68,17 @@ fn report(name: &str, r: anyhow::Result<()>) -> i32 {
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let prog = argv.first().map(|a| util::stem(util::basename(a)).to_ascii_lowercase()).unwrap_or_default();
-    let code = if prog == "lab" {
+    // `lab build-image ...` is what `lab` itself runs for a missing base image (through its own
+    // path, which may be the `lab` symlink): route it to the tool, not the lab command line
+    let code = if prog == "lab" && argv.get(1).map(String::as_str) == Some("build-image") {
+        let mut a = argv.clone();
+        a[0] = "wtl-rs".into();
+        let cli = Cli::try_parse_from(&a).unwrap_or_else(|e| usage_exit(e, 2));
+        match &cli.tool {
+            Tool::BuildImage(b) => lab::build_main(b),
+            _ => unreachable!(),
+        }
+    } else if prog == "lab" {
         let a = LabOnly::try_parse_from(&argv).unwrap_or_else(|e| usage_exit(e, 2));
         lab::main(&a.lab)
     } else {
@@ -73,6 +86,7 @@ fn main() {
         let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| usage_exit(e, usage_code));
         match &cli.tool {
             Tool::Lab(a) => lab::main(a),
+            Tool::BuildImage(a) => lab::build_main(a),
             Tool::Schema(a) => report("schema", schema::cli(a)),
             Tool::Mkiso(a) => report("mkiso", mkiso::cli(a)),
             Tool::Qmp(a) => qmp::cli(a),

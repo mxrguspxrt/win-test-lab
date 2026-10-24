@@ -22,5 +22,8 @@ pub mod qemu;
 pub mod qmp;
 pub mod schema;
 pub mod serialwait;
+pub mod sha256;
 pub mod sys;
+pub mod build;
 pub mod util;
+pub mod winiso;

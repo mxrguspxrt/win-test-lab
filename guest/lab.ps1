@@ -574,10 +574,17 @@ function Wait-LabDc($Cfg) {
 
 # Register the SYSTEM worker (labsvc.ps1) to run at every boot. Done while we are still
 # Administrator (the join phase); the limited LAB\student later talks to it via C:\WTL\svc.
-# labsvc.ps1 ships on the lab CD next to lab.ps1; copy it to the fixed baked path first.
+# labsvc.ps1 and agent.ps1 ship on the lab CD next to lab.ps1: copy them to the fixed baked
+# paths first (the base image's agent may be older than this lab's).
 function Register-LabSvc([string]$LabDir) {
-    $src = Join-Path $LabDir 'labsvc.ps1'
-    if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination 'C:\WTL\labsvc.ps1' -Force }
+    foreach ($f in 'labsvc.ps1', 'agent.ps1') {
+        $src = Join-Path $LabDir $f
+        if (-not (Test-Path -LiteralPath $src)) { continue }
+        $dst = Join-Path 'C:\WTL' $f
+        Copy-Item -LiteralPath $src -Destination $dst -Force
+        # files from a CD keep ReadOnly, which would block the next update
+        try { (Get-Item -LiteralPath $dst).IsReadOnly = $false } catch { }
+    }
     $cmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\WTL\labsvc.ps1'
     Invoke-LabNative 'schtasks.exe' @('/Create', '/TN', 'WTL-Svc', '/TR', $cmd, '/SC', 'ONSTART',
         '/RU', 'SYSTEM', '/RL', 'HIGHEST', '/F')
@@ -710,7 +717,12 @@ function Invoke-LabClient($Cfg, [string]$LabDir) {
 # ---- talk to the SYSTEM worker (labsvc.ps1) through C:\WTL\svc ----------------
 $SvcDir = 'C:\WTL\svc'
 
+# lab.json "slow": how many times longer every fixed wait here is (>1 when the host emulates this
+# machine's CPU; PowerShell alone then takes ~50 s to start). Set by Invoke-Lab.
+$script:LabSlow = 1
+
 function Invoke-SvcRequest($Req, [int]$TimeoutS = 120) {
+    $TimeoutS = $TimeoutS * $script:LabSlow
     if (-not (Test-Path $SvcDir)) { New-Item -ItemType Directory -Path $SvcDir -Force | Out-Null }
     $id = [Guid]::NewGuid().ToString('N')
     $reqPath = Join-Path $SvcDir ($id + '.req.json')
@@ -897,6 +909,7 @@ function Invoke-Lab([string]$LabDir) {
         $cfg = [System.IO.File]::ReadAllText((Join-Path $LabDir 'lab.json')) | ConvertFrom-Json
         Send-WtlEvent 'LAB_START' @('role', $cfg.role, 'phase', (Get-LabPhase), 'user', "$env:USERDOMAIN\$env:USERNAME")
         if ([string]$cfg.fmt -ne 'multi') { throw "lab.json fmt '$($cfg.fmt)' is not supported (this lab.ps1 reads fmt=multi; rebuild with the current lab)" }
+        if ($cfg.slow) { try { $script:LabSlow = [Math]::Max(1, [int]$cfg.slow) } catch { } }
         return (Invoke-LabMulti $cfg $LabDir)
     } catch {
         $msg = $_.Exception.Message

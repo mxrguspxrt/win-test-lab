@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  win-test-lab unattended answer file for UEFI / client Windows (Windows 10 & 11, amd64, GPT).
-  Rendered by build-image.sh: @IMAGE_INDEX@ @PASSWORD@ @COMPUTERNAME@
+  win-test-lab unattended answer file for UEFI / client Windows (Windows 10 & 11, amd64 or arm64, GPT).
+  Rendered by the host: @IMAGE_INDEX@ @PASSWORD@ @COMPUTERNAME@ @ARCH@ (amd64 or arm64)
   Differences from the BIOS/Server template:
    - GPT layout: EFI System Partition + MSR + Windows (UEFI firmware, q35 + OVMF).
    - windowsPE RunSynchronous writes the Windows 11 "this PC can't run Win11" bypass keys
@@ -14,7 +14,7 @@
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
 
   <settings pass="windowsPE">
-    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="@ARCH@" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <SetupUILanguage>
         <UILanguage>en-US</UILanguage>
       </SetupUILanguage>
@@ -24,7 +24,7 @@
       <UserLocale>en-US</UserLocale>
     </component>
 
-    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+    <component name="Microsoft-Windows-Setup" processorArchitecture="@ARCH@" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <RunSynchronous>
         <RunSynchronousCommand wcm:action="add">
           <Order>1</Order>
@@ -115,7 +115,7 @@
   </settings>
 
   <settings pass="specialize">
-    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="@ARCH@" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <ComputerName>@COMPUTERNAME@</ComputerName>
       <TimeZone>FLE Standard Time</TimeZone>
       <RegisteredOrganization>win-test-lab</RegisteredOrganization>
@@ -124,14 +124,14 @@
   </settings>
 
   <settings pass="oobeSystem">
-    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="@ARCH@" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <InputLocale>en-US</InputLocale>
       <SystemLocale>en-US</SystemLocale>
       <UILanguage>en-US</UILanguage>
       <UserLocale>en-US</UserLocale>
     </component>
 
-    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="@ARCH@" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <UserAccounts>
         <AdministratorPassword>
           <Value>@PASSWORD@</Value>

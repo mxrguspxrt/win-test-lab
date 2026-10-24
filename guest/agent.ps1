@@ -5,7 +5,8 @@
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\WTL\agent.ps1
 #
 # Looks for \JOB.JSON + \PAYLOAD.ZIP on a CD drive (job.iso, vol id WTL_JOB), copies the zip to the
-# Desktop, extracts it, starts the EXE and reports over COM1 using the SPEC serial protocol:
+# Desktop, extracts it, starts the EXE and reports over COM1 (or, with no COM1, the virtio-serial
+# port QEMU appends to the same host log) using the SPEC serial protocol:
 #   WTL <EVENT> [key=value ...] [| free text]
 
 $ErrorActionPreference = 'Stop'
@@ -41,7 +42,69 @@ function Open-Serial {
     }
 }
 
+# Without COM1 (Windows on Arm has no driver for QEMU's UART) every line goes to a virtio-serial
+# port (virtio-win's vioserial) that QEMU appends to the host's serial log file. The port stays
+# open, like COM1.
+$WtlChannel = '\\.\Global\org.wintestlab.0'
+$script:HasCom1 = $true
+try { $script:HasCom1 = @([System.IO.Ports.SerialPort]::GetPortNames()) -contains 'COM1' } catch { }
+$script:Chan = $null
+
+# .NET's FileStream refuses device paths (\\.\Global\...): open the port with CreateFile and
+# wrap the handle. Returns $null when the port is not there (yet).
+function Open-WtlChannel {
+    if (-not ('WtlNative.Chan' -as [type])) {
+        Add-Type -Namespace WtlNative -Name Chan -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+'@
+    }
+    # GENERIC_WRITE, no sharing, OPEN_EXISTING
+    $h = [WtlNative.Chan]::CreateFile($WtlChannel, 0x40000000, 0, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)
+    if ($h.IsInvalid) { $h.Dispose(); return $null }
+    return (New-Object System.IO.FileStream($h, [System.IO.FileAccess]::Write, 1))
+}
+
+# Only administrators and SYSTEM may open the port (a standard user gets access denied, error 5):
+# a lab user's agent hands its lines to the SYSTEM worker (labsvc.ps1) instead, as files in
+# C:\WTL\chan, which it forwards in name order. Without a worker yet (the base-image build) or
+# as an administrator, the port is written directly.
+$WtlChanSpool = Join-Path $WtlDir 'chan'
+$script:ChanSeq = 0
+
+function Write-Channel([string]$Line) {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Line + "`r`n")
+    $until = (Get-Date).AddSeconds(60)
+    do {
+        try {
+            if ($script:Chan -eq $null) {
+                $script:Chan = Open-WtlChannel
+                if ($script:Chan -eq $null) { throw 'no channel' }
+            }
+            $script:Chan.Write($bytes, 0, $bytes.Length)
+            $script:Chan.Flush()
+            return
+        } catch {
+            if ($script:Chan -ne $null) { try { $script:Chan.Close() } catch { } }
+            $script:Chan = $null
+        }
+        if (Test-Path -LiteralPath $WtlChanSpool) {
+            # <ticks>-<pid>-<seq>.line: sortable, unique per writer; .tmp until complete
+            $script:ChanSeq++
+            $name = '{0:D19}-{1}-{2:D6}' -f [DateTime]::UtcNow.Ticks, $PID, $script:ChanSeq
+            $tmp = Join-Path $WtlChanSpool ($name + '.tmp')
+            try {
+                [System.IO.File]::WriteAllBytes($tmp, $bytes)
+                [System.IO.File]::Move($tmp, (Join-Path $WtlChanSpool ($name + '.line')))
+                return
+            } catch { }
+        }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $until)
+}
+
 function Write-Serial([string]$Line) {
+    if (-not $script:HasCom1) { Write-Channel $Line; return }
     for ($attempt = 0; $attempt -lt 2; $attempt++) {
         if (-not (Open-Serial)) { return }
         try {

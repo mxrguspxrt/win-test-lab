@@ -6,10 +6,14 @@ For using the lab see [README.md](README.md) and [docs/CONFIG.md](docs/CONFIG.md
 ## Pieces
 
     wtl-rs/                Rust host program `wtl-rs` (also runs as `lab`): the AD lab runner
-      src/lab.rs           `lab` command line; finding the checkout; driving build-image.sh
+      src/lab.rs           `lab` command line (run/up/.../doctor/check-iso); finding the
+                           checkout; running the base-image builds in parallel
+      src/build.rs         unattended Windows install -> images/<name>.qcow2 (`lab build-image`)
+      src/winiso.rs        Windows ISO reader: UDF / ISO9660, WIM image list, build + CPU
+      src/sha256.rs        SHA-256 for `lab check-iso --sha256`
       src/labdef.rs        the JSON lab / run formats, validation, JSON Schema
       src/labrun.rs        the runner: 0 state, boot, control discs, steps, results
-      src/qemu.rs          WTL_* settings and the QEMU command line
+      src/qemu.rs          WTL_* settings and the QEMU command line (x64 and arm64)
       src/qmp.rs           QEMU monitor client (status, powerdown, quit, screendump -> PNG)
       src/serialwait.rs    wait for WTL events in a serial log
       src/outputs.rs       decode program output sent over serial
@@ -25,7 +29,8 @@ For using the lab see [README.md](README.md) and [docs/CONFIG.md](docs/CONFIG.md
     guest/agent.ps1        logon agent: owns COM1, dot-sources lab.ps1 from the control disc
     guest/setup.ps1        first-logon setup of a base image (build phase)
     guest/autounattend*.xml.tmpl   unattended Windows Setup answer files (BIOS / UEFI)
-    build-image.sh         unattended Windows install -> images/<name>.qcow2
+    drivers/               virtio-win drivers for arm64 machines (git-ignored; docs/ISOS.md)
+    build-image.sh         the older bash builder (Linux; `lab` no longer uses it)
     launch-test.sh         separate single-VM tester (no domain; see the end of this file)
     download-isos.sh, setup-host.sh, lib/common.sh, lib/*.py, lib/rename-isos.sh
                            host scripts and Python helpers of build-image.sh / launch-test.sh
@@ -35,9 +40,33 @@ For using the lab see [README.md](README.md) and [docs/CONFIG.md](docs/CONFIG.md
                            run-tests.sh + fake-qemu (build-image.sh / launch-test.sh suite),
                            check-labs.sh, check-catalog.sh
 
-Host requirements: `qemu-system-x86_64`, `qemu-img`, `/dev/kvm` (Linux), OVMF for UEFI
-guests, and bash + python3 (stdlib only) for installing base images. No root, no Samba, no
-xorriso/genisoimage: discs are written by the program itself.
+Host requirements: QEMU (`qemu-system-x86_64` for x64 machines, `qemu-system-aarch64` for
+arm64 machines, `qemu-img`) and its UEFI firmware; on Linux a writable `/dev/kvm`. Nothing
+else: no bash, no Python, no root, no Samba, no xorriso/genisoimage. `lab` reads the ISOs and
+writes its discs itself. (The older bash tools build-image.sh / launch-test.sh need bash 4 +
+python3.)
+
+### CPUs and acceleration
+
+Every OS key has a CPU (`arch` in lib/oslist.conf): `x64` or `arm64`. A machine whose CPU is
+the host's own runs on the hypervisor (KVM / WHPX / HVF); any other runs emulated in QEMU's
+TCG (`-accel tcg,thread=multi`), which works but is several times slower (see the measured
+table in README.md). `lab` scales its fixed waits (logon, power-off) by 6 for an emulated
+machine. `WTL_ACCEL` forces one accelerator for every machine.
+
+| | x64 machine | arm64 machine |
+|---|---|---|
+| QEMU | `WTL_QEMU`, machine `pc` (BIOS) or `q35` (UEFI) | `WTL_QEMU_ARM64`, machine `virt`, always UEFI |
+| disk | ich9-ahci | NVMe |
+| CD-ROMs | IDE | USB mass storage (the arm64 UEFI firmware boots no AHCI CD-ROM) |
+| NICs | `WTL_NIC` (e1000) | virtio-net (driver: virtio-win NetKVM) |
+| guest -> host log | COM1 (16550 UART) | virtio-serial port `org.wintestlab.0` (virtio-win vioserial), appended to the same serial log file |
+| display | std VGA | ramfb |
+
+Windows on Arm ships no driver for any NIC or UART QEMU emulates (tested: e1000e, rtl8139,
+igb, vmxnet3, virtio-net, usb-net; PL011, pci-serial, usb-serial). The build therefore puts
+virtio-win's ARM64 NetKVM and vioserial drivers under `\$WinPEDriver$` on the build disc,
+which Windows Setup installs on its own, and refuses to start an arm64 build without them.
 
 ## Settings (environment)
 
@@ -47,12 +76,15 @@ xorriso/genisoimage: discs are written by the program itself.
 | `WTL_ISO_DIR` | `<root>/iso-files` | installer ISOs |
 | `WTL_IMAGES_DIR` | `<root>/images` | base images `<os>-dc.qcow2`, `<os>-client.qcow2` |
 | `WTL_QEMU`, `WTL_QEMU_IMG` | `qemu-system-x86_64`, `qemu-img` | the QEMU programs |
-| `WTL_ACCEL` | kvm / whpx / hvf by host | `kvm`, `whpx`, `hvf` or `tcg`; `WTL_NO_KVM=1` = tcg |
+| `WTL_QEMU_ARM64` | `qemu-system-aarch64` | the QEMU program for arm64 machines |
+| `WTL_ACCEL` | kvm / whpx / hvf by host for the host's CPU, tcg for the other | `kvm`, `whpx`, `hvf` or `tcg` for every machine; `WTL_NO_KVM=1` = tcg |
 | `WTL_CPU` | `host,hv_*` on KVM, `max` otherwise | the `-cpu` value |
 | `WTL_CPUS` | 2 | vCPUs when a machine sets none |
 | `WTL_NIC` | `e1000` | NIC model |
 | `WTL_QMP` | `unix` (`tcp` on Windows) | QEMU monitor transport |
-| `WTL_OVMF_CODE`, `WTL_OVMF_VARS` | `/usr/share/OVMF/OVMF_{CODE,VARS}_4M.fd` | UEFI firmware |
+| `WTL_OVMF_CODE`, `WTL_OVMF_VARS` | the first found: `/usr/share/OVMF/OVMF_{CODE,VARS}_4M.fd`, ..., Homebrew's `edk2-x86_64-code.fd` / `edk2-i386-vars.fd` | x64 UEFI firmware |
+| `WTL_AAVMF_CODE`, `WTL_AAVMF_VARS` | the first found: `/usr/share/AAVMF/AAVMF_{CODE,VARS}.fd`, ..., Homebrew's `edk2-aarch64-code.fd` / `edk2-arm-vars.fd` | arm64 UEFI firmware |
+| `WTL_BUILDER` | `lab build-image` | what installs one base image (the tests use a fake) |
 | `WTL_DISPLAY` | `gtk` (`cocoa` on macOS) | display used by `--show` |
 | `WTL_PASSWORD` | `WinTest!2026` | local Administrator password baked into base images |
 | `WTL_TEST_FAST=1` | | skip fixed settle sleeps (fake-QEMU tests only) |
@@ -64,14 +96,21 @@ controllers and `images/<os>-client.qcow2` for every other machine (members, mem
 workgroup machines). A clone of a DC cannot join its own domain, so the two are separate
 installs; machines of the same OS and role share one image, in any lab. Any Server OS key
 works as a DC and any OS key as the rest (a 2012 DC + 2019 member = `2012-dc` + `2019-client`).
-`lab` runs `build-image.sh <os> --name <os>-dc|<os>-client --computer-name DC<os>|CL<os>
---no-updates` for every missing image of a lab, in parallel, logging to
+`lab` runs itself as `lab build-image <os> --name <os>-dc|<os>-client --computer-name
+DC<os>|CL<os> --no-updates` for every missing image of a lab, in parallel, logging to
 `labs/state/<lab>/build-<image>.log`.
 
-build-image.sh: renders `guest/autounattend*.xml.tmpl`, puts it with `guest/*.ps1` and a
-`WTL/build.json` on an `WTL_BUILD` disc, boots the installer ISO + that disc, waits for
-`WTL BUILD_DONE` on the serial log and for the guest to power off, then renames
-`<image>.qcow2.partial` to `<image>.qcow2` and writes `<image>.json`. In the guest,
+The ISO: the images-list.conf entry for the OS key if its image 1 has the OS's build and CPU,
+else the newest ISO in `WTL_ISO_DIR` that does (read from the WIM inside; x64 and arm64
+Windows 11 share build 26300, so the CPU matters). The build renders
+`guest/autounattend*.xml.tmpl` (`@ARCH@` = amd64 / arm64), puts it with `guest/*.ps1`, a
+`WTL/build.json` and, for arm64, the virtio-win drivers under `$WinPEDriver$` on a `WTL_BUILD`
+disc, boots the installer ISO + that disc (UEFI: presses Enter for the "boot from CD" prompt
+once the firmware starts a boot option), waits for `WTL BUILD_DONE` on the serial log and for
+the guest to power off, then renames `<image>.qcow2.partial` to `<image>.qcow2`, keeps the
+UEFI variable store as `<image>.vars.fd` (the Windows Boot Manager entry lives there; every
+machine made from the image starts from a copy) and writes `<image>.json`
+(`install_minutes` included). In the guest,
 `setup.ps1` runs at first logon: autologon, firewall off, power settings, optional Windows
 Update rounds, then installs the agent autostart (HKLM Run `WTL-Agent` -> `C:\WTL\agent.ps1`)
 **after** sending `BUILD_DONE` (an agent started earlier would hold COM1), and shuts down.
@@ -216,7 +255,12 @@ workgroup machine without `network` has only the NAT NIC.
 
 ## Serial protocol (guest -> host)
 
-COM1, a file on the host (`labs/state/<lab>/<machine>.serial.log`), text lines:
+COM1 (on arm64: the virtio-serial port `\\.\Global\org.wintestlab.0`, which QEMU appends to
+the same file), a file on the host (`labs/state/<lab>/<machine>.serial.log`), text lines.
+Only administrators and SYSTEM may open the virtio-serial port, so on arm64 the logged-on lab
+user's agent writes each line as a file into `C:\WTL\chan` and the SYSTEM worker
+(`labsvc.ps1`) forwards them in order; the base-image build (Administrator) writes the port
+directly. Lines look like:
 
     WTL <EVENT> [key=value ...] [| free text]
 

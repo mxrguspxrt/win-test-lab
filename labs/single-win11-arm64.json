@@ -1,0 +1,9 @@
+{
+  "$schema": "../wtl-rs/schema/lab.schema.json",
+  "machines": {
+    "WSARM64": { "os": "win11-arm64", "logon": "tester" }
+  },
+  "users": {
+    "tester": { "password": "Test!2026" }
+  }
+}

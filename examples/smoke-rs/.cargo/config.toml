@@ -1,0 +1,8 @@
+# Windows exes from any host with only rustup: no Visual Studio, no MinGW. rust-lld links;
+# kernel32 is imported with raw-dylib, so no import libraries are needed either.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"
+rustflags = ["-C", "link-arg=/ENTRY:start", "-C", "link-arg=/SUBSYSTEM:CONSOLE", "-C", "link-arg=/NODEFAULTLIB"]
+[target.aarch64-pc-windows-msvc]
+linker = "rust-lld"
+rustflags = ["-C", "link-arg=/ENTRY:start", "-C", "link-arg=/SUBSYSTEM:CONSOLE", "-C", "link-arg=/NODEFAULTLIB"]

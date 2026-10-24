@@ -178,6 +178,27 @@ fn allocated(md: &std::fs::Metadata) -> u64 {
     md.len()
 }
 
+/// Whole GiB free on the file system holding P (its nearest existing ancestor); None where
+/// it cannot be read.
+pub fn free_gb(p: &Path) -> Option<u64> {
+    let d = p.ancestors().find(|a| a.is_dir())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(d.as_os_str().as_bytes()).ok()?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64) >> 30)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = d;
+        None
+    }
+}
+
 /// Find an executable like `command -v` (PATH search; PATHEXT on Windows).
 pub fn which(name: &str) -> Option<PathBuf> {
     let exts: Vec<String> = if cfg!(windows) {

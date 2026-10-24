@@ -143,6 +143,8 @@ struct Machine {
     no_shutdown: bool,
     /// the VM has a lab LAN NIC (-netdev dgram,id=lan0)
     lan: bool,
+    /// -machine (pc, q35, virt)
+    machine: String,
 }
 
 struct Shared {
@@ -177,13 +179,30 @@ fn fake_qemu(args: &[String]) -> i32 {
                 let d = kv(&v);
                 let Some(file) = d.get("file") else { continue };
                 if d.get("media").map(String::as_str) == Some("cdrom") {
-                    let idx: usize = d.get("index").and_then(|x| x.parse().ok()).unwrap_or(m.cds.len());
+                    // x64: index=N on IDE; arm64: id=cdN, attached as usb-storage
+                    let idx: usize = d
+                        .get("index")
+                        .or_else(|| d.get("id").and_then(|i| i.strip_prefix("cd").map(|_| i)))
+                        .and_then(|x| x.trim_start_matches("cd").parse().ok())
+                        .unwrap_or(m.cds.len());
                     m.cds.insert(idx, PathBuf::from(file));
                 } else if d.get("id").map(String::as_str) == Some("disk0") {
                     m.disk = Some(PathBuf::from(file));
                 }
             }
-            "-serial" => m.serial = v.strip_prefix("file:").map(PathBuf::from),
+            "-machine" => m.machine = v,
+            // arm64: the serial port is a file chardev (shared with the guest's TCP channel)
+            "-chardev" => {
+                let d = kv(&v);
+                if d.get("id").map(String::as_str) == Some("ser0") {
+                    m.serial = d.get("path").map(PathBuf::from);
+                }
+            }
+            "-serial" => {
+                if let Some(f) = v.strip_prefix("file:") {
+                    m.serial = Some(PathBuf::from(f));
+                }
+            }
             "-qmp" => m.qmp = Some(split_opts(&v)[0].clone()),
             "-netdev" if v.starts_with("dgram,id=lan0") => m.lan = true,
             _ => {}
@@ -372,7 +391,7 @@ impl Guest {
         if iso.volid != "WTL_LAB" {
             return Err(format!("control disc label {} (want WTL_LAB)", iso.volid));
         }
-        for f in ["LAB/lab.ps1", "LAB/labsvc.ps1"] {
+        for f in ["LAB/lab.ps1", "LAB/labsvc.ps1", "LAB/agent.ps1"] {
             iso.read(f).ok_or(format!("{} missing on the control disc", f))?;
         }
         let cfg = iso.read("LAB/lab.json").ok_or("LAB/lab.json missing")?;
@@ -615,7 +634,7 @@ impl Ctx {
         for d in ["app/sub dir", "cfg", "pids"] {
             std::fs::create_dir_all(tmp.join(d)).unwrap();
         }
-        for f in ["lib/oslist.conf", "guest/lab.ps1", "guest/labsvc.ps1"] {
+        for f in ["lib/oslist.conf", "guest/lab.ps1", "guest/labsvc.ps1", "guest/agent.ps1"] {
             std::fs::copy(src.join(f), root.join(f)).unwrap();
         }
         // a 3-machine JSON lab: 2019 DC + a 2019 member + a win11 (UEFI) member
@@ -685,6 +704,15 @@ impl Ctx {
 "#,
         )
         .unwrap();
+        // mixed CPUs: an x64 Server DC + a Windows 11 on Arm member
+        std::fs::write(
+            root.join("labs/armmix.json"),
+            r#"{ "domain": "lab.local", "netbios": "LAB", "network": { "subnet": "10.77.125", "lan_port": 47125 },
+  "machines": { "DC1": { "os": "2019", "role": "dc" }, "ARM1": { "os": "win11-arm64", "logon": "student" } },
+  "users": { "student": { "password": "Pupil!2026" } } }
+"#,
+        )
+        .unwrap();
         // a lab carried by a project, outside win-test-lab: a 2016 DC (any Server may be the
         // DC) + a 2019 member server, referred to by path from the project's run file
         let proj = tmp.join("proj/wintest");
@@ -713,17 +741,17 @@ impl Ctx {
         .unwrap();
         std::fs::write(root.join("images/2012-dc.qcow2"), "QFI\u{fb} fake base image\n").unwrap();
         let fake_build = "#!/bin/sh\n\
-             # fake build-image.sh: OS --name NAME --computer-name CN [--no-updates] [--show]\n\
+             # fake image builder (WTL_BUILDER): OS --name NAME --computer-name CN [--no-updates] [--show]\n\
              echo \"$*\" >> \"$WTL_IMAGES_DIR/build-calls.log\"\n\
              echo \"installing $1 into $3.qcow2\"\n\
              printf 'QFI\\373 fake base image\\n' > \"$WTL_IMAGES_DIR/$3.qcow2\"\n";
-        std::fs::write(root.join("build-image.sh"), fake_build).unwrap();
+        std::fs::write(tmp.join("fake-build-image"), fake_build).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(root.join("build-image.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(tmp.join("fake-build-image"), std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        for img in ["2019-dc", "2019-client", "win11-dc", "win11-client"] {
+        for img in ["2019-dc", "2019-client", "win11-dc", "win11-client", "win11-arm64-client"] {
             std::fs::write(root.join(format!("images/{}.qcow2", img)), "QFI\u{fb} fake base image\n").unwrap();
         }
         std::fs::write(tmp.join("OVMF_CODE.fd"), "code").unwrap();
@@ -771,6 +799,10 @@ impl Ctx {
             .env("WTL_TEST_FAST", "1")
             .env("WTL_OVMF_CODE", self.tmp.join("OVMF_CODE.fd"))
             .env("WTL_OVMF_VARS", self.tmp.join("OVMF_VARS.fd"))
+            .env("WTL_AAVMF_CODE", self.tmp.join("OVMF_CODE.fd"))
+            .env("WTL_AAVMF_VARS", self.tmp.join("OVMF_VARS.fd"))
+            .env("WTL_QEMU_ARM64", &me)
+            .env("WTL_BUILDER", self.tmp.join("fake-build-image"))
             .env("FAKE_PIDDIR", &self.piddir)
             .env("FAKE_LOG", &self.fake_log);
         for (k, v) in env {
@@ -919,7 +951,7 @@ fn driver(args: &[String]) -> i32 {
         let i = run(cx, outs, &["status", "nope"], &[]);
         c.code(&outs[i].1, 2);
         c.has(&outs[i].1, "no lab ");
-        c.has(&outs[i].1, "(labs: fresh roles solo tri)");
+        c.has(&outs[i].1, "(labs: armmix fresh roles solo tri)");
         // usage errors: clap's wording, exit 2
         let i = run(cx, outs, &["frobnicate", "tri"], &[]);
         c.code(&outs[i].1, 2);
@@ -1246,6 +1278,11 @@ fn driver(args: &[String]) -> i32 {
         c.ok(o.status.code() == Some(0), format!("exit {:?}", o.status.code()));
         outs.push(("lab status tri".into(), Out { code: o.status.code().unwrap_or(-1), text: text.clone() }));
         c.ok(text.contains("0 state: ready"), "status via the symlink");
+        // what `lab` runs for a missing base image goes through its own path, which is this
+        // symlink: `lab build-image` must reach the image builder
+        let o = Command::new(&link).args(["build-image", "--help"]).output().unwrap();
+        let help = String::from_utf8_lossy(&o.stdout).into_owned();
+        c.ok(o.status.code() == Some(0) && help.contains("Install Windows into a base image"), format!("lab build-image --help: {}", help));
     });
 
     scenario(&mut cx, "JSON lab: missing base images are installed first", &|cx, c, outs| {
@@ -1266,7 +1303,7 @@ fn driver(args: &[String]) -> i32 {
                     "2016 --name 2016-client --computer-name CL2016 --no-updates",
                     "2016 --name 2016-dc --computer-name DC2016 --no-updates",
                 ],
-            format!("build-image.sh calls: {:?}", lines),
+            format!("image builder calls: {:?}", lines),
         );
         c.file(&cx.state("fresh").join("build-2016-dc.log"));
         // already there: a second prepare after a rebuild does not install again
@@ -1275,6 +1312,36 @@ fn driver(args: &[String]) -> i32 {
         c.code(&outs[i].1, 0);
         c.lacks(&outs[i].1, "installing Windows");
         let _ = run(cx, outs, &["restore", "fresh"], &[]);
+    });
+
+    scenario(&mut cx, "mixed CPUs: an x64 DC and an arm64 member in one domain", &|cx, c, outs| {
+        let conf = cx.cfg(
+            "armmix.json",
+            "{ \"lab\": \"armmix\", \"mount\": { \"X\": \"../app\" }, \"steps\": [\n\
+               { \"on\": \"ARM1\", \"run\": \"X:/smoke.exe\" } ] }\n",
+        );
+        let i = run(cx, outs, &["run", &conf], &[]);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        c.has(o, "[ARM1 logon] X:\\smoke.exe -> exit 0");
+        let argv = std::fs::read_to_string(&cx.fake_log).unwrap_or_default();
+        let line = |vm: &str| argv.lines().rfind(|l| l.contains(vm)).unwrap_or("").replace('\u{1f}', " ");
+        let arm = line("lab-armmix-ARM1");
+        let dc = line("lab-armmix-DC1");
+        // the arm64 machine: virt + aarch64 UEFI, NVMe, USB CDs, virtio NICs + the guest channel
+        for want in ["-machine virt", "-device nvme,serial=wtl0,drive=disk0", "-device usb-storage,drive=cd0,removable=on",
+                     "virtio-net-pci,netdev=lan0,mac=52:54:00:4c:41:11", "name=org.wintestlab.0", "-serial chardev:ser0"] {
+            c.ok(arm.contains(want), format!("ARM1 argv lacks {:?}: {}", want, arm));
+        }
+        c.ok(!arm.contains("e1000") && !arm.contains("if=ide"), format!("ARM1 argv: {}", arm));
+        // the x64 DC is unchanged: pc + IDE + e1000, on the same LAN port
+        c.ok(dc.contains("-machine pc") && dc.contains("e1000,netdev=lan0") && dc.contains("local.port=47125"), format!("DC1 argv: {}", dc));
+        c.ok(arm.contains("local.port=47125"), "ARM1 on the lab LAN");
+        // each machine's UEFI vars come from its own CPU's template
+        c.file(&cx.state("armmix").join("ARM1-AAVMF_VARS.fd"));
+        let i = run(cx, outs, &["status", "armmix"], &[]);
+        c.has(&outs[i].1, "ARM1            member win11-arm64");
+        let _ = run(cx, outs, &["restore", "armmix"], &[]);
     });
 
     scenario(&mut cx, "workgroup mode: one machine, local users, no lab LAN", &|cx, c, outs| {

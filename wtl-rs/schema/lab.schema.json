@@ -105,7 +105,7 @@
       ],
       "properties": {
         "os": {
-          "description": "OS key from `lib/oslist.conf`, e.g. `2019`, `2012`, `win11`.",
+          "description": "OS key from `lib/oslist.conf`, e.g. `2019`, `2012`, `win11`, `win11-arm64`.",
           "type": "string"
         },
         "role": {

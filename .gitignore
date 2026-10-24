@@ -1,7 +1,7 @@
 # Big / generated / stateful things - never commit these.
 
 # Installer ISOs (multi-GB; see docs/ISOS.md for how to get them). Default dir is iso-files/.
-iso-files/
+iso-files/*
 *.iso
 *.ISO
 
@@ -32,3 +32,6 @@ __pycache__/
 .venv/
 *.swp
 .DS_Store
+
+# virtio-win drivers for arm64 machines (Red Hat's, fetched by the user; see docs/ISOS.md)
+drivers/

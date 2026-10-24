@@ -183,7 +183,7 @@ pub struct SetupDef {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MachineDef {
-    /// OS key from `lib/oslist.conf`, e.g. `2019`, `2012`, `win11`.
+    /// OS key from `lib/oslist.conf`, e.g. `2019`, `2012`, `win11`, `win11-arm64`.
     pub os: String,
     /// The compact role alias: `dc` (= `roles: ["ad-ds"]`) or `member` (= no roles). Mutually
     /// exclusive with `roles`.
