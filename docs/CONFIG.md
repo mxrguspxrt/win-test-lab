@@ -102,7 +102,7 @@ A **machine**:
 
 | field | default | meaning |
 |-------|---------|---------|
-| `os` | (required) | OS key from `lib/oslist.conf`: `2012`, `2016`, `2019`, `2022`, `2025`, `win10`, `win11` (aliases like `2012r2`, `ws2019` work too). A machine with the `ad-ds` role (the DC) must be a Windows Server. |
+| `os` | (required) | OS key from `lib/oslist.conf`: `2012`, `2016`, `2019`, `2022`, `2025`, `win10`, `win11`, `win11-arm64` (aliases like `2012r2`, `ws2019` work too). `win11-arm64` is Windows 11 on Arm: native on an Apple Silicon Mac, emulated elsewhere; it needs the virtio-win drivers (docs/ISOS.md). A machine with the `ad-ds` role (the DC) must be a Windows Server. |
 | `roles` | `[]` | The server roles baked into this machine's 0 state: any of `ad-ds`, `ad-cs`, `dhcp`, `iis` (see **Roles** below). Servers only. Mutually exclusive with `role`. |
 | `role` | `"member"` | The compact alias for `roles`: `"dc"` means `roles: ["ad-ds"]` (the domain controller; at most one, and it makes the lab an AD lab); `"member"` means no roles. Mutually exclusive with `roles`. |
 | `features` | `[]` | Windows feature names installed during the build with `Install-WindowsFeature`, e.g. `["Telnet-Client"]`. Servers only; an unknown name fails the build with the list of available features. |

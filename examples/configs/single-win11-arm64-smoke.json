@@ -1,0 +1,10 @@
+{
+  "$schema": "../../wtl-rs/schema/run.schema.json",
+  "lab": "single-win11-arm64",
+  "mount": { "X": "../smoke-rs/out" },
+  "steps": [
+    { "as": "system", "run": "X:/setup.bat" },
+    { "run": "X:/smoke-arm64.exe" },
+    { "run": "X:/smoke-x64.exe" }
+  ]
+}

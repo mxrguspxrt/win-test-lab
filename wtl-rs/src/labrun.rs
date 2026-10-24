@@ -15,7 +15,7 @@ use crate::lab::{build_base_images, find_root, indent_file, pick_vnc_display, re
 use crate::labdef::{self, Lab, Role, Run, RunStep, StepAs};
 use crate::logx::{err, log, ok, warn};
 use crate::oslist::{self, OsInfo};
-use crate::qemu::{self, Env, Lan, Opts};
+use crate::qemu::{self, Arch, Env, Lan, Opts};
 use crate::qmp::{Addr, Qmp};
 use crate::serialwait::{Outcome, Wait};
 use crate::{mkiso, outputs, pyjson, sys, util};
@@ -67,6 +67,9 @@ struct LabJson<'a> {
     logon_user: &'a str,
     logon_password: &'a str,
     shutdown_when_ready: bool,
+    /// how much longer the guest's own fixed waits are: 1 on the hypervisor, more for a
+    /// machine the host emulates (an x64 guest on an Arm Mac starts PowerShell in ~50 s)
+    slow: u32,
     /// this machine's server roles (`ad-ds` `ad-cs` `dhcp` `iis`), baked in during the build
     roles: Vec<&'a str>,
     /// Windows feature names to install during the build
@@ -254,7 +257,15 @@ impl Vm {
     fn has_steps(&self) -> bool {
         !self.steps.is_empty()
     }
+    /// The machine's CPU, from its OS (`win11-arm64` is arm64).
+    fn arch(&self) -> Arch {
+        Arch::parse(&self.os.arch).unwrap_or_default()
+    }
 }
+
+/// How much longer the fixed waits (logon, power-off) are for an emulated machine: TCG runs
+/// a Windows guest of another CPU (x64 on an Apple Silicon Mac) several times slower.
+const EMULATED_SLOWDOWN: u32 = 6;
 
 /// The base image name for a machine: `<os>-dc` for a domain controller, `<os>-client` for
 /// any other machine (a member server, a client, a workgroup machine). Any OS key works with
@@ -459,6 +470,14 @@ impl MultiLab {
     fn vm(&self, name: &str) -> &Vm {
         self.vms.iter().find(|v| v.name == name).expect("known vm")
     }
+    /// 1 for a machine on the hypervisor, [`EMULATED_SLOWDOWN`] for an emulated one.
+    fn slow(&self, name: &str) -> u32 {
+        if self.env.accel_for(self.vm(name).arch()) == qemu::Accel::Tcg && !self.env.fast {
+            EMULATED_SLOWDOWN
+        } else {
+            1
+        }
+    }
     /// The DC's name (None in workgroup mode).
     fn dc_name(&self) -> Option<String> {
         self.vms.iter().find(|v| v.role == Role::Dc).map(|v| v.name.clone())
@@ -576,7 +595,8 @@ impl MultiLab {
                 continue;
             };
             let mut i = 0;
-            while sys::pid_alive(pid) && i < 900 {
+            let limit = 900 * self.slow(vm);
+            while sys::pid_alive(pid) && i < limit {
                 if self.vm_status(vm) == "shutdown" {
                     break;
                 }
@@ -584,8 +604,8 @@ impl MultiLab {
                 i += 1;
             }
             if sys::pid_alive(pid) {
-                if i >= 900 {
-                    warn(&format!("{} did not power off in 3 min, stopping it hard", vm));
+                if i >= limit {
+                    warn(&format!("{} did not power off in {} min, stopping it hard", vm, 3 * self.slow(vm)));
                 }
                 if !self.qmp_quit(vm) {
                     sys::kill_hard(pid);
@@ -611,11 +631,12 @@ impl MultiLab {
         };
         self.qmp_cmd(vm, "system_powerdown");
         let mut i = 0;
-        while sys::pid_alive(pid) && i < 1800 {
+        let (limit, again) = (1800 * self.slow(vm), 300 * self.slow(vm));
+        while sys::pid_alive(pid) && i < limit {
             if self.vm_status(vm) == "shutdown" {
                 break;
             }
-            if i == 300 {
+            if i == again {
                 self.qmp_cmd(vm, "system_powerdown");
             }
             self.nap(0.2)?;
@@ -624,7 +645,7 @@ impl MultiLab {
         if !sys::pid_alive(pid) {
             return Ok(true);
         }
-        if self.vm_status(vm) != "shutdown" && i >= 1800 {
+        if self.vm_status(vm) != "shutdown" && i >= limit {
             return Ok(false);
         }
         if !self.qmp_quit(vm) {
@@ -715,7 +736,9 @@ impl MultiLab {
             }
             _ => {}
         }
-        self.env.check_tools()?;
+        let mut arches: Vec<Arch> = self.vms.iter().map(|v| v.arch()).collect();
+        arches.dedup();
+        self.env.check_tools(&arches)?;
         sys::install_interrupt_handler();
         self.run_lab()
     }
@@ -772,7 +795,9 @@ impl MultiLab {
         let _ = std::fs::remove_dir_all(&stage);
         let labdir = stage.join("LAB");
         std::fs::create_dir_all(&labdir).with_context(|| format!("cannot create {}", labdir.display()))?;
-        for f in ["lab.ps1", "labsvc.ps1"] {
+        // agent.ps1 too: the base image's copy may be older than this checkout's (lab.ps1
+        // installs it as C:\WTL\agent.ps1 during the 0-state build)
+        for f in ["lab.ps1", "labsvc.ps1", "agent.ps1"] {
             let src = self.root.join("guest").join(f);
             std::fs::copy(&src, labdir.join(f)).with_context(|| format!("cannot copy {}", src.display()))?;
         }
@@ -860,6 +885,7 @@ impl MultiLab {
             logon_user,
             logon_password,
             shutdown_when_ready: build && vm.role != Role::Dc,
+            slow: self.slow(&vm.name),
             roles,
             features,
             ad_cs,
@@ -920,13 +946,21 @@ impl MultiLab {
     }
 
     fn uefi_vars(&self, vm: &Vm) -> Result<Option<PathBuf>> {
-        if vm.os.firmware != "uefi" {
+        if vm.os.firmware != "uefi" && vm.arch() == Arch::X64 {
             return Ok(None);
         }
-        let vars = self.st(&format!("{}-OVMF_VARS.fd", vm.name));
+        let (name, tmpl, var) = match vm.arch() {
+            Arch::X64 => ("OVMF_VARS", &self.env.ovmf_vars, "WTL_OVMF_VARS"),
+            Arch::Arm64 => ("AAVMF_VARS", &self.env.aavmf_vars, "WTL_AAVMF_VARS"),
+        };
+        let vars = self.st(&format!("{}-{}.fd", vm.name, name));
         if !vars.is_file() {
-            std::fs::copy(&self.env.ovmf_vars, &vars).with_context(|| {
-                format!("cannot copy the UEFI vars template {} (install 'ovmf' or set WTL_OVMF_VARS)", self.env.ovmf_vars.display())
+            // the UEFI variables (boot order) live in the base image's copy: the install
+            // registered the Windows Boot Manager there
+            let base = self.base_image(vm).with_extension("vars.fd");
+            let src = if base.is_file() { &base } else { tmpl };
+            std::fs::copy(src, &vars).with_context(|| {
+                format!("cannot copy the UEFI vars template {} (install QEMU's UEFI firmware or set {})", src.display(), var)
             })?;
         }
         Ok(Some(vars))
@@ -963,6 +997,7 @@ impl MultiLab {
             no_usernet: vm.role == Role::Dc,
             no_shutdown: true,
             uefi: self.uefi_vars(vm)?,
+            arch: vm.arch(),
             ..Default::default()
         };
         o.qmp = Some(self.new_qmp_addr(&vm.name)?);
@@ -1082,8 +1117,9 @@ impl MultiLab {
     }
 
     fn wait_logon(&mut self, vm: &str, label: &str) -> Result<()> {
+        let wait = 300.0 * self.slow(vm) as f64;
         for attempt in 1..=3 {
-            let t = self.remaining().clamp(1.0, 300.0);
+            let t = self.remaining().clamp(1.0, wait);
             match self.serial_wait(vm, &["AGENT_START"], &["LAB_FAIL"], t)? {
                 Outcome::Until(_) => return Ok(()),
                 Outcome::Timeout if Instant::now() >= self.deadline => return Err(self.fail(vm, Outcome::Timeout, label)),
@@ -1091,7 +1127,7 @@ impl MultiLab {
                 other => return Err(self.fail(vm, other, label)),
             }
             if !self.reset_if_off(vm) {
-                warn(&format!("{}: no logon within 5 min (autologon stuck?) - resetting it ({}/3)", vm, attempt));
+                warn(&format!("{}: no logon within {} min (autologon stuck?) - resetting it ({}/3)", vm, wait as u64 / 60, attempt));
                 self.qmp_cmd(vm, "system_reset");
             }
         }

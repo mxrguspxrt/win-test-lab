@@ -28,9 +28,49 @@ $ScriptDir  = Split-Path -Parent $ScriptPath
 $script:HasCom1 = $false
 try { $script:HasCom1 = @([System.IO.Ports.SerialPort]::GetPortNames()) -contains 'COM1' } catch { $script:HasCom1 = $false }
 
+# Machines without a COM1 (Windows on Arm: no driver for QEMU's UART) write the same lines to a
+# virtio-serial port (virtio-win's vioserial driver) that QEMU appends to the host's serial log
+# file, so the host reads one log either way. SPEC.md.
+$WtlChannel = '\\.\Global\org.wintestlab.0'
+
+# .NET's FileStream refuses device paths (\\.\Global\...): open the port with CreateFile and
+# wrap the handle. Returns $null when the port is not there (yet).
+function Open-WtlChannel {
+    if (-not ('WtlNative.Chan' -as [type])) {
+        Add-Type -Namespace WtlNative -Name Chan -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+'@
+    }
+    # GENERIC_WRITE, no sharing, OPEN_EXISTING
+    $h = [WtlNative.Chan]::CreateFile($WtlChannel, 0x40000000, 0, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)
+    if ($h.IsInvalid) { $h.Dispose(); return $null }
+    return (New-Object System.IO.FileStream($h, [System.IO.FileAccess]::Write, 1))
+}
+
+function Write-ChannelLine([string]$Line, [int]$TrySecs) {
+    # The driver may still be starting at first logon: retry.
+    $until = (Get-Date).AddSeconds($TrySecs)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Line + "`r`n")
+    do {
+        $fs = $null
+        try {
+            $fs = Open-WtlChannel
+            if ($fs -eq $null) { throw 'no channel' }
+            $fs.Write($bytes, 0, $bytes.Length)
+            $fs.Flush()
+            return
+        } catch {
+        } finally {
+            if ($fs -ne $null) { try { $fs.Close() } catch { } }
+        }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $until)
+}
+
 function Write-SerialLine([string]$Line) {
-    # Open COM1, write one line, close. Silent fallback if COM1 is unavailable.
-    if (-not $script:HasCom1) { return }
+    # Open COM1, write one line, close; without COM1 the virtio-serial channel.
+    if (-not $script:HasCom1) { Write-ChannelLine $Line 60; return }
     for ($attempt = 0; $attempt -lt 3; $attempt++) {
         $port = $null
         try {
@@ -84,7 +124,9 @@ function Set-Phase([string]$Text) {
 # Heartbeat: a background job that emits "WTL LOG | still busy ..." every 5 minutes while a
 # long blocking call (WU scan/download/install, DISM) runs in the main process.
 $HeartbeatScript = {
-    param($PhaseFile, $LogFile, $HasCom1)
+    param($PhaseFile, $LogFile, $HasCom1, $Channel, $OpenChannel)
+    $WtlChannel = $Channel
+    if (-not $HasCom1) { . ([ScriptBlock]::Create($OpenChannel)) }
     while ($true) {
         Start-Sleep -Seconds 300
         $phase = 'working'; $mins = 0
@@ -96,7 +138,14 @@ $HeartbeatScript = {
         } catch { }
         $line = "WTL LOG | still busy: $phase (${mins} min)"
         try { [System.IO.File]::AppendAllText($LogFile, ((Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + " $line`r`n")) } catch { }
-        if ($HasCom1) {
+        if (-not $HasCom1) {
+            $fs = $null
+            try {
+                $fs = Open-WtlChannel
+                $b = [System.Text.Encoding]::UTF8.GetBytes($line + "`r`n")
+                $fs.Write($b, 0, $b.Length)
+            } catch { } finally { if ($fs -ne $null) { try { $fs.Close() } catch { } } }
+        } else {
             for ($i = 0; $i -lt 3; $i++) {
                 $p = $null
                 try {
@@ -122,7 +171,7 @@ $script:HeartbeatJob = $null
 function Start-Heartbeat {
     if ($script:HeartbeatJob -ne $null) { return }
     try {
-        $script:HeartbeatJob = Start-Job -ScriptBlock $HeartbeatScript -ArgumentList $PhaseFile, $LogFile, $script:HasCom1
+        $script:HeartbeatJob = Start-Job -ScriptBlock $HeartbeatScript -ArgumentList $PhaseFile, $LogFile, $script:HasCom1, $WtlChannel, ('function Open-WtlChannel {' + ${function:Open-WtlChannel}.ToString() + '}')
     } catch {
         $script:HeartbeatJob = $null
         Write-Log "heartbeat job not available: $($_.Exception.Message)"

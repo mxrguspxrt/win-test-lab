@@ -255,16 +255,61 @@ function Invoke-Request($ReqPath) {
     Write-SvcLog "handled $(Split-Path -Leaf $ReqPath) -> ok=$($res.ok)"
 }
 
+# ---- the report channel for machines without COM1 (Windows on Arm) ---------------------------
+# The lab user's agent may not open the virtio-serial port (only administrators and SYSTEM can);
+# it drops its lines into C:\WTL\chan as <sortable>.line files, and this worker forwards them in
+# order. Created only where there is no COM1, so x64 machines behave exactly as before.
+$ChanDir = 'C:\WTL\chan'
+$script:Chan = $null
+$script:HasCom1 = $true
+try { $script:HasCom1 = @([System.IO.Ports.SerialPort]::GetPortNames()) -contains 'COM1' } catch { }
+
+function Open-SvcChannel {
+    if (-not ('WtlNative.SvcChan' -as [type])) {
+        Add-Type -Namespace WtlNative -Name SvcChan -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+'@
+    }
+    # GENERIC_WRITE, no sharing, OPEN_EXISTING
+    $h = [WtlNative.SvcChan]::CreateFile('\\.\Global\org.wintestlab.0', 0x40000000, 0, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)
+    if ($h.IsInvalid) { $h.Dispose(); return $null }
+    return (New-Object System.IO.FileStream($h, [System.IO.FileAccess]::Write, 1))
+}
+
+function Send-SvcSpool {
+    $lines = @(Get-ChildItem -LiteralPath $ChanDir -Filter '*.line' -ErrorAction SilentlyContinue | Sort-Object Name)
+    foreach ($f in $lines) {
+        if ($script:Chan -eq $null) { $script:Chan = Open-SvcChannel; if ($script:Chan -eq $null) { return } }
+        try {
+            $b = [System.IO.File]::ReadAllBytes($f.FullName)
+            $script:Chan.Write($b, 0, $b.Length)
+            $script:Chan.Flush()
+            Remove-Item -LiteralPath $f.FullName -Force
+        } catch {
+            try { $script:Chan.Close() } catch { }
+            $script:Chan = $null
+            return
+        }
+    }
+}
+
 # single instance
 $mutex = New-Object System.Threading.Mutex($false, 'Global\WTL-Svc')
 try { if (-not $mutex.WaitOne(0)) { exit 0 } } catch [System.Threading.AbandonedMutexException] { }
 
 if (-not (Test-Path $SvcDir)) { New-Item -ItemType Directory -Path $SvcDir -Force | Out-Null }
+if (-not $script:HasCom1 -and -not (Test-Path $ChanDir)) {
+    New-Item -ItemType Directory -Path $ChanDir -Force | Out-Null
+    # the lab user writes its lines here (C:\WTL already grants Users modify)
+}
 Write-SvcLog "labsvc started as $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
 while ($true) {
     try {
+        if (-not $script:HasCom1) { Send-SvcSpool }
         $reqs = Get-ChildItem -LiteralPath $SvcDir -Filter '*.req.json' -ErrorAction SilentlyContinue | Sort-Object Name
         foreach ($r in $reqs) { Invoke-Request $r.FullName }
     } catch { Write-SvcLog "loop error: $($_.Exception.Message)" }
-    Start-Sleep -Milliseconds 500
+    # the report spool needs a short tick; requests are fine with it too
+    Start-Sleep -Milliseconds 200
 }
