@@ -18,6 +18,9 @@ step "clippy + fmt"
 if cargo clippy --all-targets --quiet -- -D warnings; then echo "ok  clippy"; else echo "FAIL clippy"; rc=1; fi
 if cargo fmt --check >/dev/null; then echo "ok  fmt"; else echo "FAIL fmt (run cargo fmt)"; rc=1; fi
 
+step "the wtl crate (wtl/: cargo install wtl) builds against this library"
+if (cd wtl && cargo build --quiet && cargo clippy --quiet -- -D warnings); then echo "ok  wtl/"; else echo "FAIL wtl/"; rc=1; fi
+
 step "PowerShell lint (guest/*.ps1)"
 if command -v python3 >/dev/null; then
     if python3 tests/ps_lint.py guest/*.ps1; then :; else rc=1; fi

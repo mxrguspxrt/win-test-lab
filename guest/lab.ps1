@@ -721,21 +721,38 @@ $SvcDir = 'C:\WTL\svc'
 # machine's CPU; PowerShell alone then takes ~50 s to start). Set by Invoke-Lab.
 $script:LabSlow = 1
 
+# The worker is a boot task (WTL-Svc), and Windows starts boot tasks when it gets to them:
+# Windows 11 has started it 2 minutes after the user's logon. Until the worker has answered once
+# in this boot, a request may wait this long for it to start; after that, the normal timeout.
+$SvcStartS = 900
+$script:SvcAnswered = $false
+
 function Invoke-SvcRequest($Req, [int]$TimeoutS = 120) {
     $TimeoutS = $TimeoutS * $script:LabSlow
+    if (-not $script:SvcAnswered) { $TimeoutS = [Math]::Max($TimeoutS, $SvcStartS * $script:LabSlow) }
     if (-not (Test-Path $SvcDir)) { New-Item -ItemType Directory -Path $SvcDir -Force | Out-Null }
     $id = [Guid]::NewGuid().ToString('N')
     $reqPath = Join-Path $SvcDir ($id + '.req.json')
     $resPath = Join-Path $SvcDir ($id + '.res.json')
     [System.IO.File]::WriteAllText($reqPath, ($Req | ConvertTo-Json -Compress))
-    $deadline = [DateTime]::Now.AddSeconds($TimeoutS)
+    $start = [DateTime]::Now
+    $deadline = $start.AddSeconds($TimeoutS)
+    $told = $false
     while (-not (Test-Path -LiteralPath $resPath)) {
         if ([DateTime]::Now -ge $deadline) { throw "the privileged worker did not answer within ${TimeoutS}s (is WTL-Svc running?)" }
+        if (-not $script:SvcAnswered -and -not $told -and ([DateTime]::Now - $start).TotalSeconds -ge 30) {
+            Send-LabPhase 'waiting for the SYSTEM worker (WTL-Svc) to start'
+            $told = $true
+        }
         Start-Sleep -Milliseconds 300
     }
     Start-Sleep -Milliseconds 100
     $res = [System.IO.File]::ReadAllText($resPath) | ConvertFrom-Json
     try { Remove-Item -LiteralPath $resPath -Force } catch { }
+    if (-not $script:SvcAnswered -and $told) {
+        Send-LabPhase ('the SYSTEM worker answered after {0:N0}s' -f ([DateTime]::Now - $start).TotalSeconds)
+    }
+    $script:SvcAnswered = $true
     return $res
 }
 

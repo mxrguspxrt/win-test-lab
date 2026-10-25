@@ -1,8 +1,9 @@
 //! win-test-lab: test Windows software on real Windows machines in QEMU. The `wtl` program
 //! and the pieces it is built from.
 //!
-//! * [`lab`]: the `wtl` command line for labs (run, up, restore, status, ...) and installing
-//!   the Windows base images.
+//! * [`cli`]: the `wtl` command line ([`cli::main`]).
+//! * [`lab`]: the lab commands (run, up, restore, status, ...) and installing the Windows base
+//!   images.
 //! * [`home`]: where the data lives (ISOs, base images, 0 states) and the config files.
 //! * [`assets`]: the guest scripts, the OS table and the example labs built into the program.
 //! * [`labdef`]: the typed JSON lab and run formats, their validation and JSON Schema.
@@ -16,6 +17,7 @@
 
 pub mod assets;
 pub mod build;
+pub mod cli;
 pub mod home;
 pub mod lab;
 pub mod labdef;
