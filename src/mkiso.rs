@@ -1,5 +1,4 @@
-//! ISO9660 + Joliet image writer (port of lib/mkiso.py; same layout, byte for byte apart
-//! from timestamps).
+//! ISO9660 + Joliet image writer (the control and mount discs).
 //!
 //! * ISO9660 primary tree: level-2 style names (uppercase d-characters, max 30 chars for
 //!   NAME.EXT plus ";1" version suffix for files, 31 chars for directories).

@@ -289,7 +289,7 @@ pub struct Lan {
     pub port: u16,
 }
 
-/// The options lib/common.sh qemu_cmd took.
+/// What one VM needs: disks, discs, serial log, monitor, display, LAN.
 #[derive(Clone, Debug, Default)]
 pub struct Opts {
     pub name: String,

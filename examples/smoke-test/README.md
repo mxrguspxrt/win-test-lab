@@ -11,7 +11,4 @@ The example configs mount `out/` as drive `X:`, run `setup.bat` as `system` (cop
 to `C:\App`), then `smoke.exe` as the machines' logged-on users - see
 `examples/configs/school-smoke.json` and `2019-smoke.json`.
 
-`build.sh` also produces `smoke.zip` for the separate single-VM tester:
-`launch-test.sh examples/smoke-test/smoke.zip smoke.exe 2019`.
-
 Needs the mingw cross-compiler: `sudo apt-get install gcc-mingw-w64-x86-64`.

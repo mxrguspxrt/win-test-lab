@@ -1,6 +1,6 @@
 //! Read Windows install media: the UDF file system of a Windows ISO (1.02 / 2.01 / 2.50,
 //! including the metadata partition), falling back to ISO9660 (Joliet preferred), and the
-//! image list in `sources/install.wim` / `install.esd` (port of lib/isoinfo.py).
+//! image list in `sources/install.wim` / `install.esd`.
 //!
 //! Only reads what picking an image needs: directory lookups and the WIM's XML header. The
 //! ISO is opened read-only.

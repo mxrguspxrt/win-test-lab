@@ -9,15 +9,13 @@ roles (`ad-cs`, `dhcp`, `iis`), Windows features and per-machine setup scripts, 
 the 0 state. A lab is `labs/<name>.json` or a `lab.json` in another project, built once into a
 frozen "0 state", and reset to it before every run. A run config (`examples/configs/*.json`,
 or a project's `wintest/*.json`) names its lab by name or path, mounts host folders and runs
-programs on chosen machines as chosen users. The user wants it simple: "0 state, run my
-program, see if it works, restore, deploy the new version". No snapshot juggling.
+programs on chosen machines as chosen users. Keep it simple: 0 state, run the program, see
+if it works, restore, deploy the new version. No snapshot juggling.
 
 The host side is the Rust crate at the repository root (crate `win-test-lab` on crates.io,
 binary `wtl`). The guest side is PowerShell in `guest/`, compiled into `wtl` (with
 `lib/oslist.conf` and `labs/*.json`) so an installed `wtl` needs no checkout; run from a
 checkout, `wtl` reads them from disk instead. They talk over a serial log (SPEC.md).
-`build-image.sh` and `launch-test.sh` (bash + `lib/*.py`) are older tools that `wtl` does not
-use; they stay in git, not in the published crate.
 
 Read [SPEC.md](../SPEC.md) for the design and [docs/CONFIG.md](CONFIG.md) for the formats.
 
@@ -41,7 +39,7 @@ Read [SPEC.md](../SPEC.md) for the design and [docs/CONFIG.md](CONFIG.md) for th
   (compiled in by `embed.rs`) and the package's `include` list in Cargo.toml; data paths go
   through `src/home.rs`. Check with `cargo package --list` and a `cargo install --path .`
   run from an empty folder.
-- At most 3 VMs at a time on the development machine.
+- Mind the host: each VM takes 3-4 GB of RAM and 2 vCPUs; a 3-machine lab wants ~12 GB free.
 
 ## Where things are
 
@@ -61,7 +59,7 @@ Read [SPEC.md](../SPEC.md) for the design and [docs/CONFIG.md](CONFIG.md) for th
     guest/lab.ps1            rename, DC promotion, users/groups, join, autologon, the build-time
                              "configure" phase (roles ad-cs/dhcp/iis, features, setup), run steps
     guest/labsvc.ps1         SYSTEM worker: mounts, steps as system / as another user
-    guest/agent.ps1          logon agent (COM1); also the launch-test.sh agent
+    guest/agent.ps1          logon agent (COM1)
     guest/setup.ps1          base-image first logon
     labs/*.json, examples/configs/*.json, schema/*.json
 
@@ -85,7 +83,7 @@ images), `labs/state/<lab>/` (0 state, overlays, serial logs, `runs/<id>/`), `is
 ## Before saying it works
 
     tests/all.sh                         # everything that needs no VM (cargo test, ps_lint,
-                                         # lab/config checks, the fake-qemu suite)
+                                         # clippy, fmt, lab/config checks)
     cargo clippy --all-targets && cargo fmt --check
     cargo check --target x86_64-pc-windows-gnu && cargo check --target x86_64-apple-darwin
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps

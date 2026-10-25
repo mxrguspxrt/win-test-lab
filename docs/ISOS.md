@@ -7,7 +7,9 @@ shows it: `iso-files/` in the home), or point `WTL_ISO_DIR` (or `"iso_dir"` in a
 at wherever you keep them. Do not use third-party download tools or mirrors.
 
 The lab finds the right ISO by reading the Windows build number **and CPU** *inside* it, so
-the file name does not matter.
+the file name does not matter. To pin a file when you keep several of one OS, add an
+`images-list.conf` to the home, one `KEY = file.iso` per line (`2019 = server2019-de.iso`; a
+path relative to the ISO folder, or absolute).
 
 ## Which OS has which CPU
 
@@ -38,7 +40,7 @@ Experience*. Client media install Pro with Microsoft's generic key (not activate
 
 ## Checking an ISO
 
-    wtl check-iso                              # every ISO in WTL_ISO_DIR: build, CPU, editions,
+    wtl check-iso                              # every ISO in the ISO folder: build, CPU, editions,
                                                # and which lab key it serves
     wtl check-iso FILE.iso --sha256 HASH       # also: is it byte-for-byte what Microsoft published
 
@@ -84,6 +86,6 @@ build without them. x64 machines need none of this.
 ## Windows 10 / 11 members
 
 A lab member may run Windows 10 or 11 (`"os": "win10"` / `"win11"` / `"win11-arm64"`, see
-`labs/win10.json`, `labs/2025-arm64.json`); the DC must be a Windows Server. Windows 11 boots
+`labs/win10.json`, `labs/single-win11-arm64.json`); the DC must be a Windows Server. Windows 11 boots
 UEFI, so the host needs QEMU's UEFI firmware (Homebrew's and the distros' QEMU packages ship
 it; `wtl doctor` shows what it found).

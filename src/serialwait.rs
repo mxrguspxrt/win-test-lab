@@ -1,6 +1,5 @@
-//! Wait for `WTL <EVENT> [key=value ...] [| text]` lines in a growing serial log (port of
-//! lib/serialwait.py). Used in-process by `wtl run`, and as `wtl tool serialwait` with the same
-//! flags and exit codes as the Python script.
+//! Wait for `WTL <EVENT> [key=value ...] [| text]` lines in a growing serial log. Used
+//! in-process by `wtl run`, and as `wtl tool serialwait`.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};

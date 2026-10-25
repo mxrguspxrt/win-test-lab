@@ -1,4 +1,4 @@
-//! Minimal QEMU Machine Protocol client (port of lib/qmp.py).
+//! Minimal QEMU Machine Protocol client.
 //!
 //! The monitor is a unix socket on Linux/macOS (`-qmp unix:PATH,server=on,wait=off`) and a
 //! loopback TCP port on Windows (`-qmp tcp:127.0.0.1:PORT,...`), since Windows QEMU

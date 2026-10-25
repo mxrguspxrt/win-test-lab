@@ -1,4 +1,4 @@
-//! Timestamped, coloured log lines on stderr (same look as lib/common.sh log/ok/warn/err).
+//! Timestamped, coloured log lines on stderr: log / ok / warn / err.
 
 use std::io::IsTerminal;
 use std::sync::OnceLock;

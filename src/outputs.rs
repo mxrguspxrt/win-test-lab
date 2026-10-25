@@ -1,10 +1,9 @@
-//! Decode program output the guest sent over serial (same result as lib/outputs.py, which
-//! launch-test.sh still uses).
+//! Decode program output the guest sent over serial.
 //!
 //! ```text
 //! The guest sends   WTL OUTPUT stream=NAME seq=N | <base64>
 //! followed by       WTL OUTPUT_END stream=NAME bytes=TOTAL sent=N truncated=0|1
-//! and (launch-test) WTL PROC_EXIT code=N secs=S   or   WTL PROC_TIMEOUT secs=S
+//! and (job mode)    WTL PROC_EXIT code=N secs=S   or   WTL PROC_TIMEOUT secs=S
 //! ```
 //!
 //! A lab run uses streams `stepNout` / `stepNerr`. Each stream is written to

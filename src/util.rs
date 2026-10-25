@@ -1,7 +1,6 @@
 //! Small string and path helpers. Several mirror the Python standard library (str.strip,
-//! int(), os.path.normpath, urllib.parse.unquote), because the serial protocol and the ISO
-//! writer must match the Python tools build-image.sh / launch-test.sh still use; plus
-//! `du`- and `which`-like helpers.
+//! int(), os.path.normpath, urllib.parse.unquote): the serial protocol and the ISO writer were
+//! first written in Python and keep its behaviour; plus `du`- and `which`-like helpers.
 
 use std::path::{Component, Path, PathBuf};
 
