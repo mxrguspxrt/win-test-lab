@@ -1,5 +1,5 @@
 {
-  "$schema": "../wtl-rs/schema/lab.schema.json",
+  "$schema": "../schema/lab.schema.json",
   "domain": "pki.local",
   "netbios": "PKI",
   "network": { "subnet": "10.77.60", "lan_port": 47060 },

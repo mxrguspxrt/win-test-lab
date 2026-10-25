@@ -1,8 +1,9 @@
 {
-  "$schema": "../../wtl-rs/schema/run.schema.json",
+  "$schema": "../../schema/run.schema.json",
   "lab": "single-2025",
-  "mount": { "X": "../smoke-rs/out" },
+  "mount": { "X": "../smoke-test/out" },
   "steps": [
-    { "run": "X:/smoke-x64.exe" }
+    { "as": "system", "run": "X:/setup.bat" },
+    { "run": "X:/smoke.exe" }
   ]
 }

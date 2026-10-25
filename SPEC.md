@@ -5,12 +5,16 @@ For using the lab see [README.md](README.md) and [docs/CONFIG.md](docs/CONFIG.md
 
 ## Pieces
 
-    wtl-rs/                Rust host program `wtl-rs` (also runs as `lab`): the AD lab runner
-      src/lab.rs           `lab` command line (run/up/.../doctor/check-iso); finding the
-                           checkout; running the base-image builds in parallel
-      src/build.rs         unattended Windows install -> images/<name>.qcow2 (`lab build-image`)
+    Cargo.toml, src/       the Rust host program `wtl` (crate `win-test-lab`)
+      src/main.rs          the `wtl` command line
+      src/lab.rs           the lab commands (run/up/.../doctor/check-iso/home/init); running
+                           the base-image builds in parallel
+      src/home.rs          the home: where ISOs, images and 0 states live, the config files
+      src/assets.rs        guest/, lib/oslist.conf, labs/*.json built into the program
+                           (listed by embed.rs, the build script)
+      src/build.rs         unattended Windows install -> images/<name>.qcow2 (`wtl build-image`)
       src/winiso.rs        Windows ISO reader: UDF / ISO9660, WIM image list, build + CPU
-      src/sha256.rs        SHA-256 for `lab check-iso --sha256`
+      src/sha256.rs        SHA-256 for `wtl check-iso --sha256`
       src/labdef.rs        the JSON lab / run formats, validation, JSON Schema
       src/labrun.rs        the runner: 0 state, boot, control discs, steps, results
       src/qemu.rs          WTL_* settings and the QEMU command line (x64 and arm64)
@@ -20,8 +24,8 @@ For using the lab see [README.md](README.md) and [docs/CONFIG.md](docs/CONFIG.md
       src/mkiso.rs         ISO9660 + Joliet writer (control and mount discs) and reader
       src/oslist.rs        the OS table lib/oslist.conf
       src/sys.rs           process liveness / stop, detached spawn, Ctrl-C
-      schema/              generated JSON Schemas of the two formats (`wtl-rs schema`)
-      tests/fake_lab.rs    end-to-end suite: wtl-rs lab against a fake QEMU + qemu-img
+    schema/                generated JSON Schemas of the two formats (`wtl schema`)
+    tests/fake_lab.rs      end-to-end suite: `wtl` against a fake QEMU + qemu-img
     labs/<name>.json       lab definitions; labs/state/<name>/ their 0 state, runs, logs
     examples/configs/      example run configs
     guest/lab.ps1          guest side of the lab (rename, DC promotion, join, run steps)
@@ -30,28 +34,25 @@ For using the lab see [README.md](README.md) and [docs/CONFIG.md](docs/CONFIG.md
     guest/setup.ps1        first-logon setup of a base image (build phase)
     guest/autounattend*.xml.tmpl   unattended Windows Setup answer files (BIOS / UEFI)
     drivers/               virtio-win drivers for arm64 machines (git-ignored; docs/ISOS.md)
-    build-image.sh         the older bash builder (Linux; `lab` no longer uses it)
-    launch-test.sh         separate single-VM tester (no domain; see the end of this file)
-    download-isos.sh, setup-host.sh, lib/common.sh, lib/*.py, lib/rename-isos.sh
-                           host scripts and Python helpers of build-image.sh / launch-test.sh
-    lib/oslist.conf        OS table (read by both the Rust and the bash side)
-    images-list.conf       which ISO file serves which OS key (optional; else found by build)
+    lib/oslist.conf        the OS table: key, Windows build, edition, firmware, CPU
+    images-list.conf       optional, in the home: which ISO file serves which OS key (else
+                           found by the build and CPU inside each ISO)
+    examples/              smoke-test (C) and smoke-rs (Rust, x64 + Arm64) test programs,
+                           pki/ scripts for the pki lab, configs/ example run files
     tests/                 all.sh (every no-VM test), ps_lint.py (PowerShell 4 lint),
-                           run-tests.sh + fake-qemu (build-image.sh / launch-test.sh suite),
-                           check-labs.sh, check-catalog.sh
+                           check-labs.sh
 
 Host requirements: QEMU (`qemu-system-x86_64` for x64 machines, `qemu-system-aarch64` for
 arm64 machines, `qemu-img`) and its UEFI firmware; on Linux a writable `/dev/kvm`. Nothing
-else: no bash, no Python, no root, no Samba, no xorriso/genisoimage. `lab` reads the ISOs and
-writes its discs itself. (The older bash tools build-image.sh / launch-test.sh need bash 4 +
-python3.)
+else: no bash, no Python, no root, no Samba, no xorriso/genisoimage, no checkout. `wtl` reads
+the ISOs and writes its discs itself.
 
 ### CPUs and acceleration
 
 Every OS key has a CPU (`arch` in lib/oslist.conf): `x64` or `arm64`. A machine whose CPU is
 the host's own runs on the hypervisor (KVM / WHPX / HVF); any other runs emulated in QEMU's
 TCG (`-accel tcg,thread=multi`), which works but is several times slower (see the measured
-table in README.md). `lab` scales its fixed waits (logon, power-off) by 6 for an emulated
+table in README.md). `wtl` scales its fixed waits (logon, power-off) by 6 for an emulated
 machine. `WTL_ACCEL` forces one accelerator for every machine.
 
 | | x64 machine | arm64 machine |
@@ -72,9 +73,13 @@ which Windows Setup installs on its own, and refuses to start an arm64 build wit
 
 | variable | default | meaning |
 |----------|---------|---------|
-| `WTL_ROOT` | found from the binary's location (or the cwd) | the win-test-lab folder |
-| `WTL_ISO_DIR` | `<root>/iso-files` | installer ISOs |
-| `WTL_IMAGES_DIR` | `<root>/images` | base images `<os>-dc.qcow2`, `<os>-client.qcow2` |
+| `WTL_HOME` (`--home`) | see below | the home: where the data lives (`WTL_ROOT` is an old name for it) |
+| `WTL_CONFIG` | `config.json` in the per-user config folder | the user config file |
+| `WTL_ISO_DIR` | `<home>/iso-files` | installer ISOs |
+| `WTL_IMAGES_DIR` | `<home>/images` | base images `<os>-dc.qcow2`, `<os>-client.qcow2` |
+| `WTL_STATE_DIR` | `<home>/labs/state` | each lab's 0 state, run disks, logs and results |
+| `WTL_RUNS_DIR` | `<home>/runs` | base-image build scratch (`build-<image>/`) |
+| `WTL_DRIVERS_DIR` | `<home>/drivers` | virtio-win drivers for arm64 machines |
 | `WTL_QEMU`, `WTL_QEMU_IMG` | `qemu-system-x86_64`, `qemu-img` | the QEMU programs |
 | `WTL_QEMU_ARM64` | `qemu-system-aarch64` | the QEMU program for arm64 machines |
 | `WTL_ACCEL` | kvm / whpx / hvf by host for the host's CPU, tcg for the other | `kvm`, `whpx`, `hvf` or `tcg` for every machine; `WTL_NO_KVM=1` = tcg |
@@ -84,10 +89,21 @@ which Windows Setup installs on its own, and refuses to start an arm64 build wit
 | `WTL_QMP` | `unix` (`tcp` on Windows) | QEMU monitor transport |
 | `WTL_OVMF_CODE`, `WTL_OVMF_VARS` | the first found: `/usr/share/OVMF/OVMF_{CODE,VARS}_4M.fd`, ..., Homebrew's `edk2-x86_64-code.fd` / `edk2-i386-vars.fd` | x64 UEFI firmware |
 | `WTL_AAVMF_CODE`, `WTL_AAVMF_VARS` | the first found: `/usr/share/AAVMF/AAVMF_{CODE,VARS}.fd`, ..., Homebrew's `edk2-aarch64-code.fd` / `edk2-arm-vars.fd` | arm64 UEFI firmware |
-| `WTL_BUILDER` | `lab build-image` | what installs one base image (the tests use a fake) |
+| `WTL_BUILDER` | `wtl build-image` | what installs one base image (the tests use a fake) |
 | `WTL_DISPLAY` | `gtk` (`cocoa` on macOS) | display used by `--show` |
 | `WTL_PASSWORD` | `WinTest!2026` | local Administrator password baked into base images |
 | `WTL_TEST_FAST=1` | | skip fixed settle sleeps (fake-QEMU tests only) |
+
+The home (`src/home.rs`) is, first match wins: `WTL_HOME`; the current folder or a parent of
+it with a `wtl.json` or a checkout (`lib/oslist.conf` + `guest/lab.ps1`); the checkout the
+program was built in; `home` in the user config file; the per-user data folder
+(`directories` crate: XDG on Linux, Application Support on macOS, `%LOCALAPPDATA%` on
+Windows). Each folder above is its variable, else its key in the home's `wtl.json`, else its
+key in the user config file, else its default; config paths are relative to their file. A
+home that is a checkout supplies `guest/`, `lib/oslist.conf` and its `labs/`; otherwise the
+copies built into the program are used, and a built-in lab NAME is written to
+`<state_dir>/NAME/NAME.json` when used. A child `wtl build-image` gets the resolved folders in
+its environment.
 
 ## Base images
 
@@ -96,12 +112,13 @@ controllers and `images/<os>-client.qcow2` for every other machine (members, mem
 workgroup machines). A clone of a DC cannot join its own domain, so the two are separate
 installs; machines of the same OS and role share one image, in any lab. Any Server OS key
 works as a DC and any OS key as the rest (a 2012 DC + 2019 member = `2012-dc` + `2019-client`).
-`lab` runs itself as `lab build-image <os> --name <os>-dc|<os>-client --computer-name
+`wtl run` runs itself as `wtl build-image <os> --name <os>-dc|<os>-client --computer-name
 DC<os>|CL<os> --no-updates` for every missing image of a lab, in parallel, logging to
 `labs/state/<lab>/build-<image>.log`.
 
-The ISO: the images-list.conf entry for the OS key if its image 1 has the OS's build and CPU,
-else the newest ISO in `WTL_ISO_DIR` that does (read from the WIM inside; x64 and arm64
+The ISO: the home's `images-list.conf` entry for the OS key (`2019 = my-server-2019.iso`, a
+path relative to the ISO folder) if its image 1 has the OS's build and CPU, else the newest ISO
+in the ISO folder that does (read from the WIM inside; x64 and arm64
 Windows 11 share build 26300, so the CPU matters). The build renders
 `guest/autounattend*.xml.tmpl` (`@ARCH@` = amd64 / arm64), puts it with `guest/*.ps1`, a
 `WTL/build.json` and, for arm64, the virtio-win drivers under `$WinPEDriver$` on a `WTL_BUILD`
@@ -122,16 +139,17 @@ forest, the others join it, `users` are domain users. A lab without one is a **w
 no domain, `users` are local accounts on every machine. One workgroup machine needs no lab
 LAN (it gets only QEMU user-mode NAT); every other lab has the multicast LAN below.
 
-The run file's `lab` is a name (`labs/<name>.json` in the checkout) or a path relative to the
-run file. The lab's **state name** (`labs/state/<name>/`, VM names `lab-<name>-<machine>`) is
-the lab's `name` field, else the file name for `labs/*.json`, else the file name plus an
+The run file's `lab` is a name (`labs/<name>.json` in the home, else the built-in lab) or a
+path relative to the run file. The lab's **state name** (`<state_dir>/<name>/`, VM names
+`lab-<name>-<machine>`) is the lab's `name` field, else the lab name for a named lab, else the
+file name plus an
 FNV-1a hash of the lab file's absolute path (`lab-3f9a1c2b`), so labs from different
 projects never collide.
 
 ## The 0 state
 
 `labs/state/<lab>/<machine>-0.qcow2`: a qcow2 overlay per machine on its base image. It is
-built once (`lab prepare`, or the first `lab run`) by booting the overlays themselves:
+built once (`wtl prepare`, or the first `wtl run`) by booting the overlays themselves:
 
 1. Each machine gets a control disc (`<machine>.iso`, label `WTL_LAB`, drive D:) with
    `LAB\lab.ps1`, `LAB\labsvc.ps1` and `LAB\lab.json` (below). The agent finds it at logon
@@ -160,12 +178,12 @@ built once (`lab prepare`, or the first `lab run`) by booting the overlays thems
 
 The guest keeps its progress in `C:\WTL\lab-state.json` (`phase`: new, promoted, ready,
 joined, configure), so every reboot continues where it stopped. Roles, features and setup
-scripts (below) are applied here and frozen into the 0 state. `lab rebuild` deletes the
+scripts (below) are applied here and frozen into the 0 state. `wtl rebuild` deletes the
 `-0.qcow2` files and `0-state.json`; the base images stay.
 
 ## A run
 
-`lab run CONFIG`: restore (QMP quit, delete `<machine>.qcow2`), create new throwaway
+`wtl run CONFIG`: restore (QMP quit, delete `<machine>.qcow2`), create new throwaway
 overlays `<machine>.qcow2` on the 0-state disks, write each machine's control disc with
 `run` filled in, write one mount disc per drive of the run for every machine that has steps
 (`mount-<machine>-<letter>.iso`, label `WTL<LETTER>`, read-only), boot all machines (DC
@@ -178,7 +196,7 @@ screen).
 Each step is checked against its `expect_exit` (or `exit=running` with `keep_running`).
 Results go to `runs/<id>/` (see docs/CONFIG.md): `result.json`, `config.json`, and per
 machine the decoded `stepNout/err.txt`, `serial.log`, `screen.png`. The VMs keep running;
-`lab up` is the same without steps.
+`wtl up` is the same without steps.
 
 Exit codes: 0 all steps passed, 1 a step failed, 2 lab error (bad config, `LAB_FAIL`, a VM
 exited, an `ERROR` event; a screenshot `<machine>-fail.png` is taken), 3 timeout.
@@ -209,7 +227,7 @@ Pure ASCII (PowerShell 4 reads it without a BOM), one per machine:
 ```
 
 In workgroup mode `domain`, `netbios` and `dc_ip` are empty; `lan` is false (and `ip`
-empty) for a machine without a lab LAN. `run` is set only for `lab run`, and only on
+empty) for a machine without a lab LAN. `run` is set only for `wtl run`, and only on
 machines that have steps. `as_` is resolved per machine: a step `as` the machine's own logon
 user, or with no `as`, is `logon` (its desktop session); another lab user is `user` with that
 user's password (started by the SYSTEM worker with `LogonUser` + `CreateProcessAsUser`, as
@@ -298,20 +316,4 @@ All guest scripts must run on PowerShell 4.0 / .NET 4.5 (Server 2012 R2): no
 `Expand-Archive`, no `::new()`, no classes, no `-AsHashtable`. `tests/ps_lint.py` checks a
 subset. `lab.ps1` and `labsvc.ps1` are read from the control disc at every boot, but
 `labsvc.ps1` is copied to `C:\WTL` (and the `WTL-Svc` task registered) during the 0-state
-build: changes to it need `lab rebuild`.
-
-## The single-VM tester (launch-test.sh)
-
-Separate from the lab and older: one throwaway copy of a base image, no domain.
-
-    ./launch-test.sh program.zip program.exe 2019 [--port 5000] [--test check.py] [--args ".."] [--expect-exit N]
-
-It writes a `WTL_JOB` disc with `JOB.JSON` + `PAYLOAD.ZIP`; `agent.ps1` copies the zip to the
-Desktop, extracts it, starts the program and reports `JOB_FOUND`, `COPIED`, `EXTRACTED`,
-`LAUNCHED`, `READY port=P` (server mode, once the port listens) or `OUTPUT` + `PROC_EXIT
-code=N secs=S` / `PROC_TIMEOUT` (exit mode, without `--port`). The host then runs the test
-script with `WTL_HOST`, `WTL_PORT`, `WTL_OS`, `WTL_RESULTS`, `WTL_RUN_ID` (exit mode:
-`WTL_EXIT_CODE`, `WTL_STDOUT`, `WTL_STDERR`) and writes `results/<run>/result.json`,
-`test.log`, `serial.log`, `screen.png`. Exit 0 pass, 1 test failed, 2 setup error, 3 timeout.
-It uses lib/common.sh and lib/{mkiso,qmp,serialwait,outputs}.py; `examples/demo`,
-`examples/python-test.py`, `examples/fetch-ria` and `examples/fetch-test.py` are its examples.
+build: changes to it need `wtl rebuild`.
