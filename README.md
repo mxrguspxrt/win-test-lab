@@ -14,6 +14,8 @@ win-test-lab (the `wtl` command) does the boring part for you:
   DHCP, a certificate authority (AD CS) with auto-enrollment, IIS, members and users.
 - **Run your program** inside Windows, as SYSTEM or as any lab user, and get every step's exit
   code and output back.
+- **On Linux, macOS and Windows.** One program, `wtl`, plus QEMU. No bash, Python, root or
+  Samba needed. On a Mac it currently supports Windows 11 on Arm only (see below).
 
 ## What it looks like
 
@@ -76,6 +78,24 @@ completes and checks them.
 **Why:** with a coding agent, this becomes a loop the agent can run on its own: build your
 code, `wtl run` it on every Windows you care about, read the results, fix the bug, run again.
 
+## Which host runs what
+
+`wtl` runs on Linux, macOS and Windows. Windows runs fast only where its CPU matches the
+host's, so which Windows you can test depends on the host:
+
+| host | supported Windows | how |
+|------|-------------------|-----|
+| **Linux** (x64) | every one: Server 2012 R2 to 2025, Windows 10, Windows 11 | native, KVM. Tested. |
+| **macOS** (Apple Silicon) | **Windows 11 on Arm only** | native, Apple's hypervisor. Tested. |
+| **Windows** (x64) | every one, like Linux | native, Windows Hypervisor Platform. Compiles, not tested yet. |
+
+**The macOS limit:** an Apple Silicon Mac has an Arm CPU, and Microsoft publishes an Arm64 ISO
+only for Windows 11; there is no Windows Server for Arm. Any x64 Windows (every Server, Windows
+10, x64 Windows 11) can only be emulated there, and that is too slow to use: a Server 2025
+install took 73 minutes and PowerShell needed ~50 s just to start. So on a Mac, `wtl` supports
+Windows 11 on Arm (which still runs your x64 programs, see below); for Servers and AD domains
+use a Linux or Windows machine. An Intel Mac runs x64 Windows natively, but is not tested.
+
 ## Install
 
 You need QEMU and Rust (https://rustup.rs):
@@ -85,7 +105,7 @@ You need QEMU and Rust (https://rustup.rs):
 | Debian / Ubuntu | `sudo apt install qemu-system-x86 qemu-utils ovmf` (and `sudo usermod -aG kvm $USER`) |
 | Fedora | `sudo dnf install qemu-kvm qemu-img edk2-ovmf` |
 | macOS | `brew install qemu` |
-| Windows | `winget install SoftwareFreedomConservancy.QEMU` |
+| Windows | `winget install SoftwareFreedomConservancy.QEMU`, and turn on the Windows feature "Windows Hypervisor Platform" |
 
 ```
 cargo install win-test-lab    # installs the `wtl` command
@@ -149,11 +169,12 @@ the home's `wtl.json`, which wins over the user config file:
 Relative paths in a config file are relative to that file. A lab name (`school`) is
 `labs/school.json` in the home if there is one, else the lab of that name built into `wtl`.
 
-## On a Mac with Apple Silicon: Windows on Arm
+## On a Mac: Windows 11 on Arm
 
-Windows 11 on Arm runs natively on an M-series Mac (Apple's hypervisor, no emulation), and it
-runs **both Arm64 and x64 programs**: Windows translates an x64 exe on the fly, per program,
-with nothing to set up.
+Windows 11 on Arm runs natively on an Apple Silicon Mac (Apple's hypervisor, no emulation),
+and it runs **both Arm64 and x64 programs**: Windows translates an x64 exe on the fly, per
+program, with nothing to set up. So you can test your x64 build on a Mac too, as long as it
+needs Windows 11 and not a Server.
 
 ```json
 {
@@ -198,16 +219,8 @@ What you need for it:
   any network card QEMU can emulate): see
   [docs/ISOS.md](https://github.com/mxrguspxrt/win-test-lab/blob/main/docs/ISOS.md#drivers-for-arm64-machines-virtio-win).
 
-x64 Windows (every Server) also runs on an Arm Mac, but only emulated (measured: a Server 2025
-install takes 73 min and PowerShell needs ~50 s just to start), so it is not practical for
-daily testing. For x64 Windows use a Linux machine with KVM (or an Intel Mac).
-
-| host | x64 Windows (Servers, Win10, Win11) | Windows 11 on Arm |
-|------|-------------------------------------|-------------------|
-| Linux x64 | native (KVM). Supported and tested. | emulated |
-| macOS, Apple Silicon | emulated (slow) | native (HVF). Tested. |
-| macOS, Intel | native (HVF). Compiles, not tested. | emulated |
-| Windows | native (WHPX). Compiles, not tested. | emulated |
+The other way round, a Linux or Windows x64 host can run Windows 11 on Arm only emulated
+(slow), so Arm64-only testing belongs on a Mac.
 
 ## Commands
 

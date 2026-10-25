@@ -240,7 +240,16 @@ so CI jobs only pay for the run itself. Runs of the same lab must not overlap: g
   growth per run (thrown away by `wtl restore`); 60 GB free is a comfortable minimum.
 - **RAM and CPU**: 4 GB and 2 vCPUs per machine by default (3 GB for a DC), so a 3-machine lab
   wants 12 GB free; set `mem` / `cpus` per machine.
-- Mounted folders are read-only snapshots taken at the start of a run; use the step's output
-  (stdout/stderr) to get data out.
-- Linux + KVM is the tested host. Windows (WHPX) and Intel macOS (HVF) builds compile but are
-  not tested.
+- **Getting files in and out**: mounted folders are read-only snapshots taken at the start of
+  a run (host edits during a run are not seen), and the only way out is a step's stdout/stderr,
+  at most 256 KiB per stream, over the serial line. Files a program writes (logs, dumps,
+  reports) cannot be collected yet.
+  - TODO: a small HTTP file exchange in `wtl`. Each run starts a server on the host; guests
+    reach it at `10.0.2.2` through QEMU's NAT, with a per-run token. Steps upload files of any
+    size into the run's results (`wtl-put C:\logs\app.log`, or `"collect": ["C:/logs/*.log"]`
+    in the run file) and read the host's current files instead of the start-of-run copy. No
+    root and no Samba, and it works the same on Linux, macOS and Windows hosts. An AD lab's DC
+    has no NAT card, so it needs a second one or a member to relay.
+- **Hosts**: see "Which host runs what" in the README. Linux + KVM is tested with every
+  Windows; an Apple Silicon Mac is tested with Windows 11 on Arm; Windows hosts compile but
+  are not tested.
