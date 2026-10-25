@@ -1,5 +1,5 @@
 /*
- * smoke.c - a tiny, self-contained test program for `lab run`.
+ * smoke.c - a tiny, self-contained test program for `wtl run`.
  * Build: examples/smoke-test/build.sh  (needs gcc-mingw-w64-x86-64)
  * No DLLs, no data files - just one .exe. It prints who it runs as and the Windows version,
  * then exits 0, so a run that reaches "RESULT OK" / exit 0 proves the lab launched the exe.

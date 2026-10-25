@@ -2,12 +2,14 @@
 
 win-test-lab installs Windows from Microsoft's own ISOs. They are not redistributed with
 this project (they are large and Microsoft's to host). Download the ones you need **from
-Microsoft's pages below, in your browser**, and put them in **`win-test-lab/iso-files/`**
-(the default `WTL_ISO_DIR`), or point `WTL_ISO_DIR` at wherever you keep them. Do not use
-third-party download tools or mirrors.
+Microsoft's pages below, in your browser**, and put them in the **ISO folder** (`wtl home`
+shows it: `iso-files/` in the home), or point `WTL_ISO_DIR` (or `"iso_dir"` in a config file)
+at wherever you keep them. Do not use third-party download tools or mirrors.
 
 The lab finds the right ISO by reading the Windows build number **and CPU** *inside* it, so
-the file name does not matter.
+the file name does not matter. To pin a file when you keep several of one OS, add an
+`images-list.conf` to the home, one `KEY = file.iso` per line (`2019 = server2019-de.iso`; a
+path relative to the ISO folder, or absolute).
 
 ## Which OS has which CPU
 
@@ -38,16 +40,16 @@ Experience*. Client media install Pro with Microsoft's generic key (not activate
 
 ## Checking an ISO
 
-    lab check-iso                              # every ISO in WTL_ISO_DIR: build, CPU, editions,
+    wtl check-iso                              # every ISO in the ISO folder: build, CPU, editions,
                                                # and which lab key it serves
-    lab check-iso FILE.iso --sha256 HASH       # also: is it byte-for-byte what Microsoft published
+    wtl check-iso FILE.iso --sha256 HASH       # also: is it byte-for-byte what Microsoft published
 
 Microsoft's download pages list a SHA-256 for every language; compare it before you use an
 ISO. For example the English Windows 11 Arm64 ISO (26H2) is
-`8992F2D2CFD2FA647E579E9EB31FC21F34DA8333C29B6170FDE17D2ED6623E9C`. `lab check-iso` needs no
+`8992F2D2CFD2FA647E579E9EB31FC21F34DA8333C29B6170FDE17D2ED6623E9C`. `wtl check-iso` needs no
 other tool (on a 8.5 GB ISO the hash takes a few minutes).
 
-    lab doctor                                 # this host: QEMU per CPU, acceleration,
+    wtl doctor                                 # this host: QEMU per CPU, acceleration,
                                                # firmware, disk space, ISO -> lab key
 
 A disc with no `sources/install.wim` (a Features-on-Demand / LOF disc) is not an installation
@@ -58,7 +60,7 @@ ISO and is skipped.
 Windows 11 on Arm ships **no driver for any network card or serial port QEMU can emulate**
 (tested in an installed Windows 11 26300: e1000e, rtl8139, igb, vmxnet3, virtio-net and
 usb-net network cards; PL011, pci-serial and usb-serial ports; all show up without a driver,
-or as usb-net's broken serial function). Without a network and a serial channel `lab` cannot
+or as usb-net's broken serial function). Without a network and a serial channel `wtl` cannot
 drive the machine, so an arm64 build needs two drivers from **virtio-win**, the Windows
 drivers for QEMU's virtio devices (built by Red Hat, signed by Microsoft's Windows Hardware
 Compatibility Publisher, used by Proxmox, UTM, libvirt):
@@ -68,7 +70,8 @@ Compatibility Publisher, used by Proxmox, UTM, libvirt):
 | NetKVM | `NetKVM/w11/ARM64/` | the network cards (NAT + lab LAN) |
 | vioserial | `vioserial/w11/ARM64/` | the guest -> host report channel (instead of COM1) |
 
-Put them under `win-test-lab/drivers/virtio-win-<version>/`, keeping virtio-win's layout:
+Put them under `drivers/virtio-win-<version>/` in the home (or the folder `WTL_DRIVERS_DIR`
+names), keeping virtio-win's layout:
 
     drivers/virtio-win-0.1.302/NetKVM/w11/ARM64/{netkvm.inf,netkvm.sys,netkvm.cat,netkvmp.exe,...}
     drivers/virtio-win-0.1.302/vioserial/w11/ARM64/{vioser.inf,vioser.sys,vioser.cat}
@@ -83,6 +86,6 @@ build without them. x64 machines need none of this.
 ## Windows 10 / 11 members
 
 A lab member may run Windows 10 or 11 (`"os": "win10"` / `"win11"` / `"win11-arm64"`, see
-`labs/win10.json`, `labs/2025-arm64.json`); the DC must be a Windows Server. Windows 11 boots
+`labs/win10.json`, `labs/single-win11-arm64.json`); the DC must be a Windows Server. Windows 11 boots
 UEFI, so the host needs QEMU's UEFI firmware (Homebrew's and the distros' QEMU packages ship
-it; `lab doctor` shows what it found).
+it; `wtl doctor` shows what it found).

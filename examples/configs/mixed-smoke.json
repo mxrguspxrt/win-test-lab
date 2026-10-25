@@ -1,5 +1,5 @@
 {
-  "$schema": "../../wtl-rs/schema/run.schema.json",
+  "$schema": "../../schema/run.schema.json",
   "lab": "mixed",
   "mount": { "X": "../smoke-test/out" },
   "steps": [

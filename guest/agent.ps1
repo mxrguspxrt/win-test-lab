@@ -168,7 +168,7 @@ function Find-JobDrive([int]$WaitSecs = $JobPollSecs) {
     }
 }
 
-# AD lab mode: a CD (the control disc the host's `lab` writes) with \LAB\lab.ps1 + \LAB\lab.json
+# AD lab mode: a CD (the control disc the host's `wtl` writes) with \LAB\lab.ps1 + \LAB\lab.json
 function Find-LabDir {
     for ($i = 0; $i -lt 3; $i++) {
         foreach ($root in (Get-CdDrives)) {

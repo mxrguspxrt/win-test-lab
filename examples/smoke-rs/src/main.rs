@@ -1,4 +1,4 @@
-//! smoke.exe - a tiny, self-contained test program for `lab run`, buildable for x64 and
+//! smoke.exe - a tiny, self-contained test program for `wtl run`, buildable for x64 and
 //! Arm64 Windows from any host with rustup (no Windows SDK, no MinGW, no C runtime).
 //! Prints who it runs as, which CPU the exe is built for and which CPU the machine has (an
 //! x64 exe on Windows on Arm runs translated), then "RESULT OK" and exits 0.

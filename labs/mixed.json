@@ -1,5 +1,5 @@
 {
-  "$schema": "../wtl-rs/schema/lab.schema.json",
+  "$schema": "../schema/lab.schema.json",
   "domain": "lab.local",
   "netbios": "LAB",
   "network": { "subnet": "10.77.40", "lan_port": 47040 },
