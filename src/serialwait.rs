@@ -1,5 +1,5 @@
 //! Wait for `WTL <EVENT> [key=value ...] [| text]` lines in a growing serial log (port of
-//! lib/serialwait.py). Used in-process by `lab`, and as `wtl-rs serialwait` with the same
+//! lib/serialwait.py). Used in-process by `wtl run`, and as `wtl tool serialwait` with the same
 //! flags and exit codes as the Python script.
 
 use std::fs::File;
@@ -176,11 +176,11 @@ impl Wait<'_> {
     }
 }
 
-/// `wtl-rs serialwait LOG --until EV1,EV2 [...]`
+/// `wtl tool serialwait LOG --until EV1,EV2 [...]`
 #[derive(clap::Args, Debug)]
 #[command(
-    about = "Wait for WTL events in a (growing) serial log file (lib/serialwait.py)",
-    long_about = "Wait for WTL events in a (growing) serial log file (lib/serialwait.py).\n\n\
+    about = "Wait for WTL events in a (growing) serial log file",
+    long_about = "Wait for WTL events in a (growing) serial log file.\n\n\
         Lines look like  \"WTL <EVENT> [key=value ...] [| text]\"  (CRLF ok; leading junk before \"WTL \" \
         on a line is tolerated, since the serial port may print garbage at boot). The matched line is \
         printed on stdout.",
@@ -270,7 +270,7 @@ mod tests {
     }
 
     fn tmpfile(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("wtl-rs-sw-{}-{}.log", tag, std::process::id()))
+        std::env::temp_dir().join(format!("wtl-sw-{}-{}.log", tag, std::process::id()))
     }
 
     #[test]

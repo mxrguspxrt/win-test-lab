@@ -161,7 +161,12 @@ enum PartMap {
     /// type 1: a physical partition number
     Physical(u16),
     /// type 2 "*UDF Metadata Partition": the metadata file's extents (absolute bytes)
-    Metadata { pnum: u16, file: u32, mirror: u32, extents: Vec<(Option<u64>, u64)> },
+    Metadata {
+        pnum: u16,
+        file: u32,
+        mirror: u32,
+        extents: Vec<(Option<u64>, u64)>,
+    },
     Unsupported,
 }
 
@@ -205,7 +210,12 @@ impl Udf {
                 2 => {
                     let ident = lvd.get(p + 5..p + 28).unwrap_or(&[]);
                     if ident.starts_with(b"*UDF Metadata Partition") {
-                        PartMap::Metadata { pnum: u16le(&lvd, p + 38), file: u32le(&lvd, p + 40), mirror: u32le(&lvd, p + 44), extents: Vec::new() }
+                        PartMap::Metadata {
+                            pnum: u16le(&lvd, p + 38),
+                            file: u32le(&lvd, p + 40),
+                            mirror: u32le(&lvd, p + 44),
+                            extents: Vec::new(),
+                        }
                     } else {
                         PartMap::Unsupported
                     }
@@ -438,7 +448,10 @@ impl Iso9660 {
         let is_joliet = joliet.is_some();
         let vd = joliet.or(pvd).ok_or_else(|| anyhow!("no ISO9660 volume descriptor"))?;
         let (ext, size) = (u32le(&vd, 156 + 2) as u64, u32le(&vd, 156 + 10) as u64);
-        Ok(Iso9660 { joliet: is_joliet, root: Entry { name: String::new(), is_dir: true, size, extents: vec![(Some(ext * SECTOR), size)], inline: None } })
+        Ok(Iso9660 {
+            joliet: is_joliet,
+            root: Entry { name: String::new(), is_dir: true, size, extents: vec![(Some(ext * SECTOR), size)], inline: None },
+        })
     }
 
     fn listdir(&self, img: &mut Image, d: &Entry) -> Vec<Entry> {
@@ -596,11 +609,7 @@ pub fn parse_wim_xml(xml: &str) -> Vec<WimImage> {
         let end = block_start.find("</IMAGE>").map(|e| e + 8).unwrap_or(block_start.len());
         let block = &block_start[..end];
         rest = &block_start[end..];
-        let index = block
-            .split_once("INDEX=\"")
-            .and_then(|(_, r)| r.split('"').next())
-            .and_then(|n| n.parse().ok())
-            .unwrap_or(0);
+        let index = block.split_once("INDEX=\"").and_then(|(_, r)| r.split('"').next()).and_then(|n| n.parse().ok()).unwrap_or(0);
         let windows = tag(block, "WINDOWS").unwrap_or("");
         let version = tag(windows, "VERSION").unwrap_or("");
         let num = |s: Option<&str>| s.and_then(|v| v.parse::<u32>().ok());
@@ -623,7 +632,9 @@ pub fn parse_wim_xml(xml: &str) -> Vec<WimImage> {
 pub fn pick(imgs: &[WimImage], edition: &str, inst_type: &str) -> Option<u32> {
     let want_t = inst_type.to_ascii_lowercase();
     for cand in [edition.to_ascii_lowercase(), format!("{}eval", edition.to_ascii_lowercase())] {
-        if let Some(i) = imgs.iter().find(|i| i.edition_id.to_ascii_lowercase() == cand && i.installation_type.to_ascii_lowercase() == want_t) {
+        if let Some(i) =
+            imgs.iter().find(|i| i.edition_id.to_ascii_lowercase() == cand && i.installation_type.to_ascii_lowercase() == want_t)
+        {
             return Some(i.index);
         }
     }
@@ -693,11 +704,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The real UDF media in WTL_ISO_DIR (skipped when there are none): agree with the build
-    /// number lib/isoinfo.py would print.
+    /// The real UDF media in the checkout's iso-files/ (skipped when there are none): a
+    /// plausible build and CPU.
     #[test]
     fn real_isos_if_present() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../iso-files");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("iso-files");
         let Ok(rd) = std::fs::read_dir(&dir) else { return };
         for e in rd.flatten() {
             let p = e.path();

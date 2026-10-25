@@ -1,13 +1,15 @@
-//! `lab` - the command line of the Active Directory lab runner, and the helpers the runner
-//! ([`crate::labrun`]) is built from: finding the checkout, ports, files, and installing the
-//! Windows base images ([`crate::build`]).
+//! The lab commands of `wtl` (run, up, restore, stop, status, prepare, rebuild, doctor,
+//! check-iso, home, init), and the helpers the runner ([`crate::labrun`]) is built from:
+//! ports, files, and installing the Windows base images ([`crate::build`]).
 //!
 //! A lab is `labs/<name>.json` (see [`crate::labdef`]); a run is a `.json` run config that
-//! names its lab. `lab run CONFIG` builds the lab's 0 state once (installing Windows first if
+//! names its lab. `wtl run CONFIG` builds the lab's 0 state once (installing Windows first if
 //! a base image is missing), then every run starts from it.
 
+use crate::assets;
+use crate::home::Home;
 use crate::labrun::{self, RunOpts};
-use crate::logx::{err, log};
+use crate::logx::{err, log, ok};
 use crate::util;
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
@@ -15,34 +17,23 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const AFTER_HELP: &str = r#"A LAB is labs/LAB.json (e.g. school, 2019): the domain, the machines, the users.
-A CONFIG is a run file (e.g. examples/configs/school-smoke.json): the lab it boots, the host
-folders it mounts as read-only drives, and the steps it runs on which machine as whom.
-See docs/CONFIG.md, and wtl-rs/schema/ for the JSON Schema of both files.
+pub const AFTER_HELP: &str = r#"A LAB is a lab file: the domain, the machines, the users. A name (school, 2019,
+single-win11, ...) is labs/NAME.json in the home, else the lab of that name built into wtl.
+A CONFIG is a run file: the lab it boots, the host folders it mounts as read-only drives, and
+the steps it runs on which machine as whom. The formats, with JSON Schemas (`wtl schema`):
+https://github.com/mxrguspxrt/win-test-lab/blob/main/docs/CONFIG.md
 
 The 0 state = Windows installed, the domain created, every member joined and its user
 logging on automatically, all shut down cleanly. It is built once (by the first run, or
-`lab prepare LAB`) and frozen in labs/state/LAB/; every run writes only to throwaway disks
-on top of it, so a run starts from the 0 state and `lab restore` takes a second.
+`wtl prepare LAB`) and frozen in the state folder; every run writes only to throwaway disks
+on top of it, so a run starts from the 0 state and `wtl restore` takes a second.
+
+The data (ISOs, base images, 0 states) lives in the home: `wtl home` shows where, and how
+to move it (--home, WTL_HOME, a wtl.json, the user config file).
 
 Exit: 0 all steps passed, 1 a step failed, 2 lab error, 3 timeout."#;
 
-/// `lab CMD LAB|CONFIG [options]`
-#[derive(clap::Args, Debug)]
-#[command(
-    about = "Active Directory lab: a domain controller + domain-joined members, on QEMU",
-    override_usage = "lab run CONFIG [--show] [--wait S] [--timeout-min M]\n       \
-                      lab up|restore|stop|status|prepare|rebuild LAB|CONFIG\n       \
-                      lab doctor\n       \
-                      lab check-iso [FILE --sha256 HASH]",
-    after_help = AFTER_HELP
-)]
-pub struct Cli {
-    #[command(subcommand)]
-    pub cmd: Cmd,
-}
-
-/// The `lab` subcommands.
+/// The lab commands.
 #[derive(clap::Subcommand, Debug)]
 pub enum Cmd {
     /// run a config: restore the lab it names to its 0 state, boot it, mount the host
@@ -68,12 +59,25 @@ pub enum Cmd {
     /// check the ISOs you downloaded by hand: the Windows build and CPU inside each one, and
     /// with --sha256 HASH that one file's SHA-256 (from Microsoft's download page)
     CheckIso(CheckIso),
+    /// show the home (where the ISOs, base images and 0 states are), how it was found, and
+    /// where each folder's setting comes from
+    Home,
+    /// make DIR (default: the current folder) a home: writes DIR/wtl.json, so `wtl` run in
+    /// DIR or below keeps its ISOs, images and 0 states there
+    Init(Init),
 }
 
-/// `lab check-iso [FILE] [--sha256 HASH]`
+/// `wtl init [DIR]`
+#[derive(clap::Args, Debug)]
+pub struct Init {
+    /// the folder (default: the current one)
+    pub dir: Option<PathBuf>,
+}
+
+/// `wtl check-iso [FILE] [--sha256 HASH]`
 #[derive(clap::Args, Debug)]
 pub struct CheckIso {
-    /// one ISO (default: every ISO in WTL_ISO_DIR)
+    /// one ISO (default: every ISO in the ISO folder, see `wtl home`)
     pub file: Option<PathBuf>,
     /// the SHA-256 the download page lists for FILE; the file must match it
     #[arg(long, value_name = "HASH", requires = "file")]
@@ -83,7 +87,7 @@ pub struct CheckIso {
 /// What a command acts on, and its options.
 #[derive(clap::Args, Debug)]
 pub struct Target {
-    /// LAB (labs/LAB.json, e.g. school) or a CONFIG run file; `run` needs a CONFIG
+    /// LAB (a lab name, e.g. school, or a lab file) or a CONFIG run file; `run` needs a CONFIG
     #[arg(value_name = "LAB|CONFIG")]
     pub target: String,
     /// open the VM windows (default: headless, VNC addresses printed)
@@ -115,9 +119,9 @@ fn positive_int(s: &str) -> Result<i64, String> {
     }
 }
 
-/// `lab CMD ...`; returns the exit code.
-pub fn main(cli: &Cli) -> i32 {
-    match run_cli(cli) {
+/// `wtl CMD ...`; returns the exit code.
+pub fn main(cmd: &Cmd) -> i32 {
+    match run_cli(cmd) {
         Ok(code) => code,
         Err(e) => {
             err(&format!("{:#}", e));
@@ -126,10 +130,20 @@ pub fn main(cli: &Cli) -> i32 {
     }
 }
 
-fn run_cli(cli: &Cli) -> Result<i32> {
-    let (cmd, t) = match &cli.cmd {
+fn run_cli(cmd: &Cmd) -> Result<i32> {
+    let (cmd, t) = match cmd {
         Cmd::Doctor => return doctor(),
         Cmd::CheckIso(c) => return check_iso(c),
+        Cmd::Home => {
+            print!("{}", Home::resolve()?.describe());
+            return Ok(0);
+        }
+        Cmd::Init(i) => {
+            let dir = i.dir.clone().unwrap_or_else(|| PathBuf::from("."));
+            let p = crate::home::init(&dir)?;
+            ok(&format!("wrote {}: wtl run in {} or below keeps its data there", p.display(), util::canon(&dir).display()));
+            return Ok(0);
+        }
         Cmd::Run(t) => ("run", t),
         Cmd::Restore(t) => ("restore", t),
         Cmd::Up(t) => ("up", t),
@@ -138,14 +152,13 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         Cmd::Prepare(t) => ("prepare", t),
         Cmd::Rebuild(t) => ("rebuild", t),
     };
-    let root = find_root()?;
     let opts = RunOpts { show: t.show, updates: t.updates, wait: t.wait, timeout_min: t.timeout_min };
     let target = t.target.as_str();
     // a run config: an existing .json file that is not itself a lab
     let is_file = Path::new(target).is_file();
     if cmd == "run" {
         if !is_file {
-            bail!("usage: lab run CONFIG  (a run .json file, e.g. examples/configs/school-smoke.json; not found: {})", target);
+            bail!("usage: wtl run CONFIG  (a run .json file, e.g. examples/configs/school-smoke.json; not found: {})", target);
         }
         let config = util::canon(Path::new(target));
         let (lab_file, lab, run) = labrun::load_run(&config).context("config error")?;
@@ -162,25 +175,25 @@ fn run_cli(cli: &Cli) -> Result<i32> {
         if !util::is_safe_name(target) {
             bail!("bad lab name {:?}", target);
         }
-        let f = root.join("labs").join(format!("{}.json", target));
-        if !f.is_file() {
-            bail!("no lab {} (labs: {})", f.display(), lab_names(&root).join(" "));
+        let home = Home::resolve()?;
+        match assets::lab_file(&home, target)? {
+            Some(f) => f,
+            None => bail!("no lab {} in {} or built in (labs: {})", target, home.labs_dir().display(), assets::lab_names(&home).join(" ")),
         }
-        f
     };
     let lab = labrun::load_lab(&lab_file).context("lab error")?;
     Ok(labrun::run(cmd, &lab_file, None, None, lab, &opts))
 }
 
-/// `lab doctor`: what this host can run, and which ISO serves which OS. Exit 0 if the host
+/// `wtl doctor`: what this host can run, and which ISO serves which OS. Exit 0 if the host
 /// can run at least one OS it has an ISO for, else 1.
 fn doctor() -> Result<i32> {
     use crate::qemu::{Accel, Arch, Env};
-    let root = find_root()?;
-    let vars = crate::qemu::seed_vars(&root);
-    let env = Env::from_vars(&root, &vars)?;
+    let home = Home::resolve()?;
+    let vars = crate::qemu::seed_vars(&home);
+    let env = Env::from_vars(&home, &vars)?;
     let mark = |good: bool| if good { "ok  " } else { "MISS" };
-    println!("host: {} {}, win-test-lab {}", std::env::consts::OS, std::env::consts::ARCH, root.display());
+    println!("host: {} {}, wtl {}, home {}", std::env::consts::OS, std::env::consts::ARCH, env!("CARGO_PKG_VERSION"), home.dir.display());
     let mut runnable = Vec::new();
     for arch in [Arch::X64, Arch::Arm64] {
         let q = env.qemu_for(arch);
@@ -190,25 +203,45 @@ fn doctor() -> Result<i32> {
             Accel::Tcg => "emulated (TCG): works, several times slower".to_string(),
             a => format!("hardware-accelerated ({:?})", a).to_lowercase(),
         };
-        println!("{} {:5} guests: {} - {}", mark(have), arch.as_str(), q, if have { how } else { "not found (install QEMU)".into() });
+        println!(
+            "{} {:5} guests: {} - {}",
+            mark(have),
+            arch.as_str(),
+            q,
+            if have { how } else { format!("not found (install QEMU: {})", crate::qemu::QEMU_HINT) }
+        );
         let (code, vars_f) = match arch {
             Arch::X64 => (&env.ovmf_code, &env.ovmf_vars),
             Arch::Arm64 => (&env.aavmf_code, &env.aavmf_vars),
         };
         let fw = code.is_file() && vars_f.is_file();
-        println!("     {:5} UEFI firmware: {} {}", arch.as_str(), mark(fw), if fw { code.display().to_string() } else { format!("{} / {} not found", code.display(), vars_f.display()) });
+        println!(
+            "     {:5} UEFI firmware: {} {}",
+            arch.as_str(),
+            mark(fw),
+            if fw { code.display().to_string() } else { format!("{} / {} not found", code.display(), vars_f.display()) }
+        );
         if have {
             runnable.push(arch);
         }
     }
     if env.accel == Accel::Kvm {
         let kvm = std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok();
-        println!("{} /dev/kvm {}", mark(kvm), if kvm { "is writable" } else { "missing or not writable (./setup-host.sh)" });
+        println!(
+            "{} /dev/kvm {}",
+            mark(kvm),
+            if kvm { "is writable".to_string() } else { format!("missing or not writable ({})", crate::qemu::KVM_HINT) }
+        );
     }
     let qi = util::which(&env.qemu_img).is_some();
     println!("{} qemu-img: {}", mark(qi), env.qemu_img);
     match util::free_gb(&env.images_dir) {
-        Some(g) => println!("{} {} GiB free for {} (an install needs 20-30 GiB, a lab's 0 state a few more)", mark(g >= 30), g, env.images_dir.display()),
+        Some(g) => println!(
+            "{} {} GiB free for {} (an install needs 20-30 GiB, a lab's 0 state a few more)",
+            mark(g >= 30),
+            g,
+            env.images_dir.display()
+        ),
         None => println!("     free space for {}: unknown", env.images_dir.display()),
     }
     // the ISOs
@@ -224,15 +257,16 @@ fn doctor() -> Result<i32> {
         }
     }
     if isos.is_empty() {
-        println!("     none (see docs/ISOS.md)");
+        println!("     none (where to get them: https://github.com/mxrguspxrt/win-test-lab/blob/main/docs/ISOS.md)");
     }
-    println!("OS keys (lib/oslist.conf):");
-    let table = std::fs::read_to_string(root.join("lib").join("oslist.conf")).unwrap_or_default();
+    println!("OS keys:");
+    let table = assets::oslist(&home)?;
     let mut usable = 0;
     for os in crate::oslist::parse_table(&table) {
         let arch = Arch::parse(&os.arch).unwrap_or_default();
-        let iso = crate::build::find_iso(&root, &env.iso_dir, &os);
-        let image = env.images_dir.join(format!("{}-client.qcow2", os.key)).is_file() || env.images_dir.join(format!("{}-dc.qcow2", os.key)).is_file();
+        let iso = crate::build::find_iso(&home, &env.iso_dir, &os);
+        let image = env.images_dir.join(format!("{}-client.qcow2", os.key)).is_file()
+            || env.images_dir.join(format!("{}-dc.qcow2", os.key)).is_file();
         let speed = if env.accel_for(arch) == Accel::Tcg { "emulated" } else { "native" };
         let ok_ = iso.is_some() && runnable.contains(&arch);
         if ok_ {
@@ -251,13 +285,13 @@ fn doctor() -> Result<i32> {
     Ok(if usable > 0 { 0 } else { 1 })
 }
 
-/// `lab check-iso`: what each ISO is (build, CPU, editions) and which OS key it serves; with
+/// `wtl check-iso`: what each ISO is (build, CPU, editions) and which OS key it serves; with
 /// --sha256, that the file is byte-for-byte the one Microsoft published. Exit 1 on a mismatch
 /// or an unreadable file.
 fn check_iso(c: &CheckIso) -> Result<i32> {
-    let root = find_root()?;
-    let vars = crate::qemu::seed_vars(&root);
-    let env = crate::qemu::Env::from_vars(&root, &vars)?;
+    let home = Home::resolve()?;
+    let vars = crate::qemu::seed_vars(&home);
+    let env = crate::qemu::Env::from_vars(&home, &vars)?;
     let files: Vec<PathBuf> = match &c.file {
         Some(f) => vec![f.clone()],
         None => {
@@ -271,7 +305,7 @@ fn check_iso(c: &CheckIso) -> Result<i32> {
             v
         }
     };
-    let table = crate::oslist::parse_table(&std::fs::read_to_string(root.join("lib").join("oslist.conf")).unwrap_or_default());
+    let table = crate::oslist::parse_table(&assets::oslist(&home)?);
     let mut bad = 0;
     for f in &files {
         println!("{}", f.display());
@@ -280,7 +314,12 @@ fn check_iso(c: &CheckIso) -> Result<i32> {
                 let first = imgs.first();
                 let (b, a) = (first.and_then(|i| i.build).unwrap_or(0), first.map(|i| i.arch_name()).unwrap_or_default());
                 let keys: Vec<&str> = table.iter().filter(|o| o.build == b.to_string() && o.arch == a).map(|o| o.key.as_str()).collect();
-                println!("  Windows build {}, {}; serves: {}", b, a, if keys.is_empty() { "no OS key (not in lib/oslist.conf)".to_string() } else { keys.join(" ") });
+                println!(
+                    "  Windows build {}, {}; serves: {}",
+                    b,
+                    a,
+                    if keys.is_empty() { "no OS key (not in the OS table)".to_string() } else { keys.join(" ") }
+                );
                 for i in &imgs {
                     println!("    {:2} {:24} {:12} {}", i.index, i.edition_id, i.installation_type, i.name);
                 }
@@ -303,42 +342,6 @@ fn check_iso(c: &CheckIso) -> Result<i32> {
         }
     }
     Ok(if bad > 0 { 1 } else { 0 })
-}
-
-/// The lab names in labs/ (each labs/NAME.json), sorted.
-fn lab_names(root: &Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(root.join("labs"))
-        .map(|rd| rd.flatten().filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".json")).map(str::to_string)).collect())
-        .unwrap_or_default();
-    names.sort();
-    names
-}
-
-/// Find the win-test-lab checkout (lib/oslist.conf + guest/lab.ps1): $WTL_ROOT, else a
-/// parent of this executable, of the source tree it was built from, or of the cwd.
-pub fn find_root() -> Result<PathBuf> {
-    let is_root = |d: &Path| d.join("lib").join("oslist.conf").is_file() && d.join("guest").join("lab.ps1").is_file();
-    if let Some(r) = std::env::var_os("WTL_ROOT").filter(|v| !v.is_empty()) {
-        let r = util::canon(Path::new(&r));
-        if is_root(&r) {
-            return Ok(r);
-        }
-        bail!("WTL_ROOT={} is not a win-test-lab checkout (no lib/oslist.conf + guest/lab.ps1)", r.display());
-    }
-    let mut starts = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        starts.push(util::canon(&exe));
-    }
-    starts.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-    if let Ok(cwd) = std::env::current_dir() {
-        starts.push(cwd);
-    }
-    for s in &starts {
-        if let Some(d) = s.ancestors().find(|d| is_root(d)) {
-            return Ok(util::canon(d));
-        }
-    }
-    bail!("cannot find the win-test-lab directory (set WTL_ROOT to it)")
 }
 
 /// 127.0.0.1:PORT can be bound
@@ -383,11 +386,11 @@ pub(crate) fn write_file(p: &Path, data: impl AsRef<[u8]>) -> Result<()> {
     std::fs::write(p, data).with_context(|| format!("cannot write {}", p.display()))
 }
 
-/// One base image (`images/<image>.qcow2`) to install with build-image.sh.
+/// One base image (`images/<image>.qcow2`) to install with `wtl build-image`.
 pub(crate) struct BaseBuild {
     /// short label for the log prefix and STATE/build-<tag>.log
     pub tag: String,
-    /// OS key from lib/oslist.conf
+    /// OS key from the OS table
     pub os: String,
     /// image name: images/<image>.qcow2
     pub image: String,
@@ -402,12 +405,11 @@ impl BaseBuild {
 }
 
 /// Install Windows into each base image (unattended, in parallel): each build is this program
-/// again (`wtl-rs build-image`, see [`crate::build`]), its output tee'd to
+/// again (`wtl build-image`, see [`crate::build`]), its output tee'd to
 /// LOG_DIR/build-<tag>.log and shown prefixed with `[tag]`. `vars` supplies the WTL_* settings
-/// passed on; `nap` sleeps (and fails on Ctrl-C). The caller checks that the images exist
-/// afterwards.
+/// passed on (the home and its folders included, so the build sees the same ones); `nap`
+/// sleeps (and fails on Ctrl-C). The caller checks that the images exist afterwards.
 pub(crate) fn build_base_images(
-    _root: &Path,
     vars: &HashMap<String, String>,
     log_dir: &Path,
     builds: &[BaseBuild],
@@ -445,13 +447,14 @@ pub(crate) fn build_base_images(
             cmd.arg("--show");
         }
         for (k, v) in vars {
-            if k.starts_with("WTL_") || k == "ROOT" {
+            if k.starts_with("WTL_") {
                 cmd.env(k, v);
             }
         }
         let (reader, writer) = std::io::pipe().context("pipe")?;
         cmd.stdin(Stdio::null()).stdout(writer.try_clone().context("pipe")?).stderr(writer);
-        let child = cmd.spawn().with_context(|| format!("cannot run the image builder ({})", builder.as_deref().unwrap_or("wtl-rs build-image")))?;
+        let child =
+            cmd.spawn().with_context(|| format!("cannot run the image builder ({})", builder.as_deref().unwrap_or("wtl build-image")))?;
         drop(cmd); // closes our copies of the pipe's write end
         let logf = log_dir.join(format!("build-{}.log", b.tag));
         let tag = b.tag.clone();
@@ -479,14 +482,14 @@ pub(crate) fn build_base_images(
     Ok(())
 }
 
-/// `wtl-rs build-image OS [--name NAME] [--computer-name CN] [--no-updates] [--show] [--iso PATH]`
+/// `wtl build-image OS [--name NAME] [--computer-name CN] [--no-updates] [--show] [--iso PATH]`
 #[derive(clap::Args, Debug)]
 #[command(
     about = "Install Windows into a base image, unattended: images/<NAME>.qcow2",
-    after_help = "OS is a key of lib/oslist.conf (2012 2016 2019 2022 2025 win10 win11 win11-arm64).\n\
-                  The ISO is found in WTL_ISO_DIR by the Windows build and CPU inside it (or\n\
-                  images-list.conf, or --iso). `lab` runs this itself for a missing base image.\n\
-                  Exit: 0 built (or already there), 2 error, 3 timeout."
+    after_help = "OS is an OS key (2012 2016 2019 2022 2025 win10 win11 win11-arm64; `wtl doctor` lists them).\n\
+                  The ISO is found in the ISO folder by the Windows build and CPU inside it (or\n\
+                  the home's images-list.conf, or --iso). `wtl run` does this itself for a missing\n\
+                  base image. Exit: 0 built (or already there), 2 error, 3 timeout."
 )]
 pub struct BuildCli {
     /// the OS key
@@ -494,7 +497,7 @@ pub struct BuildCli {
     /// image file images/NAME.qcow2 (default: the OS key)
     #[arg(long)]
     pub name: Option<String>,
-    /// the Windows computer name (default WTL-<os>, max 15 chars)
+    /// the Windows computer name (default `WTL-<os>`, max 15 chars)
     #[arg(long, value_name = "CN")]
     pub computer_name: Option<String>,
     /// skip Windows Update
@@ -511,14 +514,13 @@ pub struct BuildCli {
     pub timeout_h: f64,
 }
 
-/// `wtl-rs build-image ...`; returns the exit code.
+/// `wtl build-image ...`; returns the exit code.
 pub fn build_main(a: &BuildCli) -> i32 {
     let r = (|| -> Result<()> {
-        let root = find_root()?;
-        let os = crate::oslist::lookup(&root.join("lib").join("oslist.conf"), &a.os).ok_or_else(|| {
-            let keys: Vec<String> = std::fs::read_to_string(root.join("lib").join("oslist.conf"))
-                .map(|t| crate::oslist::parse_table(&t).into_iter().map(|o| o.key).collect())
-                .unwrap_or_default();
+        let home = Home::resolve()?;
+        let table = assets::oslist(&home)?;
+        let os = crate::oslist::lookup(&table, &a.os).ok_or_else(|| {
+            let keys: Vec<String> = crate::oslist::parse_table(&table).into_iter().map(|o| o.key).collect();
             anyhow::anyhow!("unknown OS '{}' (known: {})", a.os, keys.join(" "))
         })?;
         let image = a.name.clone().unwrap_or_else(|| os.key.clone());
@@ -529,8 +531,8 @@ pub fn build_main(a: &BuildCli) -> i32 {
         if computer.is_empty() || computer.len() > 15 || !computer.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
             bail!("--computer-name: 1-15 letters, digits, -");
         }
-        let vars = crate::qemu::seed_vars(&root);
-        let env = crate::qemu::Env::from_vars(&root, &vars)?;
+        let vars = crate::qemu::seed_vars(&home);
+        let env = crate::qemu::Env::from_vars(&home, &vars)?;
         let qmp_tcp = match std::env::var("WTL_QMP").unwrap_or_default().as_str() {
             "tcp" => true,
             "unix" => false,

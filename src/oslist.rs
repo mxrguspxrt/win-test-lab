@@ -1,6 +1,4 @@
-//! The OS table lib/oslist.conf and its aliases (port of os_normalize / os_lookup).
-
-use std::path::Path;
+//! The OS table lib/oslist.conf and its aliases.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OsInfo {
@@ -73,11 +71,10 @@ pub fn parse_table(text: &str) -> Vec<OsInfo> {
     out
 }
 
-/// Look NAME (or an alias of it) up in the table file.
-pub fn lookup(oslist: &Path, name: &str) -> Option<OsInfo> {
+/// Look NAME (or an alias of it) up in the table text.
+pub fn lookup(table: &str, name: &str) -> Option<OsInfo> {
     let want = normalize(name);
-    let text = std::fs::read_to_string(oslist).ok()?;
-    parse_table(&text).into_iter().find(|o| o.key == want)
+    parse_table(table).into_iter().find(|o| o.key == want)
 }
 
 #[cfg(test)]
@@ -99,19 +96,19 @@ mod tests {
 
     #[test]
     fn real_table() {
-        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lib/oslist.conf");
-        let o = lookup(&p, "2012r2").unwrap();
+        let p = crate::assets::OSLIST;
+        let o = lookup(p, "2012r2").unwrap();
         assert_eq!((o.build.as_str(), o.kind.as_str(), o.firmware.as_str()), ("9600", "server", "bios"));
         assert_eq!(o.display, "Windows Server 2012 R2");
-        let w = lookup(&p, "win11").unwrap();
+        let w = lookup(p, "win11").unwrap();
         assert_eq!((w.kind.as_str(), w.firmware.as_str(), w.arch.as_str()), ("client", "uefi", "x64"));
-        let a = lookup(&p, "win11-arm64").unwrap();
+        let a = lookup(p, "win11-arm64").unwrap();
         assert_eq!((a.build.as_str(), a.firmware.as_str(), a.arch.as_str()), ("26300", "uefi", "arm64"));
         assert_eq!(a.display, "Windows 11 Pro on Arm");
-        for o in parse_table(&std::fs::read_to_string(&p).unwrap()) {
+        for o in parse_table(p) {
             assert!(o.arch == "x64" || o.arch == "arm64", "{}: arch {:?}", o.key, o.arch);
             assert!(o.min_disk_gb.parse::<u32>().is_ok(), "{}: min_disk_gb {:?}", o.key, o.min_disk_gb);
         }
-        assert!(lookup(&p, "xp").is_none());
+        assert!(lookup(p, "xp").is_none());
     }
 }

@@ -1,12 +1,24 @@
-//! Host settings (the WTL_* variables of lib/common.sh) and the QEMU command line
-//! (port of qemu_cmd / start_qemu).
+//! Host settings (the WTL_* variables) and the QEMU command line.
 
+use crate::home::Home;
 use crate::qmp::Addr;
 use crate::util::which;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+/// What to do when /dev/kvm cannot be opened.
+pub const KVM_HINT: &str = "add yourself to the kvm group: sudo usermod -aG kvm $USER, then log in again";
+
+/// How to install QEMU on this kind of host.
+pub const QEMU_HINT: &str = if cfg!(target_os = "macos") {
+    "brew install qemu"
+} else if cfg!(windows) {
+    "winget install SoftwareFreedomConservancy.QEMU"
+} else {
+    "Debian/Ubuntu: sudo apt install qemu-system-x86 qemu-system-arm qemu-utils ovmf qemu-efi-aarch64; Fedora: sudo dnf install qemu-kvm qemu-img edk2-ovmf"
+};
 
 /// Hardware acceleration backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,11 +100,10 @@ impl Arch {
     }
 }
 
-/// Settings from the environment (+ a lab definition's own WTL_* lines), with the same
-/// defaults as lib/common.sh.
+/// Settings: the home's folders and the WTL_* variables (environment, else the defaults).
 #[derive(Clone, Debug)]
 pub struct Env {
-    pub root: PathBuf,
+    pub home: Home,
     pub iso_dir: PathBuf,
     pub images_dir: PathBuf,
     pub qemu: String,
@@ -118,14 +129,10 @@ pub struct Env {
     pub fast: bool,
 }
 
-/// The WTL_* defaults, as `NAME -> value` pairs, given ROOT.
-pub fn defaults(root: &Path) -> Vec<(&'static str, String)> {
-    let r = |p: &str| root.join(p).to_string_lossy().into_owned();
-    vec![
-        ("WTL_ISO_DIR", r("iso-files")),
-        ("WTL_IMAGES_DIR", r("images")),
-        ("WTL_RUNS_DIR", r("runs")),
-        ("WTL_RESULTS_DIR", r("results")),
+/// The WTL_* defaults, as `NAME -> value` pairs, given the home.
+pub fn defaults(home: &Home) -> Vec<(&'static str, String)> {
+    let mut v: Vec<(&'static str, String)> = home.vars().into_iter().map(|(k, p)| (k, p.to_string_lossy().into_owned())).collect();
+    v.extend([
         ("WTL_QEMU", if cfg!(windows) { "qemu-system-x86_64.exe" } else { "qemu-system-x86_64" }.into()),
         ("WTL_QEMU_ARM64", if cfg!(windows) { "qemu-system-aarch64.exe" } else { "qemu-system-aarch64" }.into()),
         ("WTL_QEMU_IMG", if cfg!(windows) { "qemu-img.exe" } else { "qemu-img" }.into()),
@@ -138,7 +145,8 @@ pub fn defaults(root: &Path) -> Vec<(&'static str, String)> {
         ("WTL_OVMF_VARS", firmware("x86_64", "vars")),
         ("WTL_AAVMF_CODE", firmware("aarch64", "code")),
         ("WTL_AAVMF_VARS", firmware("aarch64", "vars")),
-    ]
+    ]);
+    v
 }
 
 /// The first UEFI firmware file (ARCH x86_64 or aarch64, KIND code or vars) that exists in the
@@ -147,10 +155,26 @@ pub fn defaults(root: &Path) -> Vec<(&'static str, String)> {
 /// QEMU for Windows. The first candidate if none exists, so the error names a real path.
 pub fn firmware(arch: &str, kind: &str) -> String {
     let linux: &[&str] = match (arch, kind) {
-        ("x86_64", "code") => &["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/edk2/ovmf/OVMF_CODE.fd", "/usr/share/edk2/x64/OVMF_CODE.4m.fd"],
-        ("x86_64", _) => &["/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/OVMF/OVMF_VARS.fd", "/usr/share/edk2/ovmf/OVMF_VARS.fd", "/usr/share/edk2/x64/OVMF_VARS.4m.fd"],
-        (_, "code") => &["/usr/share/AAVMF/AAVMF_CODE.fd", "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd", "/usr/share/edk2/aarch64/QEMU_EFI-pflash.raw"],
-        _ => &["/usr/share/AAVMF/AAVMF_VARS.fd", "/usr/share/qemu-efi-aarch64/QEMU_VARS.fd", "/usr/share/edk2/aarch64/vars-template-pflash.raw"],
+        ("x86_64", "code") => &[
+            "/usr/share/OVMF/OVMF_CODE_4M.fd",
+            "/usr/share/OVMF/OVMF_CODE.fd",
+            "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+            "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+        ],
+        ("x86_64", _) => &[
+            "/usr/share/OVMF/OVMF_VARS_4M.fd",
+            "/usr/share/OVMF/OVMF_VARS.fd",
+            "/usr/share/edk2/ovmf/OVMF_VARS.fd",
+            "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+        ],
+        (_, "code") => {
+            &["/usr/share/AAVMF/AAVMF_CODE.fd", "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd", "/usr/share/edk2/aarch64/QEMU_EFI-pflash.raw"]
+        }
+        _ => &[
+            "/usr/share/AAVMF/AAVMF_VARS.fd",
+            "/usr/share/qemu-efi-aarch64/QEMU_VARS.fd",
+            "/usr/share/edk2/aarch64/vars-template-pflash.raw",
+        ],
     };
     let edk2 = match (arch, kind) {
         ("x86_64", "code") => "edk2-x86_64-code.fd",
@@ -159,28 +183,30 @@ pub fn firmware(arch: &str, kind: &str) -> String {
         _ => "edk2-arm-vars.fd",
     };
     let mut cands: Vec<String> = linux.iter().map(|s| s.to_string()).collect();
-    for dir in ["/opt/homebrew/share/qemu", "/usr/local/share/qemu", "/opt/local/share/qemu", "C:/Program Files/qemu/share", "/usr/share/qemu"] {
+    for dir in
+        ["/opt/homebrew/share/qemu", "/usr/local/share/qemu", "/opt/local/share/qemu", "C:/Program Files/qemu/share", "/usr/share/qemu"]
+    {
         cands.push(format!("{}/{}", dir, edk2));
     }
     let first = cands[0].clone();
     cands.into_iter().find(|c| Path::new(c).is_file()).unwrap_or(first)
 }
 
-/// Seed a variable map: every WTL_* default, overridden by the process environment.
-pub fn seed_vars(root: &Path) -> HashMap<String, String> {
+/// Seed a variable map: every WTL_* default, overridden by the process environment. The
+/// home's folders are already resolved (environment included) and are taken as they are.
+pub fn seed_vars(home: &Home) -> HashMap<String, String> {
     let mut m = HashMap::new();
-    m.insert("ROOT".to_string(), root.to_string_lossy().into_owned());
-    m.insert("WTL_LIB".to_string(), root.join("lib").to_string_lossy().into_owned());
-    for (k, v) in defaults(root) {
-        let v = std::env::var(k).ok().filter(|x| !x.is_empty() || k == "WTL_NO_KVM").unwrap_or(v);
+    let folders: Vec<&str> = home.vars().iter().map(|(k, _)| *k).collect();
+    for (k, v) in defaults(home) {
+        let v = if folders.contains(&k) { v } else { std::env::var(k).ok().filter(|x| !x.is_empty() || k == "WTL_NO_KVM").unwrap_or(v) };
         m.insert(k.to_string(), v);
     }
     m
 }
 
 impl Env {
-    /// Build from a variable map made by [`seed_vars`] (+ whatever a lab file set).
-    pub fn from_vars(root: &Path, vars: &HashMap<String, String>) -> Result<Env> {
+    /// Build from a variable map made by [`seed_vars`] (+ the lab's own password).
+    pub fn from_vars(home: &Home, vars: &HashMap<String, String>) -> Result<Env> {
         let get = |k: &str| -> String { vars.get(k).cloned().or_else(|| std::env::var(k).ok()).unwrap_or_default() };
         let nonempty = |k: &str| Some(get(k)).filter(|v| !v.is_empty());
         let accel_forced = nonempty("WTL_ACCEL").is_some() || get("WTL_NO_KVM") == "1";
@@ -191,7 +217,7 @@ impl Env {
         };
         let display = nonempty("WTL_DISPLAY").unwrap_or_else(|| if cfg!(target_os = "macos") { "cocoa" } else { "gtk" }.into());
         Ok(Env {
-            root: root.to_path_buf(),
+            home: home.clone(),
             iso_dir: PathBuf::from(get("WTL_ISO_DIR")),
             images_dir: PathBuf::from(get("WTL_IMAGES_DIR")),
             qemu: get("WTL_QEMU"),
@@ -236,16 +262,17 @@ impl Env {
             let q = self.qemu_for(*a);
             ensure!(
                 which(q).is_some(),
-                "'{}' not found (install QEMU: ./setup-host.sh; or set {})",
+                "'{}' not found (install QEMU: {}; or set {})",
                 q,
+                QEMU_HINT,
                 if *a == Arch::Arm64 { "WTL_QEMU_ARM64" } else { "WTL_QEMU" }
             );
         }
-        ensure!(which(&self.qemu_img).is_some(), "'{}' not found (install QEMU: ./setup-host.sh; or set WTL_QEMU_IMG)", self.qemu_img);
+        ensure!(which(&self.qemu_img).is_some(), "'{}' not found (install QEMU: {}; or set WTL_QEMU_IMG)", self.qemu_img, QEMU_HINT);
         if arches.iter().any(|a| self.accel_for(*a) == Accel::Kvm)
             && std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_err()
         {
-            bail!("/dev/kvm missing or not writable (run ./setup-host.sh; or WTL_NO_KVM=1 for very slow TCG)");
+            bail!("/dev/kvm missing or not writable ({}; or WTL_NO_KVM=1 for very slow TCG)", KVM_HINT);
         }
         Ok(())
     }
@@ -434,7 +461,12 @@ pub fn command_arm64(env: &Env, o: &Opts) -> Result<Vec<String>> {
         let p = s.to_string_lossy().replace(',', ",,");
         push(&["-chardev", &format!("file,id=ser0,path={},append=on", p), "-serial", "chardev:ser0"]);
         push(&["-chardev", &format!("file,id=wtlch,path={},append=on", p)]);
-        push(&["-device", "virtio-serial-pci,id=vser0", "-device", &format!("virtserialport,bus=vser0.0,chardev=wtlch,name={}", GUEST_CHANNEL)]);
+        push(&[
+            "-device",
+            "virtio-serial-pci,id=vser0",
+            "-device",
+            &format!("virtserialport,bus=vser0.0,chardev=wtlch,name={}", GUEST_CHANNEL),
+        ]);
     }
     // NICs: virtio-net (NetKVM from virtio-win; Windows on Arm has no in-box driver for any
     // NIC QEMU emulates)
@@ -521,12 +553,12 @@ mod tests {
     use super::*;
 
     fn env() -> Env {
-        let root = PathBuf::from("/r");
-        let mut vars = seed_vars(&root);
+        let home = Home::fixed(Path::new("/r"));
+        let mut vars = seed_vars(&home);
         vars.insert("WTL_QEMU".into(), "qemu-system-x86_64".into());
         vars.insert("WTL_CPUS".into(), "2".into());
         vars.insert("WTL_NIC".into(), "e1000".into());
-        let mut e = Env::from_vars(&root, &vars).unwrap();
+        let mut e = Env::from_vars(&home, &vars).unwrap();
         e.accel = Accel::Kvm;
         // as if WTL_ACCEL were set: the pinned x64 command lines hold on any host CPU
         e.accel_forced = true;
@@ -537,7 +569,7 @@ mod tests {
     /// The whole argv of a member, as a shell line (what <vm>.qemu.log.cmdline holds).
     #[test]
     fn member_cmdline() {
-        let s = "/home/dte/Documents/ISO images/win-test-lab/labs/state/school";
+        let s = "/home/u/my labs/labs/state/school";
         let o = Opts {
             name: "lab-school-CL1".into(),
             mem: "4096".into(),
@@ -552,7 +584,7 @@ mod tests {
             ..Default::default()
         };
         let got: Vec<String> = command(&env(), &o).unwrap().iter().map(|a| shell_quote(a)).collect();
-        let want = r"qemu-system-x86_64 -name lab-school-CL1 -machine pc -m 4096 -smp 2 -enable-kvm -cpu host\,hv_relaxed\,hv_spinlocks=0x1fff\,hv_vapic\,hv_time -rtc base=localtime -vga std -usb -device usb-tablet -device ich9-ahci\,id=ahci -drive id=disk0\,if=none\,format=qcow2\,file=/home/dte/Documents/ISO\ images/win-test-lab/labs/state/school/CL1.qcow2\,cache=writeback\,discard=unmap\,detect-zeroes=unmap -device ide-hd\,drive=disk0\,bus=ahci.0 -drive file=/home/dte/Documents/ISO\ images/win-test-lab/labs/state/school/CL1.iso\,media=cdrom\,if=ide\,index=0\,readonly=on -drive file=/home/dte/Documents/ISO\ images/win-test-lab/labs/state/school/mount-CL1-X.iso\,media=cdrom\,if=ide\,index=1\,readonly=on -netdev user\,id=net0 -device e1000\,netdev=net0 -netdev dgram\,id=lan0\,remote.type=inet\,remote.host=239.77.30.1\,remote.port=47030\,local.type=inet\,local.host=127.0.0.1\,local.port=47030 -device e1000\,netdev=lan0\,mac=52:54:00:4c:41:11 -serial file:/home/dte/Documents/ISO\ images/win-test-lab/labs/state/school/CL1.serial.log -qmp unix:/home/dte/Documents/ISO\ images/win-test-lab/labs/state/school/CL1.qmp\,server=on\,wait=off -boot order=c -display none -vnc 127.0.0.1:11 -no-shutdown";
+        let want = r"qemu-system-x86_64 -name lab-school-CL1 -machine pc -m 4096 -smp 2 -enable-kvm -cpu host\,hv_relaxed\,hv_spinlocks=0x1fff\,hv_vapic\,hv_time -rtc base=localtime -vga std -usb -device usb-tablet -device ich9-ahci\,id=ahci -drive id=disk0\,if=none\,format=qcow2\,file=/home/u/my\ labs/labs/state/school/CL1.qcow2\,cache=writeback\,discard=unmap\,detect-zeroes=unmap -device ide-hd\,drive=disk0\,bus=ahci.0 -drive file=/home/u/my\ labs/labs/state/school/CL1.iso\,media=cdrom\,if=ide\,index=0\,readonly=on -drive file=/home/u/my\ labs/labs/state/school/mount-CL1-X.iso\,media=cdrom\,if=ide\,index=1\,readonly=on -netdev user\,id=net0 -device e1000\,netdev=net0 -netdev dgram\,id=lan0\,remote.type=inet\,remote.host=239.77.30.1\,remote.port=47030\,local.type=inet\,local.host=127.0.0.1\,local.port=47030 -device e1000\,netdev=lan0\,mac=52:54:00:4c:41:11 -serial file:/home/u/my\ labs/labs/state/school/CL1.serial.log -qmp unix:/home/u/my\ labs/labs/state/school/CL1.qmp\,server=on\,wait=off -boot order=c -display none -vnc 127.0.0.1:11 -no-shutdown";
         assert_eq!(got.join(" "), want);
     }
 
@@ -616,7 +648,11 @@ mod tests {
         let ser = command(&e, &Opts { serial: Some("/s/a,b.log".into()), ..o.clone() }).unwrap().join(" ");
         assert!(ser.contains("-chardev file,id=ser0,path=/s/a,,b.log,append=on -serial chardev:ser0"), "{}", ser);
         assert!(ser.contains("-chardev file,id=wtlch,path=/s/a,,b.log,append=on"), "{}", ser);
-        assert!(ser.contains("-device virtio-serial-pci,id=vser0 -device virtserialport,bus=vser0.0,chardev=wtlch,name=org.wintestlab.0"), "{}", ser);
+        assert!(
+            ser.contains("-device virtio-serial-pci,id=vser0 -device virtserialport,bus=vser0.0,chardev=wtlch,name=org.wintestlab.0"),
+            "{}",
+            ser
+        );
         assert!(!a.contains("ide-") && !a.contains("e1000") && !a.contains("-boot"), "{}", a);
         // a normal boot: from the disk
         let b = command(&e, &Opts { boot_once_d: false, ..o.clone() }).unwrap().join(" ");

@@ -1,8 +1,8 @@
-//! End-to-end test of `wtl-rs lab` without KVM or Windows.
+//! End-to-end test of `wtl` without KVM or Windows.
 //!
 //! This one binary plays three parts:
 //!   * the test driver (no args / cargo's args): builds a throwaway win-test-lab tree in a
-//!     temp dir and runs `wtl-rs lab ...` against it, checking exit codes, messages and files;
+//!     temp dir and runs `wtl ...` against it, checking exit codes, messages and files;
 //!   * a fake `qemu-system-x86_64` (argv has `-machine`): serves QMP (unix socket or TCP)
 //!     and simulates guest/lab.ps1 by reading the control disc's LAB/lab.json and the mount
 //!     discs, writing the WTL serial events a real guest sends;
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use wtl_rs::mkiso::IsoReader;
+use wtl::mkiso::IsoReader;
 
 fn b64encode(b: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(b)
@@ -357,7 +357,7 @@ fn qmp_conn(c: Box<dyn ReadWrite>, shared: Arc<Mutex<Shared>>, no_shutdown: bool
                     continue;
                 }
                 let ppm = [b"P6\n4 2\n255\n".to_vec(), vec![200u8; 4 * 2 * 3]].concat();
-                let data = if png_wanted { wtl_rs::qmp::ppm_to_png(&ppm).unwrap() } else { ppm };
+                let data = if png_wanted { wtl::qmp::ppm_to_png(&ppm).unwrap() } else { ppm };
                 if std::fs::write(&file, data).is_ok() {
                     send(&mut w, r#"{"return": {}}"#);
                 } else {
@@ -622,12 +622,12 @@ fn free_port() -> u16 {
 
 impl Ctx {
     fn new(filter: Vec<String>) -> Ctx {
-        let tmp = std::env::temp_dir().join(format!("wtl-rs-fakelab-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("wtl-fakelab-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let tmp = std::fs::canonicalize(&tmp).unwrap(); // paths below are compared as text
         let root = tmp.join("lab");
-        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
         for d in ["lib", "guest", "labs", "images"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
@@ -658,7 +658,7 @@ impl Ctx {
         );
         std::fs::write(root.join("labs/tri.json"), tri).unwrap();
         // a JSON lab whose base images do not exist yet: the runner installs them with
-        // build-image.sh (here a fake that writes the image and logs its arguments)
+        // `wtl build-image` (here a fake that writes the image and logs its arguments)
         let fresh = format!(
             r#"{{
   "domain": "lab.local", "netbios": "LAB", "admin_password": "WinTest!2026",
@@ -778,20 +778,20 @@ impl Ctx {
         self.root.join("labs/state").join(lab)
     }
 
-    /// Run `wtl-rs lab ARGS` with the fake QEMU; stdout+stderr combined.
+    /// Run `wtl ARGS` with the fake QEMU; stdout+stderr combined.
     fn lab(&self, args: &[&str], env: &[(&str, &str)]) -> Out {
         let me = std::env::current_exe().unwrap();
         let outf = self.tmp.join("out.txt");
         let f = std::fs::File::create(&outf).unwrap();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_wtl-rs"));
-        cmd.arg("lab").args(args).current_dir(self.tmp.join("cfg"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_wtl"));
+        cmd.args(args).current_dir(self.tmp.join("cfg"));
         for (k, _) in std::env::vars_os() {
             let ks = k.to_string_lossy();
             if ks.starts_with("WTL_") || ks.starts_with("FAKE_") {
                 cmd.env_remove(&k);
             }
         }
-        cmd.env("WTL_ROOT", &self.root)
+        cmd.env("WTL_HOME", &self.root)
             .env("WTL_IMAGES_DIR", self.root.join("images"))
             .env("WTL_QEMU", &me)
             .env("WTL_QEMU_IMG", &me)
@@ -830,7 +830,7 @@ impl Ctx {
         for e in std::fs::read_dir(&self.piddir).unwrap().flatten() {
             let pid = e.file_name().to_string_lossy().into_owned();
             // an exited fake may be a zombie for a moment until init reaps it
-            let alive = |p: &str| p.parse().is_ok_and(wtl_rs::sys::pid_alive);
+            let alive = |p: &str| p.parse().is_ok_and(wtl::sys::pid_alive);
             if alive(&pid) {
                 std::thread::sleep(Duration::from_millis(300));
                 if alive(&pid) {
@@ -844,7 +844,7 @@ impl Ctx {
     fn kill_fakes(&self) {
         for e in std::fs::read_dir(&self.piddir).unwrap().flatten() {
             if let Ok(pid) = e.file_name().to_string_lossy().parse() {
-                wtl_rs::sys::kill_hard(pid);
+                wtl::sys::kill_hard(pid);
             }
             let _ = std::fs::remove_file(e.path());
         }
@@ -903,7 +903,7 @@ fn driver(args: &[String]) -> i32 {
     let mut cx = Ctx::new(filter);
     let mut out_of: Vec<(String, Out)> = Vec::new();
     let mut ran = 0;
-    // a scenario gets the test tree, a checker, and the outputs of the `lab` runs it makes
+    // a scenario gets the test tree, a checker, and the outputs of the `wtl` runs it makes
     // (printed when it fails)
     #[allow(clippy::type_complexity)]
     let mut scenario = |cx: &mut Ctx, name: &str, f: &dyn Fn(&Ctx, &mut Check, &mut Vec<(String, Out)>)| {
@@ -933,25 +933,28 @@ fn driver(args: &[String]) -> i32 {
         }
     };
     let run = |cx: &Ctx, outs: &mut Vec<(String, Out)>, args: &[&str], env: &[(&str, &str)]| -> usize {
-        outs.push((format!("lab {}", args.join(" ")), cx.lab(args, env)));
+        outs.push((format!("wtl {}", args.join(" ")), cx.lab(args, env)));
         outs.len() - 1
     };
 
     scenario(&mut cx, "usage + help", &|cx, c, outs| {
         let i = run(cx, outs, &["--help"], &[]);
         c.code(&outs[i].1, 0);
-        c.has(&outs[i].1, "lab up|restore|stop|status|prepare|rebuild LAB|CONFIG");
+        c.has(&outs[i].1, "stop the VMs and throw away everything since the 0 state");
+        c.has(&outs[i].1, "--home <DIR>");
         c.has(&outs[i].1, "Exit: 0 all steps passed, 1 a step failed, 2 lab error, 3 timeout.");
         // run needs a config file
         let i = run(cx, outs, &["run", "tri"], &[]);
         c.code(&outs[i].1, 2);
-        c.has(&outs[i].1, "usage: lab run CONFIG");
+        c.has(&outs[i].1, "usage: wtl run CONFIG");
         let i = run(cx, outs, &["status"], &[]);
         c.code(&outs[i].1, 2);
         let i = run(cx, outs, &["status", "nope"], &[]);
         c.code(&outs[i].1, 2);
         c.has(&outs[i].1, "no lab ");
-        c.has(&outs[i].1, "(labs: armmix fresh roles solo tri)");
+        // the home's own labs and the built-in ones
+        c.has(&outs[i].1, "armmix fresh mixed pki roles school single-2012");
+        c.has(&outs[i].1, "solo tri win10 win11)");
         // usage errors: clap's wording, exit 2
         let i = run(cx, outs, &["frobnicate", "tri"], &[]);
         c.code(&outs[i].1, 2);
@@ -994,7 +997,7 @@ fn driver(args: &[String]) -> i32 {
         c.code(&outs[i].1, 0);
         c.has(&outs[i].1, "lab tri (");
         c.has(&outs[i].1, "domain lab.local, 3 machines");
-        c.has(&outs[i].1, "0 state: not built yet (lab prepare tri, or just lab run ...)");
+        c.has(&outs[i].1, "0 state: not built yet (wtl prepare tri, or just wtl run ...)");
         c.has(&outs[i].1, "  DC              dc     2019    10.77.98.10 off");
         c.has(&outs[i].1, "  CL2             member win11   10.77.98.21 off");
     });
@@ -1203,7 +1206,7 @@ fn driver(args: &[String]) -> i32 {
         let o = &outs[i].1;
         c.code(o, 2);
         c.has(o, "ERROR: config run: CL1 reported: WTL LAB_FAIL | fake guest: CL1: step 1 blew up (line 42)");
-        c.has(o, "the VMs keep running - lab restore tri");
+        c.has(o, "the VMs keep running - wtl restore tri");
         c.has(o, "screenshot: ");
         c.ok(std::fs::read(st.join("CL1-fail.png")).unwrap_or_default().starts_with(b"\x89PNG"), "CL1-fail.png is not a PNG");
     });
@@ -1229,7 +1232,7 @@ fn driver(args: &[String]) -> i32 {
         c.code(o, 0);
         c.has(o, "CL2 ready");
         c.has(o, "  lab tri: domain lab.local");
-        c.has(o, "back to the 0 state: lab restore tri");
+        c.has(o, "back to the 0 state: wtl restore tri");
         c.lacks(o, "running ");
         let iso = IsoReader::open(&st.join("CL1.iso"), true).unwrap();
         let j: Value = serde_json::from_slice(iso.read("LAB/lab.json").unwrap()).unwrap();
@@ -1265,24 +1268,42 @@ fn driver(args: &[String]) -> i32 {
         c.ok(cx.live_fakes().is_empty(), format!("prepare left VMs running: {:?}", cx.live_fakes()));
     });
 
-    scenario(&mut cx, "invoked as `lab` through a symlink", &|cx, c, outs| {
-        std::fs::create_dir_all(cx.tmp.join("bin")).unwrap();
-        let link = cx.tmp.join("bin/lab");
-        let _ = std::fs::remove_file(&link);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_wtl-rs"), &link).unwrap();
-        #[cfg(not(unix))]
-        std::fs::copy(env!("CARGO_BIN_EXE_wtl-rs"), &link).unwrap();
-        let o = Command::new(&link).arg("status").arg("tri").env("WTL_ROOT", &cx.root).output().unwrap();
-        let text = String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr);
-        c.ok(o.status.code() == Some(0), format!("exit {:?}", o.status.code()));
-        outs.push(("lab status tri".into(), Out { code: o.status.code().unwrap_or(-1), text: text.clone() }));
-        c.ok(text.contains("0 state: ready"), "status via the symlink");
-        // what `lab` runs for a missing base image goes through its own path, which is this
-        // symlink: `lab build-image` must reach the image builder
-        let o = Command::new(&link).args(["build-image", "--help"]).output().unwrap();
-        let help = String::from_utf8_lossy(&o.stdout).into_owned();
-        c.ok(o.status.code() == Some(0) && help.contains("Install Windows into a base image"), format!("lab build-image --help: {}", help));
+    scenario(&mut cx, "a home that is not a checkout: built-in labs + scripts, wtl.json", &|cx, c, outs| {
+        // what `cargo install` users get: no checkout anywhere, only the program
+        let h = cx.tmp.join("plain home");
+        let _ = std::fs::remove_dir_all(&h);
+        std::fs::create_dir_all(&h).unwrap();
+        let hs = h.to_string_lossy().into_owned();
+        let i = run(cx, outs, &["home"], &[("WTL_HOME", &hs)]);
+        c.code(&outs[i].1, 0);
+        c.has(&outs[i].1, &format!("home        {}", hs));
+        c.has(&outs[i].1, "guest scripts and OS table built into wtl");
+        c.has(&outs[i].1, &format!("state_dir   {}/labs/state", hs));
+        // a built-in lab, written into its state folder
+        let i = run(cx, outs, &["status", "single-2019"], &[("WTL_HOME", &hs)]);
+        c.code(&outs[i].1, 0);
+        c.has(&outs[i].1, "lab single-2019 (");
+        c.has(&outs[i].1, "(wtl prepare single-2019, or just wtl run ...)");
+        c.file(&h.join("labs/state/single-2019/single-2019.json"));
+        // wtl.json moves a folder, relative to itself; a WTL_* variable beats it
+        std::fs::write(h.join("wtl.json"), "{ \"state_dir\": \"../plain state\" }\n").unwrap();
+        let i = run(cx, outs, &["home"], &[("WTL_HOME", &hs)]);
+        c.has(&outs[i].1, &format!("state_dir   {}  [{}]", cx.tmp.join("plain state").display(), h.join("wtl.json").display()));
+        let i = run(cx, outs, &["home"], &[("WTL_HOME", &hs), ("WTL_STATE_DIR", "/elsewhere")]);
+        c.has(&outs[i].1, "state_dir   /elsewhere  [WTL_STATE_DIR]");
+        // a bad key in wtl.json is an error, not ignored
+        std::fs::write(h.join("wtl.json"), "{ \"state_dirr\": \"x\" }\n").unwrap();
+        let i = run(cx, outs, &["home"], &[("WTL_HOME", &hs)]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "unknown field `state_dirr`");
+        let _ = std::fs::remove_file(h.join("wtl.json"));
+        // --home is WTL_HOME
+        let i = run(cx, outs, &["--home", &hs, "home"], &[]);
+        c.has(&outs[i].1, &format!("home        {}", hs));
+        // `wtl build-image` is what a run starts for a missing base image
+        let i = run(cx, outs, &["build-image", "--help"], &[]);
+        c.code(&outs[i].1, 0);
+        c.has(&outs[i].1, "Install Windows into a base image");
     });
 
     scenario(&mut cx, "JSON lab: missing base images are installed first", &|cx, c, outs| {
@@ -1329,13 +1350,22 @@ fn driver(args: &[String]) -> i32 {
         let arm = line("lab-armmix-ARM1");
         let dc = line("lab-armmix-DC1");
         // the arm64 machine: virt + aarch64 UEFI, NVMe, USB CDs, virtio NICs + the guest channel
-        for want in ["-machine virt", "-device nvme,serial=wtl0,drive=disk0", "-device usb-storage,drive=cd0,removable=on",
-                     "virtio-net-pci,netdev=lan0,mac=52:54:00:4c:41:11", "name=org.wintestlab.0", "-serial chardev:ser0"] {
+        for want in [
+            "-machine virt",
+            "-device nvme,serial=wtl0,drive=disk0",
+            "-device usb-storage,drive=cd0,removable=on",
+            "virtio-net-pci,netdev=lan0,mac=52:54:00:4c:41:11",
+            "name=org.wintestlab.0",
+            "-serial chardev:ser0",
+        ] {
             c.ok(arm.contains(want), format!("ARM1 argv lacks {:?}: {}", want, arm));
         }
         c.ok(!arm.contains("e1000") && !arm.contains("if=ide"), format!("ARM1 argv: {}", arm));
         // the x64 DC is unchanged: pc + IDE + e1000, on the same LAN port
-        c.ok(dc.contains("-machine pc") && dc.contains("e1000,netdev=lan0") && dc.contains("local.port=47125"), format!("DC1 argv: {}", dc));
+        c.ok(
+            dc.contains("-machine pc") && dc.contains("e1000,netdev=lan0") && dc.contains("local.port=47125"),
+            format!("DC1 argv: {}", dc),
+        );
         c.ok(arm.contains("local.port=47125"), "ARM1 on the lab LAN");
         // each machine's UEFI vars come from its own CPU's template
         c.file(&cx.state("armmix").join("ARM1-AAVMF_VARS.fd"));
@@ -1412,8 +1442,8 @@ fn driver(args: &[String]) -> i32 {
         if let Some(st) = st {
             let dir = cx.root.join("labs/state").join(&st);
             c.file(&dir.join("DC1-0.qcow2"));
-            // the hints name the lab file (what `lab` takes for a project lab)
-            c.has(o, &format!("lab restore {}", cx.tmp.join("proj/wintest/lab.json").display()));
+            // the hints name the lab file (what `wtl` takes for a project lab)
+            c.has(o, &format!("wtl restore {}", cx.tmp.join("proj/wintest/lab.json").display()));
             c.has(o, &format!("lab {}: domain corp.test", st));
             // the steps only name X:, but Y: (the build output) is mounted too
             c.file(&dir.join("mount-SRV1-Y.iso"));

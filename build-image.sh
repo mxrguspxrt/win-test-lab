@@ -196,7 +196,7 @@ build_one() {
     fi
     render_template "$tmpl" "$stage/autounattend.xml" \
         "IMAGE_INDEX=$idx" "PASSWORD=$(xml_escape "$WTL_PASSWORD")" "COMPUTERNAME=$cn" \
-        "OS=$OS_KEY" "PRODUCTKEY=$prodkey"
+        "OS=$OS_KEY" "PRODUCTKEY=$prodkey" "ARCH=amd64"
     cp "$ROOT/guest/setup.ps1" "$ROOT/guest/agent.ps1" "$stage/WTL/"
     local g
     for g in "$ROOT"/guest/*.ps1; do [[ -f "$g" && ! -e "$stage/WTL/$(basename "$g")" ]] && cp "$g" "$stage/WTL/" ; done

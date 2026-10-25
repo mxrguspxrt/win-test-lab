@@ -2,7 +2,7 @@
 #
 # PowerShell 4.0 compatible (Server 2012 R2 baseline). No PS5+ features.
 # Dot-sourced by agent.ps1 when a CD has \LAB\lab.ps1 + \LAB\lab.json (the control disc the
-# host's `lab` writes for each machine); uses the agent's Send-WtlEvent. Runs at every logon
+# host's `wtl` writes for each machine); uses the agent's Send-WtlEvent. Runs at every logon
 # and continues where it left off:
 #
 #   role dc:      rename to the machine key -> reboot -> static IP on the lab NIC -> AD DS

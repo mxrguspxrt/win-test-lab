@@ -1,7 +1,7 @@
-# smoke-test: a tiny standalone exe for `lab run`
+# smoke-test: a tiny standalone exe for `wtl run`
 
     examples/smoke-test/build.sh                    # -> out/ (smoke.exe + setup.bat) and smoke.zip
-    lab run examples/configs/school-smoke.json      # mount out/ as X:, run it on every machine
+    wtl run examples/configs/school-smoke.json      # mount out/ as X:, run it on every machine
 
 `smoke.exe` is a single self-contained program - no DLLs, no data files. It prints who it runs
 as (e.g. `LAB\student1`) and the Windows version, then exits 0. A run whose steps all exit 0

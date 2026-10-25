@@ -26,6 +26,12 @@ examples/**/*.zip
 examples/**/out/
 examples/demo/program.exe
 
+# Rust build output
+/target/
+
+# a home's own config (wtl init)
+/wtl.json
+
 # Python / editor
 __pycache__/
 *.pyc

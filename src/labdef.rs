@@ -30,7 +30,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LabDef {
-    /// Optional path or URL of the JSON Schema, for editors (ignored by `lab`).
+    /// Optional path or URL of the JSON Schema, for editors (ignored by `wtl`).
     #[serde(default, rename = "$schema", skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
     /// The lab's name: names its state folder `labs/state/<name>/` and its VMs. Default: the
@@ -242,7 +242,7 @@ pub struct UserDef {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RunDef {
-    /// Optional path or URL of the JSON Schema, for editors (ignored by `lab`).
+    /// Optional path or URL of the JSON Schema, for editors (ignored by `wtl`).
     #[serde(default, rename = "$schema", skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
     /// The lab to boot: a name (`labs/<lab>.json` in win-test-lab, e.g. `school`) or a path to
@@ -353,7 +353,7 @@ impl JsonSchema for OnSpec {
 
 // ===================================================================== resolved types
 
-/// The default Administrator password: what build-image.sh installs base images with.
+/// The default Administrator password: what `wtl build-image` installs base images with.
 pub const DEFAULT_ADMIN_PASSWORD: &str = "WinTest!2026";
 
 /// A fully resolved lab: defaults filled in, validated, ready to boot.
@@ -1215,20 +1215,19 @@ mod tests {
     /// Every lab in labs/ and every example run in examples/configs/ loads and resolves.
     #[test]
     fn repo_labs_and_runs_resolve() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut labs = std::collections::HashMap::new();
-        for e in std::fs::read_dir(root.join("labs")).unwrap().flatten() {
-            let p = e.path();
-            if p.extension().is_some_and(|x| x == "json") {
-                let l = LabDef::load(&p).unwrap_or_else(|e| panic!("{}: {:#}", p.display(), e));
-                labs.insert(p.file_stem().unwrap().to_string_lossy().into_owned(), l);
-            }
+        for (file, text) in crate::assets::LABS {
+            let l = LabDef::parse(text, file).and_then(|d| d.resolve(file)).unwrap_or_else(|e| panic!("{}: {:#}", file, e));
+            labs.insert(file.trim_end_matches(".json").to_string(), l);
         }
         for want in ["school", "2019", "mixed", "single-2019"] {
             assert!(labs.contains_key(want), "no labs/{}.json: {:?}", want, labs.keys());
         }
+        // examples/ is not in the published package: check the runs where it exists
+        let Ok(rd) = std::fs::read_dir(root.join("examples/configs")) else { return };
         let mut runs = 0;
-        for e in std::fs::read_dir(root.join("examples/configs")).unwrap().flatten() {
+        for e in rd.flatten() {
             let p = e.path();
             if p.extension().is_some_and(|x| x == "json") {
                 let def = RunDef::parse(&std::fs::read_to_string(&p).unwrap(), &p.display().to_string()).unwrap();

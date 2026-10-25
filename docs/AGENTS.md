@@ -12,10 +12,12 @@ or a project's `wintest/*.json`) names its lab by name or path, mounts host fold
 programs on chosen machines as chosen users. The user wants it simple: "0 state, run my
 program, see if it works, restore, deploy the new version". No snapshot juggling.
 
-The host side is the Rust program in `wtl-rs/` (binary `wtl-rs`, which acts as `lab` when
-called by that name). The guest side is PowerShell in `guest/`. They talk over a serial log
-(SPEC.md). `build-image.sh` (bash + `lib/*.py`) still installs the Windows base images; `lab`
-calls it. `launch-test.sh` is a separate, older single-VM tester that shares those helpers.
+The host side is the Rust crate at the repository root (crate `win-test-lab` on crates.io,
+binary `wtl`). The guest side is PowerShell in `guest/`, compiled into `wtl` (with
+`lib/oslist.conf` and `labs/*.json`) so an installed `wtl` needs no checkout; run from a
+checkout, `wtl` reads them from disk instead. They talk over a serial log (SPEC.md).
+`build-image.sh` and `launch-test.sh` (bash + `lib/*.py`) are older tools that `wtl` does not
+use; they stay in git, not in the published crate.
 
 Read [SPEC.md](../SPEC.md) for the design and [docs/CONFIG.md](CONFIG.md) for the formats.
 
@@ -27,24 +29,33 @@ Read [SPEC.md](../SPEC.md) for the design and [docs/CONFIG.md](CONFIG.md) for th
 - **Only the agent writes COM1.** The SYSTEM worker (`labsvc.ps1`) answers through files under
   `C:\WTL\svc`; output reaches the host as `OUTPUT` events sent by the agent's session.
 - **No root and no Samba on the host.** Host folders reach the guests as read-only ISOs
-  written by `wtl-rs/src/mkiso.rs`; the lab LAN is QEMU `-netdev dgram` multicast on loopback.
+  written by `src/mkiso.rs`; the lab LAN is QEMU `-netdev dgram` multicast on loopback.
 - **Keep the formats strict.** `labdef.rs` uses `deny_unknown_fields` and validates before
   anything boots. A new field needs: the struct field with a doc comment (it becomes the
-  schema description), validation in `resolve()`, `wtl-rs schema` to regenerate
-  `wtl-rs/schema/`, and a line in docs/CONFIG.md.
-- **Use crates for generic work** (JSON, CLI parsing, errors, time, Ctrl-C, base64). The
-  win-test-lab logic itself (ISO writer, QMP client, serial protocol, runner) is in-tree.
+  schema description), validation in `resolve()`, `cargo run -- schema` to regenerate
+  `schema/`, and a line in docs/CONFIG.md.
+- **Use crates for generic work** (JSON, CLI parsing, errors, time, Ctrl-C, base64, per-user
+  folders). The win-test-lab logic itself (ISO writer, QMP client, serial protocol, runner)
+  is in-tree.
+- **Nothing outside the crate at runtime.** A file `wtl` needs goes through `src/assets.rs`
+  (compiled in by `embed.rs`) and the package's `include` list in Cargo.toml; data paths go
+  through `src/home.rs`. Check with `cargo package --list` and a `cargo install --path .`
+  run from an empty folder.
 - At most 3 VMs at a time on the development machine.
 
 ## Where things are
 
-    wtl-rs/src/lab.rs        `lab` CLI (run/up/restore/stop/status/prepare/rebuild); find_root;
-                             build_base_images (drives build-image.sh)
-    wtl-rs/src/labdef.rs     LabDef/RunDef (raw serde) -> Lab/Run (resolved, validated)
-    wtl-rs/src/labrun.rs     MultiLab: 0 state, boot, control + mount discs, steps, result.json
-    wtl-rs/src/qemu.rs       Env (WTL_* settings) and the QEMU argv
-    wtl-rs/src/{qmp,serialwait,outputs,mkiso,oslist,sys,util,logx,pyjson,schema}.rs
-    wtl-rs/tests/fake_lab.rs end-to-end suite; one binary that is the test driver, a fake
+    src/main.rs              the `wtl` command line
+    src/lab.rs               the lab commands (run/up/restore/stop/status/prepare/rebuild,
+                             doctor, check-iso, home, init); build_base_images
+    src/home.rs              the home: --home / WTL_HOME / wtl.json / user config / data folder
+    src/assets.rs, embed.rs  guest/, lib/oslist.conf, labs/*.json built into the program
+    src/build.rs             `wtl build-image`: an unattended Windows install
+    src/labdef.rs            LabDef/RunDef (raw serde) -> Lab/Run (resolved, validated)
+    src/labrun.rs            MultiLab: 0 state, boot, control + mount discs, steps, result.json
+    src/qemu.rs              Env (WTL_* settings) and the QEMU argv
+    src/{qmp,serialwait,outputs,mkiso,winiso,oslist,sys,util,logx,pyjson,schema,sha256}.rs
+    tests/fake_lab.rs        end-to-end suite; one binary that is the test driver, a fake
                              qemu-system-x86_64 (simulates guest/lab.ps1 from the control disc)
                              and a fake qemu-img
     guest/lab.ps1            rename, DC promotion, users/groups, join, autologon, the build-time
@@ -52,21 +63,22 @@ Read [SPEC.md](../SPEC.md) for the design and [docs/CONFIG.md](CONFIG.md) for th
     guest/labsvc.ps1         SYSTEM worker: mounts, steps as system / as another user
     guest/agent.ps1          logon agent (COM1); also the launch-test.sh agent
     guest/setup.ps1          base-image first logon
-    labs/*.json, examples/configs/*.json, wtl-rs/schema/*.json
+    labs/*.json, examples/configs/*.json, schema/*.json
 
-State on disk (git-ignored): `images/` (base images), `labs/state/<lab>/` (0 state, overlays,
-serial logs, `runs/<id>/`), `iso-files/`, `runs/` (build-image.sh scratch).
+State on disk (git-ignored, in the home; a checkout is its own home): `images/` (base
+images), `labs/state/<lab>/` (0 state, overlays, serial logs, `runs/<id>/`), `iso-files/`,
+`runs/` (base-image build scratch). `wtl home` shows where each one is.
 
 ## When you change things
 
-- `guest/lab.ps1`: shipped on the control disc at every boot, so the next `lab run` uses it,
+- `guest/lab.ps1`: shipped on the control disc at every boot, so the next `wtl run` uses it,
   except what the 0-state build bakes in (rename, promotion, users, join, autologon, the
-  `WTL-Svc` task): for those, `lab rebuild <lab>` and run again.
-- `guest/labsvc.ps1`: copied into the 0 state, so `lab rebuild <lab>`.
-- `guest/setup.ps1`, `guest/autounattend*.xml.tmpl`, `build-image.sh`: these make the base
-  images; delete `images/<os>-*.qcow2` (or `build-image.sh --force`) and the lab's 0 state.
-- `wtl-rs/src/*`: `cargo build --release` in `wtl-rs/` (`~/.local/bin/lab` points at
-  `target/release/wtl-rs`).
+  `WTL-Svc` task): for those, `wtl rebuild <lab>` and run again.
+- `guest/labsvc.ps1`: copied into the 0 state, so `wtl rebuild <lab>`.
+- `guest/setup.ps1`, `guest/autounattend*.xml.tmpl`: these make the base images; delete
+  `images/<os>-*.qcow2` and the lab's 0 state.
+- `src/*`: `cargo build --release` (then `target/release/wtl`). A `wtl` built in a checkout
+  uses that checkout's guest scripts; an installed one uses the copies built into it.
 - The serial protocol, the control disc's `lab.json` and the `WTL_*` variables are the
   contract between host and guest: change both sides together, and SPEC.md.
 
@@ -74,15 +86,18 @@ serial logs, `runs/<id>/`), `iso-files/`, `runs/` (build-image.sh scratch).
 
     tests/all.sh                         # everything that needs no VM (cargo test, ps_lint,
                                          # lab/config checks, the fake-qemu suite)
-    cd wtl-rs && cargo clippy --all-targets && cargo fmt --check
+    cargo clippy --all-targets && cargo fmt --check
     cargo check --target x86_64-pc-windows-gnu && cargo check --target x86_64-apple-darwin
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-    wtl-rs/tests/parity.sh               # mkiso / outputs agree with lib/*.py (needs python3)
+    cargo package --list                 # what would be published
 
 Anything touching the guest or the boot sequence also needs a real run, in each mode it
-affects: `lab rebuild single-2019 && lab run examples/configs/single-2019-smoke.json`
-(workgroup, ~10 min) and `lab rebuild mixed && lab run examples/configs/mixed-smoke.json`
+affects: `wtl rebuild single-2019 && wtl run examples/configs/single-2019-smoke.json`
+(workgroup, ~10 min) and `wtl rebuild mixed && wtl run examples/configs/mixed-smoke.json`
 (AD, ~30 min).
+
+Publishing to crates.io only after the maintainer has reviewed the package and said yes: a
+published version can never be replaced, only yanked.
 
 ## Gotchas that cost time before
 
@@ -100,11 +115,11 @@ affects: `lab rebuild single-2019 && lab run examples/configs/single-2019-smoke.
 - Steps "as" another user: `Process.Start` with credentials (CreateProcessWithLogonW) does not
   work from LocalSystem; labsvc.ps1 uses `LogonUser` + `CreateProcessAsUser`, with the output
   files opened by SYSTEM and inherited (the user has no rights on `C:\WTL`).
-- A lab file outside `labs/` gets a state name with a hash of its path: moving a project's
-  `lab.json` means a new 0 state (or set `"name"`).
+- A lab file outside the home's `labs/` (and not a built-in lab) gets a state name with a hash
+  of its path: moving a project's `lab.json` means a new 0 state (or set `"name"`).
 - Roles/features/setup are baked into the 0 state in a build-only `configure` phase, so they
   are on the **build** control disc only (empty on a run disc) and changing them needs
-  `lab rebuild`. A member with config stays the (domain) Administrator for that phase, because
+  `wtl rebuild`. A member with config stays the (domain) Administrator for that phase, because
   `ad-cs`/`dhcp`-in-AD need that token, then reboots into its `logon` user. `ad-cs` requires an
   AD lab; roles/features need a server OS (checked before boot). A member has no
   ActiveDirectory PowerShell module: `ad-cs` uses ADSI (RootDSE, the template and

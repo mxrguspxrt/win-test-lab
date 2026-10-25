@@ -1,12 +1,13 @@
-//! Install Windows into a base image, unattended: `images/<name>.qcow2` (the Rust port of
-//! build-image.sh, so the host needs neither bash nor Python).
+//! Install Windows into a base image, unattended: `images/<name>.qcow2`.
 //!
-//! Finds the ISO for the OS key (images-list.conf, else any ISO in WTL_ISO_DIR whose image 1
-//! has the right build and CPU), picks the edition's image index, renders the answer file,
-//! writes the WTL_BUILD disc (answer file + guest/*.ps1 + build.json), boots QEMU with the
-//! installer, waits for `BUILD_DONE` from guest/setup.ps1 and the guest's power-off, and
-//! renames `<name>.qcow2.partial` to `<name>.qcow2`.
+//! Finds the ISO for the OS key (`images-list.conf` in the home, else any ISO in the ISO folder
+//! whose image 1 has the right build and CPU), picks the edition's image index, renders the
+//! answer file, writes the WTL_BUILD disc (answer file + guest/*.ps1 + build.json), boots QEMU
+//! with the installer, waits for `BUILD_DONE` from guest/setup.ps1 and the guest's power-off,
+//! and renames `<name>.qcow2.partial` to `<name>.qcow2`.
 
+use crate::assets;
+use crate::home::Home;
 use crate::lab::{pick_vnc_display, sock_path, write_file};
 use crate::logx::{err, log, ok, warn};
 use crate::oslist::OsInfo;
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant};
 /// What to build.
 pub struct Build<'a> {
     pub os: &'a OsInfo,
-    /// images/<image>.qcow2
+    /// `images/<image>.qcow2`
     pub image: &'a str,
     /// the Windows computer name baked into the image
     pub computer: &'a str,
@@ -33,23 +34,28 @@ pub struct Build<'a> {
     pub timeout_h: f64,
 }
 
-/// `<KEY> = <file>` from images-list.conf for an OS key (path relative to WTL_ISO_DIR).
-fn catalog_iso(root: &Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(root.join("images-list.conf")).ok()?;
+/// `<KEY> = <file>` from the home's images-list.conf for an OS key (path relative to the ISO
+/// folder).
+fn catalog_iso(home_dir: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(home_dir.join("images-list.conf")).ok()?;
     let want = crate::oslist::normalize(key);
     let pairs: Vec<(&str, &str)> =
         text.lines().filter_map(|l| l.split('#').next()?.split_once('=')).map(|(k, v)| (k.trim(), v.trim())).collect();
     // the exact key first, then any variant key of the same OS (win11_en_arm64 -> win11-arm64)
-    pairs.iter().find(|(k, _)| *k == want).or_else(|| pairs.iter().find(|(k, _)| crate::oslist::normalize(k) == want)).map(|(_, v)| v.to_string())
+    pairs
+        .iter()
+        .find(|(k, _)| *k == want)
+        .or_else(|| pairs.iter().find(|(k, _)| crate::oslist::normalize(k) == want))
+        .map(|(_, v)| v.to_string())
 }
 
 /// The ISO for OS: its images-list.conf entry if that ISO's image 1 has the OS's build and
 /// CPU, else the newest ISO in ISO_DIR that does. (x64 and arm64 Windows 11 share a build
 /// number, so the CPU decides between them.)
-pub fn find_iso(root: &Path, iso_dir: &Path, os: &OsInfo) -> Option<PathBuf> {
+pub fn find_iso(home: &Home, iso_dir: &Path, os: &OsInfo) -> Option<PathBuf> {
     let want_build: u32 = os.build.parse().ok()?;
     let fits = |p: &Path| matches!(winiso::iso_build_arch(p), Ok((b, a)) if b == want_build && a == os.arch);
-    if let Some(c) = catalog_iso(root, &os.key) {
+    if let Some(c) = catalog_iso(&home.dir, &os.key) {
         let p = if Path::new(&c).is_absolute() { PathBuf::from(&c) } else { iso_dir.join(&c) };
         if p.is_file() && fits(&p) {
             return Some(p);
@@ -62,7 +68,7 @@ pub fn find_iso(root: &Path, iso_dir: &Path, os: &OsInfo) -> Option<PathBuf> {
         .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("iso")))
         .map(|p| (std::fs::metadata(&p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), p))
         .collect();
-    isos.sort_by(|a, b| b.0.cmp(&a.0));
+    isos.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
     isos.into_iter().map(|(_, p)| p).find(|p| fits(p))
 }
 
@@ -70,18 +76,22 @@ fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
 }
 
-/// Fill `@NAME@` placeholders; CRLF line ends (Windows Setup reads either; this matches what
-/// build-image.sh wrote). Unreplaced placeholders are an error.
+/// Fill `@NAME@` placeholders; CRLF line ends (Windows Setup reads either). Unreplaced
+/// placeholders are an error.
 pub fn render_template(tmpl: &str, subs: &[(&str, String)]) -> Result<String> {
     let mut t = tmpl.trim_start_matches('\u{feff}').replace("\r\n", "\n");
     for (k, v) in subs {
         t = t.replace(&format!("@{}@", k), v);
     }
-    let left: Vec<&str> = t.match_indices('@').map(|(i, _)| &t[i..]).filter_map(|r| {
-        let end = r[1..].find('@')?;
-        let name = &r[1..1 + end];
-        (!name.is_empty() && name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')).then_some(&r[..end + 2])
-    }).collect();
+    let left: Vec<&str> = t
+        .match_indices('@')
+        .map(|(i, _)| &t[i..])
+        .filter_map(|r| {
+            let end = r[1..].find('@')?;
+            let name = &r[1..1 + end];
+            (!name.is_empty() && name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')).then_some(&r[..end + 2])
+        })
+        .collect();
     if !left.is_empty() {
         bail!("unreplaced placeholders in the answer file: {}", left.join(" "));
     }
@@ -92,7 +102,9 @@ pub fn render_template(tmpl: &str, subs: &[(&str, String)]) -> Result<String> {
 fn image_index(iso: &Path, os: &OsInfo) -> Result<u32> {
     let imgs = match winiso::Media::open(iso)?.images() {
         Ok(i) => i,
-        Err(e) if e.downcast_ref::<winiso::NoWim>().is_some() => bail!("{} has no sources/install.wim - not an installation disc", iso.display()),
+        Err(e) if e.downcast_ref::<winiso::NoWim>().is_some() => {
+            bail!("{} has no sources/install.wim - not an installation disc", iso.display())
+        }
         Err(e) => return Err(e),
     };
     if let Some(i) = winiso::pick(&imgs, &os.edition, &os.inst_type) {
@@ -106,7 +118,7 @@ fn image_index(iso: &Path, os: &OsInfo) -> Result<u32> {
 
 /// Stage + write the WTL_BUILD disc: autounattend.xml and WTL\ (setup.ps1, agent.ps1, every
 /// other guest script, build.json).
-fn make_build_disc(root: &Path, run_dir: &Path, b: &Build, idx: u32, password: &str) -> Result<PathBuf> {
+fn make_build_disc(home: &Home, run_dir: &Path, b: &Build, idx: u32, password: &str) -> Result<PathBuf> {
     let os = b.os;
     let arch = Arch::parse(&os.arch).unwrap_or_default();
     let stage = run_dir.join("stage");
@@ -114,8 +126,8 @@ fn make_build_disc(root: &Path, run_dir: &Path, b: &Build, idx: u32, password: &
     std::fs::create_dir_all(stage.join("WTL")).with_context(|| format!("cannot create {}", stage.display()))?;
     // UEFI machines (Win11, every arm64 machine) get the GPT layout + the Win11 check bypass
     let uefi = os.firmware == "uefi" || arch == Arch::Arm64;
-    let tmpl = root.join("guest").join(if uefi { "autounattend-uefi.xml.tmpl" } else { "autounattend.xml.tmpl" });
-    let text = std::fs::read_to_string(&tmpl).with_context(|| format!("cannot read {}", tmpl.display()))?;
+    let tmpl = if uefi { "autounattend-uefi.xml.tmpl" } else { "autounattend.xml.tmpl" };
+    let text = String::from_utf8(assets::guest_file(home, tmpl)?).with_context(|| format!("{} is not UTF-8", tmpl))?;
     // Client (Win10/11) retail media refuse to go on without a key; evaluation Server media
     // must NOT get one. Microsoft's published generic Pro key installs, does not activate.
     let prodkey = if os.kind == "client" {
@@ -136,23 +148,22 @@ fn make_build_disc(root: &Path, run_dir: &Path, b: &Build, idx: u32, password: &
         ],
     )?;
     write_file(&stage.join("autounattend.xml"), xml)?;
-    for e in std::fs::read_dir(root.join("guest"))?.flatten() {
-        let p = e.path();
-        if p.extension().is_some_and(|x| x == "ps1") {
-            std::fs::copy(&p, stage.join("WTL").join(e.file_name())).with_context(|| format!("cannot copy {}", p.display()))?;
+    for (name, data) in assets::guest_files(home)? {
+        if name.ends_with(".ps1") {
+            write_file(&stage.join("WTL").join(&name), data)?;
         }
     }
     for f in ["setup.ps1", "agent.ps1"] {
         if !stage.join("WTL").join(f).is_file() {
-            bail!("missing {}", root.join("guest").join(f).display());
+            bail!("missing guest/{}", f);
         }
     }
     // drivers Windows does not ship for this machine's devices (Windows on Arm has none for any
     // network card or serial port QEMU emulates): Setup installs everything under
     // \$WinPEDriver$ on any attached disc, in WinPE and into the installed system
-    let n = stage_drivers(root, arch, &stage.join("$WinPEDriver$"))?;
+    let n = stage_drivers(&home.drivers_dir, arch, &stage.join("$WinPEDriver$"))?;
     if n > 0 {
-        log(&format!("drivers for {}: {} (from drivers/, see docs/ISOS.md)", arch.as_str(), n));
+        log(&format!("drivers for {}: {} (from {}, see docs/ISOS.md)", arch.as_str(), n, home.drivers_dir.display()));
     }
     let cfg = serde_json::json!({ "os": os.key, "updates": b.updates, "password": password });
     write_file(&stage.join("WTL/build.json"), cfg.to_string())?;
@@ -166,11 +177,10 @@ fn make_build_disc(root: &Path, run_dir: &Path, b: &Build, idx: u32, password: &
 /// serial channel); x64 machines use in-box drivers and get none.
 pub const ARM64_DRIVERS: [&str; 2] = ["NetKVM", "vioserial"];
 
-/// The newest drivers/virtio-win-*/ folder (a full extracted virtio-win ISO, or just the
-/// driver folders), or a drivers/virtio-win.iso.
-fn virtio_source(root: &Path) -> Option<PathBuf> {
-    let d = root.join("drivers");
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&d)
+/// The newest virtio-win-*/ folder in the drivers folder (a full extracted virtio-win ISO, or
+/// just the driver folders).
+fn virtio_source(drivers: &Path) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(drivers)
         .ok()?
         .flatten()
         .map(|e| e.path())
@@ -182,15 +192,15 @@ fn virtio_source(root: &Path) -> Option<PathBuf> {
 
 /// Copy the drivers ARCH needs into DEST; returns how many driver folders were staged. An
 /// arm64 build without them fails here, before a 50 min install that could never report back.
-fn stage_drivers(root: &Path, arch: Arch, dest: &Path) -> Result<usize> {
+fn stage_drivers(drivers: &Path, arch: Arch, dest: &Path) -> Result<usize> {
     if arch != Arch::Arm64 {
         return Ok(0);
     }
-    let src = virtio_source(root).ok_or_else(|| {
+    let src = virtio_source(drivers).ok_or_else(|| {
         anyhow!(
             "an arm64 machine needs the virtio-win network and serial drivers in {} (Windows on Arm has no driver for \
              any network card QEMU emulates); see docs/ISOS.md",
-            root.join("drivers").display()
+            drivers.display()
         )
     })?;
     let mut n = 0;
@@ -325,9 +335,9 @@ pub fn build(env: &Env, b: &Build, qmp_tcp: bool) -> Result<()> {
     let iso = match &b.iso {
         Some(p) if p.is_file() => p.clone(),
         Some(p) => bail!("ISO not found: {}", p.display()),
-        None => find_iso(&env.root, &env.iso_dir, os).ok_or_else(|| {
+        None => find_iso(&env.home, &env.iso_dir, os).ok_or_else(|| {
             anyhow!(
-                "no ISO for {} in {} (build {}, {}; see docs/ISOS.md and images-list.conf)",
+                "no ISO for {} in {} (build {}, {}; see docs/ISOS.md, `wtl check-iso`)",
                 os.display,
                 env.iso_dir.display(),
                 os.build,
@@ -344,10 +354,10 @@ pub fn build(env: &Env, b: &Build, qmp_tcp: bool) -> Result<()> {
         warn(&format!("only {} GiB free for {}; an install needs about 20-30 GiB", avail.unwrap_or(0), env.images_dir.display()));
     }
 
-    let run_dir = env.root.join("runs").join(format!("build-{}", b.image));
+    let run_dir = env.home.runs_dir.join(format!("build-{}", b.image));
     let _ = std::fs::remove_dir_all(&run_dir);
     std::fs::create_dir_all(&run_dir).with_context(|| format!("cannot create {}", run_dir.display()))?;
-    let unattend = make_build_disc(&env.root, &run_dir, b, idx, &env.password)?;
+    let unattend = make_build_disc(&env.home, &run_dir, b, idx, &env.password)?;
 
     let _ = std::fs::remove_file(&partial);
     let st = std::process::Command::new(&env.qemu_img)
@@ -366,7 +376,8 @@ pub fn build(env: &Env, b: &Build, qmp_tcp: bool) -> Result<()> {
     let vars = if uefi {
         let tmpl = if arch == Arch::Arm64 { &env.aavmf_vars } else { &env.ovmf_vars };
         let v = run_dir.join("vars.fd");
-        std::fs::copy(tmpl, &v).with_context(|| format!("UEFI vars template {} not found (install QEMU's UEFI firmware)", tmpl.display()))?;
+        std::fs::copy(tmpl, &v)
+            .with_context(|| format!("UEFI vars template {} not found (install QEMU's UEFI firmware)", tmpl.display()))?;
         Some(v)
     } else {
         None
@@ -407,12 +418,23 @@ pub fn build(env: &Env, b: &Build, qmp_tcp: bool) -> Result<()> {
         log(&format!("watch it: vnc://127.0.0.1:{}", 5900 + n));
     }
     if env.accel_for(arch) == qemu::Accel::Tcg {
-        warn(&format!("{} runs emulated on this host (no hardware acceleration for {}): expect several times slower", b.image, arch.as_str()));
+        warn(&format!(
+            "{} runs emulated on this host (no hardware acceleration for {}): expect several times slower",
+            b.image,
+            arch.as_str()
+        ));
     }
     log(&format!("waiting for BUILD_DONE (timeout {} h; Windows Update can take hours)", b.timeout_h));
     let t0 = Instant::now();
     let mut off = 0;
-    let w = Wait { until: &["BUILD_DONE"], fail: &["BUILD_FAIL"], timeout: Some(b.timeout_h * 3600.0), pid: Some(pid), progress: true, events_file: None };
+    let w = Wait {
+        until: &["BUILD_DONE"],
+        fail: &["BUILD_FAIL"],
+        timeout: Some(b.timeout_h * 3600.0),
+        pid: Some(pid),
+        progress: true,
+        events_file: None,
+    };
     let o = w.run(&serial, &mut off);
     if o == Outcome::Interrupted {
         // Ctrl-C: the VM runs in its own session and would outlive us
@@ -462,11 +484,16 @@ pub fn build(env: &Env, b: &Build, qmp_tcp: bool) -> Result<()> {
     });
     write_file(&env.images_dir.join(format!("{}.json", b.image)), serde_json::to_string_pretty(&meta)?)?;
     let _ = std::fs::remove_dir_all(run_dir.join("stage"));
-    ok(&format!("built {} ({}) in {} min", fin.display(), util::human_size(std::fs::metadata(&fin).map(|m| m.len()).unwrap_or(0)), t0.elapsed().as_secs() / 60));
+    ok(&format!(
+        "built {} ({}) in {} min",
+        fin.display(),
+        util::human_size(std::fs::metadata(&fin).map(|m| m.len()).unwrap_or(0)),
+        t0.elapsed().as_secs() / 60
+    ));
     Ok(())
 }
 
-/// A failed build, with build-image.sh's exit code (2 error, 3 timeout).
+/// A failed build, with its exit code (2 error, 3 timeout).
 #[derive(Debug)]
 pub struct BuildError(pub i32);
 impl std::fmt::Display for BuildError {
@@ -493,11 +520,15 @@ mod tests {
     /// The real answer files: every placeholder is filled for both CPUs.
     #[test]
     fn real_templates_render() {
-        let g = Path::new(env!("CARGO_MANIFEST_DIR")).join("../guest");
-        for (f, arch) in [("autounattend.xml.tmpl", "amd64"), ("autounattend-uefi.xml.tmpl", "amd64"), ("autounattend-uefi.xml.tmpl", "arm64")] {
-            let t = std::fs::read_to_string(g.join(f)).unwrap();
-            let subs: Vec<(&str, String)> =
-                ["IMAGE_INDEX", "PASSWORD", "COMPUTERNAME", "OS", "PRODUCTKEY"].iter().map(|k| (*k, "v".to_string())).chain([("ARCH", arch.to_string())]).collect();
+        for (f, arch) in
+            [("autounattend.xml.tmpl", "amd64"), ("autounattend-uefi.xml.tmpl", "amd64"), ("autounattend-uefi.xml.tmpl", "arm64")]
+        {
+            let t = String::from_utf8(assets::GUEST.iter().find(|(n, _)| *n == f).unwrap().1.to_vec()).unwrap();
+            let subs: Vec<(&str, String)> = ["IMAGE_INDEX", "PASSWORD", "COMPUTERNAME", "OS", "PRODUCTKEY"]
+                .iter()
+                .map(|k| (*k, "v".to_string()))
+                .chain([("ARCH", arch.to_string())])
+                .collect();
             let r = render_template(&t, &subs).unwrap_or_else(|e| panic!("{}: {}", f, e));
             assert!(r.contains(&format!("processorArchitecture=\"{}\"", arch)) || f == "autounattend.xml.tmpl", "{}", f);
         }

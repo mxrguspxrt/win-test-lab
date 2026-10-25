@@ -1,5 +1,5 @@
 //! The few OS calls std does not offer: liveness / stopping of a process by pid (QEMU
-//! started by an earlier `lab` call), starting QEMU in its own session, and Ctrl-C.
+//! started by an earlier `wtl` call), starting QEMU in its own session, and Ctrl-C.
 
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};

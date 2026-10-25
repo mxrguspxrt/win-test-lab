@@ -22,7 +22,11 @@ pub struct Sha256 {
 
 impl Default for Sha256 {
     fn default() -> Self {
-        Sha256 { h: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19], buf: Vec::with_capacity(64), len: 0 }
+        Sha256 {
+            h: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19],
+            buf: Vec::with_capacity(64),
+            len: 0,
+        }
     }
 }
 

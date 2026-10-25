@@ -292,12 +292,9 @@ pub fn ppm_to_png(data: &[u8]) -> Result<Vec<u8>> {
 
 // ------------------------------------------------------------------ CLI
 
-/// `wtl-rs qmp [--timeout S] SOCK CMD [ARGS]`
+/// `wtl tool qmp [--timeout S] SOCK CMD [ARGS]`
 #[derive(clap::Args, Debug)]
-#[command(
-    about = "Minimal QEMU monitor client (lib/qmp.py)",
-    after_help = "Exit: 0 ok, 1 QMP error reply, 2 connect/protocol failure, 64 usage."
-)]
+#[command(about = "Minimal QEMU monitor client", after_help = "Exit: 0 ok, 1 QMP error reply, 2 connect/protocol failure, 64 usage.")]
 pub struct Cli {
     /// seconds to wait for QEMU
     #[arg(long, default_value_t = 10.0, value_parser = positive_secs)]

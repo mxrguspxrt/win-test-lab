@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # tests/all.sh - run every win-test-lab test that needs no VM / no Windows.
 #   tests/all.sh
-# Covers: the Rust `lab` (cargo test: unit tests and the fake-QEMU lab suite), PowerShell
-# lint, a bash syntax check of the scripts, the labs and example run configs, and the
-# fake-qemu suite for build-image.sh / launch-test.sh. Exit 0 = all green.
+# Covers: `wtl` (cargo test: unit tests and the fake-QEMU lab suite), PowerShell lint, a
+# bash syntax check of the scripts, the labs and example run configs, and the fake-qemu suite
+# for build-image.sh / launch-test.sh. Exit 0 = all green.
 set -uo pipefail
 TESTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$TESTS/.." && pwd)"
@@ -11,10 +11,10 @@ cd "$ROOT"
 rc=0
 step() { echo; echo "=== $* ==="; }
 
-step "Rust lab (cargo test in wtl-rs/)"
+step "wtl (cargo test)"
 if command -v cargo >/dev/null; then
-    if (cd wtl-rs && cargo test --quiet 2>&1 | grep -E "test result|scenarios|FAIL|error" ); then :; fi
-    (cd wtl-rs && cargo test --quiet >/dev/null 2>&1) || { echo "FAIL cargo test"; rc=1; }
+    if cargo test --quiet 2>&1 | grep -E "test result|scenarios|FAIL|error"; then :; fi
+    cargo test --quiet >/dev/null 2>&1 || { echo "FAIL cargo test"; rc=1; }
 else
     echo "SKIP cargo not found"
 fi

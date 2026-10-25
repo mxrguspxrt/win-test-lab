@@ -1,7 +1,7 @@
 //! serde_json output formatted like Python's `json.dumps`: ", " / ": " separators,
 //! ensure_ascii (non-ASCII as \uXXXX), optional `indent=N`. The control disc's lab.json must
 //! be pure ASCII (PowerShell 4 reads it without a BOM), and the `outputs` summary stays
-//! byte-identical to lib/outputs.py's (tests/parity.sh compares them).
+//! byte-identical to lib/outputs.py's.
 
 use serde::Serialize;
 use serde_json::ser::Formatter;

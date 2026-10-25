@@ -166,11 +166,11 @@ pub fn decode(serial: &Path, res: &Path) -> Result<Value> {
     Ok(Value::Object(info))
 }
 
-/// `wtl-rs outputs SERIAL_LOG RESULTS_DIR`
+/// `wtl tool outputs SERIAL_LOG RESULTS_DIR`
 #[derive(clap::Args, Debug)]
 #[command(
-    about = "Decode the guest's OUTPUT streams (lib/outputs.py)",
-    long_about = "Decode program output captured by the guest agent (lib/outputs.py).\n\n\
+    about = "Decode the guest's OUTPUT streams",
+    long_about = "Decode program output captured by the guest agent.\n\n\
         Writes RESULTS_DIR/<stream>.txt for every OUTPUT stream (stdout.txt and stderr.txt always) and \
         prints one JSON object on stdout: exit_code, exit_hex, exit_name, timed_out, secs, \
         <stream>_bytes, <stream>_truncated ..., missing_chunks."
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn decode_streams() {
-        let d = std::env::temp_dir().join(format!("wtl-rs-outputs-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("wtl-outputs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let big: Vec<u8> = (0..2000u32).map(|i| (i % 256) as u8).collect();

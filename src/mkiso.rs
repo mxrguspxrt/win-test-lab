@@ -569,9 +569,9 @@ fn write_image(
     Ok(())
 }
 
-/// `wtl-rs mkiso -o out.iso -V VOLID SRC_DIR`
+/// `wtl tool mkiso -o out.iso -V VOLID SRC_DIR`
 #[derive(clap::Args, Debug)]
-#[command(about = "Write an ISO9660 + Joliet image of a directory (lib/mkiso.py)")]
+#[command(about = "Write an ISO9660 + Joliet image of a directory")]
 pub struct Cli {
     /// the image to write
     #[arg(short = 'o', value_name = "OUT.iso")]
@@ -680,7 +680,7 @@ mod tests {
     use super::*;
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("wtl-rs-mkiso-{}-{}", tag, std::process::id()));
+        let d = std::env::temp_dir().join(format!("wtl-mkiso-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

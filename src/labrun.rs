@@ -3,7 +3,8 @@
 //!
 //! A lab is one DC plus one or more domain-joined members, all on one private multicast LAN
 //! (`-netdev dgram`, which joins N VMs with no root). It is built once into a frozen 0 state
-//! (`labs/state/<lab>/<machine>-0.qcow2`) and every run starts from throwaway overlays on top.
+//! (`<state_dir>/<lab>/<machine>-0.qcow2`, see [`crate::home`]) and every run starts from
+//! throwaway overlays on top.
 //!
 //! Steps are **guest-driven**: each machine gets its ordered step list on its control disc and
 //! runs its own steps top to bottom, reporting each over its serial log. A step that targets
@@ -11,7 +12,9 @@
 //! channel into a booted guest (mounts are read-only ISOs), so there is no host-enforced
 //! barrier *between* different steps across machines — the simple model the user asked for.
 
-use crate::lab::{build_base_images, find_root, indent_file, pick_vnc_display, read_trim, sock_path, write_file, BaseBuild};
+use crate::assets;
+use crate::home::Home;
+use crate::lab::{build_base_images, indent_file, pick_vnc_display, read_trim, sock_path, write_file, BaseBuild};
 use crate::labdef::{self, Lab, Role, Run, RunStep, StepAs};
 use crate::logx::{err, log, ok, warn};
 use crate::oslist::{self, OsInfo};
@@ -29,7 +32,7 @@ use std::time::{Duration, Instant};
 /// and never routed off the host). Labs are isolated by their unique `lan_port`, not the group.
 const LAN_GROUP: &str = "239.77.30.1";
 
-/// Ends `lab` with this exit code; the reason has already been printed.
+/// Ends `wtl` with this exit code; the reason has already been printed.
 #[derive(Debug)]
 struct Exit(i32);
 impl std::fmt::Display for Exit {
@@ -42,7 +45,7 @@ impl std::error::Error for Exit {}
 // --------------------------------------------------------------- the control-disc lab.json
 
 /// `LAB\lab.json` on a machine's control disc, read by guest/lab.ps1. `fmt: "multi"` names
-/// this format; guest/lab.ps1 refuses anything else (e.g. a disc from an older `lab`).
+/// this format; guest/lab.ps1 refuses anything else (e.g. a disc from an older `wtl`).
 #[derive(Serialize)]
 struct LabJson<'a> {
     fmt: &'a str,
@@ -225,17 +228,16 @@ struct RunResult {
 }
 
 pub struct MultiLab {
-    root: PathBuf,
     env: Env,
-    /// the WTL_* settings (defaults + environment), passed on to build-image.sh
+    /// the WTL_* settings (defaults + environment), passed on to `wtl build-image`
     vars: HashMap<String, String>,
     /// install base images with Windows Update (--updates)
     updates: bool,
     cmd: &'static str,
-    /// the state name (`labs/state/<name>/`)
+    /// the state name (`<state_dir>/<name>/`)
     name: String,
-    /// how to name this lab on the `lab` command line in hints: the name for a lab in
-    /// win-test-lab's labs/, the lab file's path for one anywhere else
+    /// how to name this lab on the `wtl` command line in hints: the name for a lab in the
+    /// home's labs/ or a built-in one, the lab file's path for one anywhere else
     arg: String,
     lab_file: PathBuf,
     lab: Lab,
@@ -274,20 +276,29 @@ fn base_name(vm: &Vm) -> String {
     format!("{}-{}", vm.os.key, if vm.role == Role::Dc { "dc" } else { "client" })
 }
 
-/// The name of a lab's state folder (`labs/state/<name>/`) and VMs. An explicit `name` in the
-/// lab file wins. Otherwise a lab in win-test-lab's own `labs/` is called by its file name
-/// (`labs/school.json` -> `school`), and a lab file anywhere else gets its file name plus a
-/// short hash of its absolute path (`/proj/wintest/lab.json` -> `lab-3f9a1c2b`), so two
-/// projects' `lab.json` never share a 0 state.
-pub fn state_name(root: &Path, lab_file: &Path, lab: &Lab) -> String {
+/// The lab's name if LAB_FILE is a named lab: `<home>/labs/NAME.json`, or a built-in lab's copy
+/// `<state_dir>/NAME/NAME.json` (see [`assets::lab_file`]).
+fn named_lab(home: &Home, lab_file: &Path) -> Option<String> {
+    let stem = util::stem(util::basename(&lab_file.to_string_lossy())).to_string();
+    let dir = util::canon(lab_file).parent()?.to_path_buf();
+    let builtin = assets::builtin_lab(&stem).is_some() && dir == util::canon(&home.state_dir.join(&stem));
+    (dir == util::canon(&home.labs_dir()) || builtin).then_some(stem)
+}
+
+/// The name of a lab's state folder (`<state_dir>/<name>/`) and VMs. An explicit `name` in the
+/// lab file wins. Otherwise a named lab (`labs/school.json`, or the built-in `school`) is
+/// called by its name, and a lab file anywhere else gets its file name plus a short hash of its
+/// absolute path (`/proj/wintest/lab.json` -> `lab-3f9a1c2b`), so two projects' `lab.json`
+/// never share a 0 state.
+pub fn state_name(home: &Home, lab_file: &Path, lab: &Lab) -> String {
     if let Some(n) = &lab.name {
         return n.clone();
     }
+    if let Some(n) = named_lab(home, lab_file) {
+        return n;
+    }
     let stem = util::stem(util::basename(&lab_file.to_string_lossy())).to_string();
     let abs = util::canon(lab_file);
-    if abs.parent() == Some(util::canon(&root.join("labs")).as_path()) {
-        return stem;
-    }
     // FNV-1a: stable across runs and platforms (unlike std's DefaultHasher)
     let mut h: u32 = 0x811c_9dc5;
     for b in abs.to_string_lossy().bytes() {
@@ -327,16 +338,16 @@ pub struct RunOpts {
 impl MultiLab {
     fn new(cmd: &'static str, lab_file: &Path, config: Option<PathBuf>, run: Option<Run>, lab: Lab, opts: &RunOpts) -> Result<MultiLab> {
         let (show, updates, wait_override, timeout_override) = (opts.show, opts.updates, opts.wait, opts.timeout_min);
-        let root = find_root()?;
-        let name = state_name(&root, lab_file, &lab);
+        let home = Home::resolve()?;
+        let name = state_name(&home, lab_file, &lab);
         if !util::is_safe_name(&name) {
             bail!("bad lab name {:?} (from {}; set \"name\" in the lab file)", name, lab_file.display());
         }
-        let mut vars = qemu::seed_vars(&root);
+        let mut vars = qemu::seed_vars(&home);
         // the JSON lab carries its own admin password; keep WTL_PASSWORD only as the fallback
         // Env still needs the WTL_* machinery, so build it from the seeded vars.
         vars.insert("WTL_PASSWORD".into(), lab.admin_password.clone());
-        let env = Env::from_vars(&root, &vars)?;
+        let env = Env::from_vars(&home, &vars)?;
         let wtl_qmp = std::env::var("WTL_QMP").unwrap_or_default();
         let qmp_tcp = match wtl_qmp.as_str() {
             "tcp" => true,
@@ -345,8 +356,8 @@ impl MultiLab {
             other => bail!("WTL_QMP={} must be tcp or unix", other),
         };
 
-        let oslist = root.join("lib").join("oslist.conf");
-        let state = root.join("labs").join("state").join(&name);
+        let oslist = assets::oslist(&home)?;
+        let state = home.state_dir.join(&name);
         std::fs::create_dir_all(&state).with_context(|| format!("cannot create {}", state.display()))?;
 
         let wait_s = wait_override.or_else(|| run.as_ref().map(|r| r.wait)).unwrap_or(60);
@@ -425,16 +436,11 @@ impl MultiLab {
             }
         }
 
-        let arg = if util::canon(lab_file).parent() == Some(util::canon(&root.join("labs")).as_path()) {
-            name.clone()
-        } else {
-            util::canon(lab_file).to_string_lossy().into_owned()
-        };
+        let arg = named_lab(&home, lab_file).unwrap_or_else(|| util::canon(lab_file).to_string_lossy().into_owned());
         let now = Instant::now();
         let limit = Duration::from_secs((timeout_min.max(0) as u64).saturating_mul(60));
         Ok(MultiLab {
             zero_done: state.join("0-state.json"),
-            root,
             env,
             vars,
             updates,
@@ -549,7 +555,7 @@ impl MultiLab {
 
     fn interrupted(&self) -> anyhow::Error {
         eprintln!();
-        warn(&format!("interrupted; VMs may still be running (lab status {} / lab restore {})", self.arg, self.arg));
+        warn(&format!("interrupted; VMs may still be running (wtl status {} / wtl restore {})", self.arg, self.arg));
         Exit(2).into()
     }
     fn nap(&self, secs: f64) -> Result<()> {
@@ -666,7 +672,7 @@ impl MultiLab {
                 std::fs::read_to_string(&self.zero_done).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
             println!("  0 state: ready ({})", z.built_at);
         } else {
-            println!("  0 state: not built yet (lab prepare {}, or just lab run ...)", self.arg);
+            println!("  0 state: not built yet (wtl prepare {}, or just wtl run ...)", self.arg);
         }
         for v in &self.vms {
             let role = match (v.role, self.lab.is_ad()) {
@@ -751,7 +757,7 @@ impl MultiLab {
         self.env.images_dir.join(format!("{}.qcow2", base_name(vm)))
     }
 
-    /// Install Windows for every missing base image (build-image.sh, in parallel; one build
+    /// Install Windows for every missing base image (`wtl build-image`, in parallel; one build
     /// per image even when several machines share it).
     fn build_bases(&self) -> Result<()> {
         let mut builds: Vec<BaseBuild> = Vec::new();
@@ -764,7 +770,7 @@ impl MultiLab {
             let prefix = if vm.role == Role::Dc { "DC" } else { "CL" };
             builds.push(BaseBuild::new(&image, &vm.os.key, &image, &format!("{}{}", prefix, vm.os.key).to_uppercase()));
         }
-        build_base_images(&self.root, &self.vars, &self.state, &builds, self.updates, self.show, &|s| self.nap(s))?;
+        build_base_images(&self.vars, &self.state, &builds, self.updates, self.show, &|s| self.nap(s))?;
         let missing: Vec<String> =
             self.vms.iter().map(|v| self.base_image(v)).filter(|b| !b.is_file()).map(|b| b.display().to_string()).collect();
         if !missing.is_empty() {
@@ -795,11 +801,10 @@ impl MultiLab {
         let _ = std::fs::remove_dir_all(&stage);
         let labdir = stage.join("LAB");
         std::fs::create_dir_all(&labdir).with_context(|| format!("cannot create {}", labdir.display()))?;
-        // agent.ps1 too: the base image's copy may be older than this checkout's (lab.ps1
+        // agent.ps1 too: the base image's copy may be older than this program's (lab.ps1
         // installs it as C:\WTL\agent.ps1 during the 0-state build)
         for f in ["lab.ps1", "labsvc.ps1", "agent.ps1"] {
-            let src = self.root.join("guest").join(f);
-            std::fs::copy(&src, labdir.join(f)).with_context(|| format!("cannot copy {}", src.display()))?;
+            write_file(&labdir.join(f), assets::guest_file(&self.env.home, f)?)?;
         }
         let role = if vm.role == Role::Dc { "dc" } else { "member" };
         let (logon_user, logon_password) = match &vm.logon {
@@ -1109,7 +1114,7 @@ impl MultiLab {
             }
         }
         log(&format!(
-            "logs: {} (guest: C:\\WTL\\agent.log); the VMs keep running - lab restore {}",
+            "logs: {} (guest: C:\\WTL\\agent.log); the VMs keep running - wtl restore {}",
             self.st(&format!("{}.serial.log", vm)).display(),
             self.arg
         ));
@@ -1178,7 +1183,7 @@ impl MultiLab {
         for vm in &order {
             log(&format!("shutting {} down cleanly", vm));
             if !self.freeze_off(vm)? {
-                bail!("{} did not power off; 0 state not saved (lab rebuild {}, then retry)", vm, self.arg);
+                bail!("{} did not power off; 0 state not saved (wtl rebuild {}, then retry)", vm, self.arg);
             }
             let _ = std::fs::remove_file(self.st(&format!("{}.pid", vm)));
             let _ = std::fs::remove_file(self.st(&format!("{}.iso", vm)));
@@ -1220,7 +1225,7 @@ impl MultiLab {
                 who
             );
         }
-        eprintln!("  back to the 0 state: lab restore {}      another run: lab run CONFIG", self.arg);
+        eprintln!("  back to the 0 state: wtl restore {}      another run: wtl run CONFIG", self.arg);
     }
 
     fn run_lab(&mut self) -> Result<i32> {
@@ -1382,12 +1387,11 @@ pub fn load_lab(path: &Path) -> Result<Lab> {
     labdef::LabDef::load(path)
 }
 
-/// Resolve the run file against its lab: `"lab": "school"` is `labs/school.json` under the
-/// win-test-lab root, `"lab": "./lab.json"` (anything with a `/` or `\`, or ending in
-/// `.json`) is a lab file relative to the run file. Returns the lab file path, the resolved
-/// lab, and the resolved run.
+/// Resolve the run file against its lab: `"lab": "school"` is `labs/school.json` in the home
+/// (else the built-in lab `school`), `"lab": "./lab.json"` (anything with a `/` or `\`, or
+/// ending in `.json`) is a lab file relative to the run file. Returns the lab file path, the
+/// resolved lab, and the resolved run.
 pub fn load_run(config: &Path) -> Result<(PathBuf, Lab, Run)> {
-    let root = find_root()?;
     let text = std::fs::read_to_string(config).map_err(|e| anyhow!("{}: {}", config.display(), e))?;
     let def = labdef::RunDef::parse(&text, &config.display().to_string())?;
     let base_dir = util::abspath(config).parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -1399,7 +1403,11 @@ pub fn load_run(config: &Path) -> Result<(PathBuf, Lab, Run)> {
         if !util::is_safe_name(&def.lab) {
             bail!("{}: lab {:?} must be a lab name (A-Z 0-9 . _ -) or a path to a lab file", config.display(), def.lab);
         }
-        root.join("labs").join(format!("{}.json", def.lab))
+        let home = Home::resolve()?;
+        match assets::lab_file(&home, &def.lab)? {
+            Some(f) => f,
+            None => home.labs_dir().join(format!("{}.json", def.lab)),
+        }
     };
     if !lab_file.is_file() {
         bail!("{}: lab {:?} not found ({} missing)", config.display(), def.lab, lab_file.display());
@@ -1437,9 +1445,11 @@ mod tests {
             machines: vec![],
             users: vec![],
         };
-        let root = Path::new("/r");
-        // labs/ in the checkout: the file name
+        let root = &Home::fixed(Path::new("/r"));
+        // labs/ in the home: the file name
         assert_eq!(state_name(root, Path::new("/r/labs/school.json"), &lab(None)), "school");
+        // a built-in lab's copy in its state folder: its name too
+        assert_eq!(state_name(root, Path::new("/r/labs/state/school/school.json"), &lab(None)), "school");
         // elsewhere: the file name + a hash of the path, different per project
         let a = state_name(root, Path::new("/p1/wintest/lab.json"), &lab(None));
         let b = state_name(root, Path::new("/p2/wintest/lab.json"), &lab(None));
