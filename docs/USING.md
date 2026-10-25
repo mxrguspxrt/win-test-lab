@@ -86,8 +86,9 @@ No domain, one Windows machine, logged on as a local user. This is the right def
 - Steps: `"as": "system"` (full rights; installers), the default (the logged-on user, with a
   desktop), or `"as": "admin2"` (another local user, started with its password, no desktop).
 
-`wtl` has `single-2012`, `single-2016`, `single-2019`, `single-2025`, `single-win10` and
-`single-win11` built in, so a project can also just say `"lab": "single-2019"`.
+`wtl` has `single-2012`, `single-2016`, `single-2019`, `single-2022`, `single-2025`,
+`single-win10` and `single-win11` built in, so a project can also just say
+`"lab": "single-2022"`.
 
 ## A domain (AD mode)
 

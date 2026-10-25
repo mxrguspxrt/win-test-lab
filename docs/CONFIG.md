@@ -181,7 +181,7 @@ The labs in `labs/`:
 
 | lab | mode | machines |
 |-----|------|----------|
-| `single-2012`, `single-2016`, `single-2019`, `single-win10`, `single-win11` | workgroup | one machine of that version, logged on as the local user `tester` |
+| `single-2012`, `single-2016`, `single-2019`, `single-2022`, `single-2025`, `single-win10`, `single-win11`, `single-win11-arm64` | workgroup | one machine of that version, logged on as the local user `tester` |
 | `mixed` | AD | DC1 (Server 2012 R2) + SRV1 (Server 2019 member server, logs on as `LAB\operator`, a Domain Admin); also the user `appuser` |
 | `school` | AD | DC1 (Server 2019) + CL1 (2012 R2, logs on as student1) + CL2 (2016, student2); users student1, student2, teacher |
 | `2012`, `2016`, `2019` | AD | a DC + one member of that version, logged on as `student`; `labadmin` is a Domain Admin |

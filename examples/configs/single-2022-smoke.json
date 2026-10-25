@@ -1,0 +1,9 @@
+{
+  "$schema": "../../schema/run.schema.json",
+  "lab": "single-2022",
+  "mount": { "X": "../smoke-test/out" },
+  "steps": [
+    { "as": "system", "run": "X:/setup.bat" },
+    { "run": "X:/smoke.exe" }
+  ]
+}

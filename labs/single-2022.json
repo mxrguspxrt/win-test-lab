@@ -1,0 +1,9 @@
+{
+  "$schema": "../schema/lab.schema.json",
+  "machines": {
+    "WS2022": { "os": "2022", "logon": "tester" }
+  },
+  "users": {
+    "tester": { "password": "Test!2026" }
+  }
+}

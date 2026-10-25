@@ -242,7 +242,7 @@ Exit codes: 0 ok, 1 a step failed, 2 lab error, 3 timeout. `--show` opens the VM
 instead of VNC.
 
 Labs built into `wtl`: one machine each (`single-2012`, `single-2016`, `single-2019`,
-`single-2025`, `single-win10`, `single-win11`, `single-win11-arm64`), AD labs (`2012`, `2016`,
+`single-2022`, `single-2025`, `single-win10`, `single-win11`, `single-win11-arm64`), AD labs (`2012`, `2016`,
 `2019`, `win10`, `win11`, `mixed`, `school`, `pki`); their files are in
 [labs/](https://github.com/mxrguspxrt/win-test-lab/tree/main/labs). Run examples:
 [examples/configs/](https://github.com/mxrguspxrt/win-test-lab/tree/main/examples/configs).
