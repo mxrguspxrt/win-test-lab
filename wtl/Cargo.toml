@@ -1,0 +1,21 @@
+[package]
+name = "wtl"
+version = "0.1.1"
+edition = "2021"
+rust-version = "1.87"
+description = "The wtl command of win-test-lab: test Windows software on real Windows in QEMU (cargo install wtl)"
+license = "MIT"
+repository = "https://github.com/mxrguspxrt/win-test-lab"
+homepage = "https://github.com/mxrguspxrt/win-test-lab"
+readme = "README.md"
+keywords = ["windows", "testing", "qemu", "active-directory", "virtual-machine"]
+categories = ["development-tools::testing", "command-line-utilities", "virtualization"]
+
+# Only the command: everything is in win-test-lab (its library is named `wtl`). The path is
+# used inside the repository; the published crate depends on the released version.
+[dependencies]
+win-test-lab = { version = "=0.1.1", path = ".." }
+
+[[bin]]
+name = "wtl"
+path = "src/main.rs"

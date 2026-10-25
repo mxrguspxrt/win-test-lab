@@ -28,6 +28,8 @@ examples/**/*.zip
 
 # Rust build output
 /target/
+/wtl/target/
+/wtl/Cargo.lock
 
 # Editor / OS / Python (tests/ps_lint.py)
 __pycache__/

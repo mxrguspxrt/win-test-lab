@@ -1,6 +1,6 @@
 [package]
 name = "win-test-lab"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.87"
 description = "Test Windows software on real Windows in QEMU: unattended installs, Active Directory labs, a frozen 0 state, one command per run"

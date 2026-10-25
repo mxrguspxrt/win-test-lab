@@ -108,7 +108,7 @@ You need QEMU and Rust (https://rustup.rs):
 | Windows | `winget install SoftwareFreedomConservancy.QEMU`, and turn on the Windows feature "Windows Hypervisor Platform" |
 
 ```
-cargo install win-test-lab    # installs the `wtl` command
+cargo install win-test-lab    # installs the `wtl` command (`cargo install wtl` is the same)
 wtl doctor                    # what this computer can run, which ISOs you have
 ```
 
