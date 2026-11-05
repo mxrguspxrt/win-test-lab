@@ -1,6 +1,6 @@
 [package]
 name = "wtl"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.87"
 description = "The wtl command of win-test-lab: test Windows software on real Windows in QEMU (cargo install wtl)"
@@ -14,7 +14,7 @@ categories = ["development-tools::testing", "command-line-utilities", "virtualiz
 # Only the command: everything is in win-test-lab (its library is named `wtl`). The path is
 # used inside the repository; the published crate depends on the released version.
 [dependencies]
-win-test-lab = { version = "=0.1.1", path = ".." }
+win-test-lab = { version = "=0.2.0", path = ".." }
 
 [[bin]]
 name = "wtl"
