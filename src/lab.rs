@@ -264,21 +264,31 @@ fn doctor() -> Result<i32> {
     let mut usable = 0;
     for os in crate::oslist::parse_table(&table) {
         let arch = Arch::parse(&os.arch).unwrap_or_default();
-        let iso = crate::build::find_iso(&home, &env.iso_dir, &os);
+        // a VHD-import OS (2003/2008 R2) is served by a .vhd, every other OS by an install ISO
+        let src =
+            if os.is_vhd() { crate::build::find_vhd(&home, &env.iso_dir, &os) } else { crate::build::find_iso(&home, &env.iso_dir, &os) };
         let image = env.images_dir.join(format!("{}-client.qcow2", os.key)).is_file()
             || env.images_dir.join(format!("{}-dc.qcow2", os.key)).is_file();
         let speed = if env.accel_for(arch) == Accel::Tcg { "emulated" } else { "native" };
-        let ok_ = iso.is_some() && runnable.contains(&arch);
+        let ok_ = src.is_some() && runnable.contains(&arch);
         if ok_ {
             usable += 1;
         }
+        let none = if os.is_vhd() {
+            match crate::vhd::download_url(&crate::vhd::parse_catalog(&crate::assets::vhds(&home)), &os.key) {
+                Some(u) => format!("no VHD - download it from {}", u),
+                None => "no VHD".to_string(),
+            }
+        } else {
+            "no ISO".to_string()
+        };
         println!(
             "{} {:12} {:5} {:8} {}{}",
             mark(ok_),
             os.key,
             os.arch,
             speed,
-            iso.map(|p| util::basename(&p.to_string_lossy()).to_string()).unwrap_or_else(|| "no ISO".into()),
+            src.map(|p| util::basename(&p.to_string_lossy()).to_string()).unwrap_or(none),
             if image { "  (base image installed)" } else { "" }
         );
     }

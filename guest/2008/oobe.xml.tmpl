@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- win-test-lab OOBE answer file for an imported, sysprepped Windows Server 2008 R2 VHD.
+     Uploaded to %WINDIR%\Panther\unattend.xml by `wtl build-image` (via virt-customize) so the
+     image's first-boot "Set Up Windows" (OOBE) runs unattended: skip EULA/region/password pages,
+     set the local Administrator password to the build password, and auto-log-on once as
+     Administrator so the injected first-boot task (setup.ps1) can run and reach BUILD_DONE.
+     The only placeholder is the build password (the lab renames the computer later). -->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <InputLocale>0409:00000409</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+        <NetworkLocation>Work</NetworkLocation>
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+      <UserAccounts>
+        <AdministratorPassword>
+          <Value>@PASSWORD@</Value>
+          <PlainText>true</PlainText>
+        </AdministratorPassword>
+      </UserAccounts>
+      <AutoLogon>
+        <Enabled>true</Enabled>
+        <Username>Administrator</Username>
+        <LogonCount>5</LogonCount>
+        <Password>
+          <Value>@PASSWORD@</Value>
+          <PlainText>true</PlainText>
+        </Password>
+      </AutoLogon>
+      <TimeZone>UTC</TimeZone>
+      <!-- run win-test-lab's build setup at the first (auto-)logon, straight from the WTL_BUILD
+           disc: scan the CD drive letters for WTL\setup.ps1. This is what drives the build to
+           BUILD_DONE; it does not rely on the libguestfs first-boot service (which gates on
+           pnp_wait while the imported image installs drivers for the new virtual hardware). -->
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>win-test-lab setup</Description>
+          <CommandLine>cmd /c "for %d in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do @if exist %d:\WTL\setup.ps1 powershell.exe -NoProfile -ExecutionPolicy Bypass -File %d:\WTL\setup.ps1"</CommandLine>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+  </settings>
+</unattend>

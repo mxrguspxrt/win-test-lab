@@ -714,8 +714,15 @@ mod tests {
             let p = e.path();
             if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("iso")) {
                 if let Ok((b, a)) = iso_build_arch(&p) {
-                    assert!(b > 9000, "{}: build {}", p.display(), b);
-                    assert!(a == "x64" || a == "arm64", "{}: arch {}", p.display(), a);
+                    // the reader returned a build + CPU: both must be sane for any Windows media
+                    assert!(b > 0 && b < 100000, "{}: implausible build {}", p.display(), b);
+                    assert!(!a.is_empty() && a != "?", "{}: no CPU for build {}", p.display(), b);
+                    // win-test-lab installs from modern x64/arm64 ISOs (build 9000+); the folder
+                    // may also hold media it never installs from (a 2008 R2 ia64 disc, a
+                    // service-pack ISO) - don't assert those are something they are not
+                    if b >= 9000 {
+                        assert!(a == "x64" || a == "arm64", "{}: modern build {} has unexpected CPU {}", p.display(), b, a);
+                    }
                 }
             }
         }

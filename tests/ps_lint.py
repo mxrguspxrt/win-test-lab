@@ -28,6 +28,27 @@ FORBIDDEN = [
     (re.compile(r'\bGet-CimInstance\b', re.I), None),  # allowed in PS3+, informational only
 ]
 
+# Extra rules for the PowerShell 2.0 guest scripts (guest/2003/, guest/2008/): Server 2003 and
+# 2008 R2 ship PowerShell 2.0 / .NET 2.0 (or less), so nothing from PS 3.0+ may be used. These
+# are checked on top of FORBIDDEN for files under a 2003/ or 2008/ guest folder (or with --ps2).
+FORBIDDEN_PS2 = [
+    (re.compile(r'\bConvertFrom-Json\b', re.I), 'ConvertFrom-Json (PS3+); use ConvertFrom-WtlJson'),
+    (re.compile(r'\bConvertTo-Json\b', re.I), 'ConvertTo-Json (PS3+); use ConvertTo-WtlJson'),
+    (re.compile(r'\bInvoke-WebRequest\b', re.I), 'Invoke-WebRequest (PS3+)'),
+    (re.compile(r'\bInvoke-RestMethod\b', re.I), 'Invoke-RestMethod (PS3+)'),
+    (re.compile(r'\bGet-CimInstance\b', re.I), 'Get-CimInstance (PS3+); use Get-WmiObject'),
+    (re.compile(r'\[ordered\]', re.I), '[ordered] hashtable (PS3+)'),
+    (re.compile(r'\bGet-NetAdapter\b', re.I), 'Get-NetAdapter (NetAdapter module, 2012+)'),
+    (re.compile(r'\bNew-NetIPAddress\b', re.I), 'New-NetIPAddress (NetTCPIP module, 2012+)'),
+    (re.compile(r'\bSet-NetIPInterface\b', re.I), 'Set-NetIPInterface (NetTCPIP module, 2012+)'),
+    (re.compile(r'\bSet-DnsClientServerAddress\b', re.I), 'Set-DnsClientServerAddress (2012+)'),
+    (re.compile(r'\b(Get|Set)-NetConnectionProfile\b', re.I), 'Net*ConnectionProfile (2012+)'),
+    (re.compile(r'\b(Get|Set|Add)-MpPreference\b', re.I), 'Defender *-MpPreference (2012+)'),
+    (re.compile(r'\bRename-Computer\b', re.I), 'Rename-Computer (PS3+); use Win32_ComputerSystem.Rename'),
+    (re.compile(r'\b(Install|Get|Uninstall)-WindowsFeature\b', re.I), '*-WindowsFeature (ServerManager, 2008R2+/2012+)'),
+    (re.compile(r'\bicacls\b', re.I), 'icacls (Vista+); use Get-Acl/Set-Acl'),
+]
+
 
 def strip_code(text):
     """Return (code_lines, errors): text with comments removed and string contents blanked
@@ -116,12 +137,15 @@ def check_balance(code):
     return errors
 
 
-def lint(path):
+def lint(path, ps2=False):
     with open(path, 'r', encoding='utf-8-sig') as f:
         text = f.read().replace('\r\n', '\n')
     code, errors = strip_code(text)
+    # a PowerShell 2.0 guest script (guest/2003/, guest/2008/) also gets the PS2 rules
+    norm = path.replace('\\', '/')
+    rules = FORBIDDEN + (FORBIDDEN_PS2 if (ps2 or '/guest/2003/' in norm or '/guest/2008/' in norm) else [])
     for ln, l in enumerate(code.split('\n'), 1):
-        for rx, msg in FORBIDDEN:
+        for rx, msg in rules:
             if msg and rx.search(l):
                 errors.append((ln, 'forbidden: ' + msg))
     errors += check_balance(code)
@@ -132,14 +156,17 @@ def lint(path):
 
 
 def main(argv):
-    files = argv[1:]
+    args = [a for a in argv[1:] if a != '--ps2']
+    ps2 = '--ps2' in argv[1:]
+    files = args
     if not files:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        files = sorted(glob.glob(os.path.join(root, 'guest', '*.ps1')) +
+        # guest/ is walked recursively so the OS-specific folders (guest/2003, guest/2008) lint too
+        files = sorted(glob.glob(os.path.join(root, 'guest', '**', '*.ps1'), recursive=True) +
                        glob.glob(os.path.join(root, 'examples', '**', '*.ps1'), recursive=True))
     ok = True
     for p in files:
-        r = lint(p)
+        r = lint(p, ps2)
         print('%s: %s' % (p, 'OK' if r else 'FAIL'))
         ok = ok and r
     return 0 if ok else 1
