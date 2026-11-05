@@ -1,0 +1,54 @@
+;SetupMgrTag
+; win-test-lab answer file for the imported Windows Server 2003 R2 Test Drive VHD.
+;
+; The VHD is sysprepped, so its first boot runs mini-setup, which reads C:\sysprep\sysprep.inf.
+; `wtl build-image` replaces that file with this one (virt-customize --upload) so mini-setup
+; runs unattended, restarts the machine once and logs on once as Administrator.
+;
+; There is deliberately no [GuiRunOnce]: Setup keeps only the first word of such a command that is
+; not quoted ("cmd /c ..." became just "cmd"), and C:\sysprep is deleted before the logon anyway.
+; The launcher that starts win-test-lab's build setup is instead registered under HKLM\...\Run
+; by guest\2003\image.reg (merged offline) and uploaded as C:\wtl-first.cmd.
+;
+; Placeholders (filled in by `wtl build-image`):
+;   @COMPUTERNAME@  the base image's computer name
+;   @PRODUCTKEY@    the product key the image already carried in its own sysprep.inf
+;   @IMAGEPASSWORD@ the Administrator password the image already has (from its own sysprep.inf).
+;                   Mini-setup "changes" the password assuming the old one is blank, which fails
+;                   for any other, so the account keeps its password and the automatic logon
+;                   must use it; the build script then sets the real build password.
+
+[Unattended]
+    OemSkipEula=Yes
+    InstallFilesPath=C:\sysprep\i386
+
+[GuiUnattended]
+    AdminPassword="@IMAGEPASSWORD@"
+    EncryptedAdminPassword=NO
+    OEMSkipRegional=1
+    TimeZone=85
+    OemSkipWelcome=1
+    AutoLogon=Yes
+    AutoLogonCount=1
+
+[UserData]
+    ProductKey=@PRODUCTKEY@
+    FullName="win-test-lab"
+    OrgName="win-test-lab"
+    ComputerName=@COMPUTERNAME@
+
+[LicenseFilePrintData]
+    AutoMode=PerServer
+    AutoUsers=5
+
+[Identification]
+    JoinWorkgroup=WORKGROUP
+
+[Networking]
+    InstallDefaultComponents=Yes
+
+[SetupMgr]
+    DistFolder=C:\sysprep\i386
+    DistShare=windist
+
+[sysprepcleanup]

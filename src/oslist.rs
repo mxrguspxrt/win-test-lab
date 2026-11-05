@@ -15,13 +15,68 @@ pub struct OsInfo {
     pub arch: String,
     pub fallback_index: String,
     pub min_disk_gb: String,
+    /// how the base image is made: "iso" (install from an ISO, the default) or "vhd:<hint>"
+    /// (import a pre-installed .vhd whose path contains <hint>, for OSes with no usable install
+    /// ISO: Server 2003, 2008 R2). See [`OsInfo::vhd_hint`]. A vhd source can carry `+option`s:
+    /// `+enter` ([`OsInfo::press_enter`]), `+nousb` ([`OsInfo::no_usb`]).
+    pub source: String,
     pub display: String,
+}
+
+impl OsInfo {
+    /// The base image is imported from a .vhd rather than installed from an ISO.
+    pub fn is_vhd(&self) -> bool {
+        self.source.starts_with("vhd")
+    }
+
+    /// For a "vhd:<hint>[+option...]" source, the <hint> (a substring of the .vhd's path); empty if none.
+    pub fn vhd_hint(&self) -> &str {
+        let s = self.source.strip_prefix("vhd:").unwrap_or("");
+        s.split('+').next().unwrap_or("")
+    }
+
+    /// The source says "+enter": the image shows a dialog during its first-boot setup that no
+    /// answer file can skip (Server 2003's evaluation edition), so `wtl build-image` presses Enter
+    /// over QMP until the guest reports in.
+    pub fn press_enter(&self) -> bool {
+        self.has_option("enter")
+    }
+
+    /// The source says "+nousb": the guest hangs at its first boot after setup when QEMU gives it
+    /// a USB controller (Server 2003 stops at an empty Winlogon screen), so its VMs get none
+    /// (PS/2 keyboard and mouse only, no usb-tablet).
+    pub fn no_usb(&self) -> bool {
+        self.has_option("nousb")
+    }
+
+    fn has_option(&self, name: &str) -> bool {
+        self.source.split('+').skip(1).any(|o| o == name)
+    }
 }
 
 /// Canonical key for NAME (aliases: 2012r2, ws2019, server2019, windows11, win11_en_x64 ...).
 pub fn normalize(name: &str) -> String {
     let k = name.to_ascii_lowercase();
     let k = match k.as_str() {
+        "2003r2"
+        | "2003-r2"
+        | "2003_r2"
+        | "win2003"
+        | "win2003r2"
+        | "server2003"
+        | "ws2003"
+        | "windowsserver2003"
+        | "windowsserver2003r2" => "2003".to_string(),
+        "2008r2"
+        | "2008-r2"
+        | "2008_r2"
+        | "win2008"
+        | "win2008r2"
+        | "server2008"
+        | "server2008r2"
+        | "ws2008"
+        | "ws2008r2"
+        | "windowsserver2008r2" => "2008".to_string(),
         "2012r2" | "2012-r2" | "2012_r2" | "win2012r2" | "windowsserver2012r2" => "2012".to_string(),
         "win2016" | "server2016" | "ws2016" => "2016".into(),
         "win2019" | "server2019" | "ws2019" => "2019".into(),
@@ -65,7 +120,15 @@ pub fn parse_table(text: &str) -> Vec<OsInfo> {
             arch: col(6),
             fallback_index: col(7),
             min_disk_gb: col(8),
-            display: if f.len() > 9 { f[9..].join(" ") } else { String::new() },
+            source: {
+                let s = col(9);
+                if s.is_empty() {
+                    "iso".to_string()
+                } else {
+                    s
+                }
+            },
+            display: if f.len() > 10 { f[10..].join(" ") } else { String::new() },
         });
     }
     out
@@ -84,6 +147,10 @@ mod tests {
     #[test]
     fn aliases() {
         assert_eq!(normalize("2012R2"), "2012");
+        assert_eq!(normalize("2003R2"), "2003");
+        assert_eq!(normalize("WindowsServer2003R2"), "2003");
+        assert_eq!(normalize("2008r2"), "2008");
+        assert_eq!(normalize("ws2008r2"), "2008");
         assert_eq!(normalize("ws2019"), "2019");
         assert_eq!(normalize("Windows11"), "win11");
         assert_eq!(normalize("win10_de_arm64"), "win10");
@@ -100,6 +167,20 @@ mod tests {
         let o = lookup(p, "2012r2").unwrap();
         assert_eq!((o.build.as_str(), o.kind.as_str(), o.firmware.as_str()), ("9600", "server", "bios"));
         assert_eq!(o.display, "Windows Server 2012 R2");
+        assert_eq!(o.source, "iso");
+        assert!(!o.is_vhd());
+        // the VHD-import server OSes
+        let v = lookup(p, "2008").unwrap();
+        assert_eq!((v.kind.as_str(), v.firmware.as_str(), v.arch.as_str()), ("server", "bios", "x64"));
+        assert!(v.is_vhd() && v.vhd_hint() == "WS2008R2", "{:?}", v.source);
+        assert_eq!(v.display, "Windows Server 2008 R2");
+        let v3 = lookup(p, "2003").unwrap();
+        assert!(v3.is_vhd() && v3.vhd_hint() == "Win2k3", "{:?}", v3.source);
+        assert!(v3.press_enter() && !v.press_enter(), "only 2003 needs Enter pressed ({:?} / {:?})", v3.source, v.source);
+        let no_usb: Vec<String> = parse_table(p).into_iter().filter(|o| o.no_usb()).map(|o| o.key).collect();
+        assert_eq!(no_usb, ["2003"], "only 2003 runs without USB");
+        assert_eq!(v3.vhd_hint(), "Win2k3", "options after the hint are not part of it");
+        assert_eq!(v3.display, "Windows Server 2003 R2");
         let w = lookup(p, "win11").unwrap();
         assert_eq!((w.kind.as_str(), w.firmware.as_str(), w.arch.as_str()), ("client", "uefi", "x64"));
         let a = lookup(p, "win11-arm64").unwrap();

@@ -371,6 +371,27 @@ impl MultiLab {
         for (i, m) in lab.machines.iter().enumerate() {
             let os = oslist::lookup(&oslist, &m.os)
                 .ok_or_else(|| anyhow!("{}: machine {}: unknown os {:?} (see lib/oslist.conf)", lab_file.display(), m.name, m.os))?;
+            // VHD-import OSes (Server 2003 / 2008 R2) run standalone only for now: no domain,
+            // no roles/features/setup, no lab LAN. The guest scripts refuse these too; checking
+            // here fails the lab cleanly before anything boots.
+            if os.is_vhd() {
+                if lab.mode != labdef::Mode::Workgroup {
+                    bail!("{}: machine {}: {} is supported standalone only (not in an AD domain) yet", lab_file.display(), m.name, m.os);
+                }
+                if lab.network.is_some() {
+                    bail!(
+                        "{}: machine {}: {} is supported standalone only, so its lab cannot have a \"network\" yet",
+                        lab_file.display(),
+                        m.name,
+                        m.os
+                    );
+                }
+                for (what, empty) in [("roles", m.roles.is_empty()), ("features", m.features.is_empty()), ("setup", m.setup.is_empty())] {
+                    if !empty {
+                        bail!("{}: machine {}: {} does not support \"{}\" yet (standalone only)", lab_file.display(), m.name, m.os, what);
+                    }
+                }
+            }
             if m.role == Role::Dc && os.kind != "server" {
                 bail!("{}: machine {}: os {} is a client OS and cannot be the domain controller", lab_file.display(), m.name, m.os);
             }
@@ -801,10 +822,16 @@ impl MultiLab {
         let _ = std::fs::remove_dir_all(&stage);
         let labdir = stage.join("LAB");
         std::fs::create_dir_all(&labdir).with_context(|| format!("cannot create {}", labdir.display()))?;
-        // agent.ps1 too: the base image's copy may be older than this program's (lab.ps1
-        // installs it as C:\WTL\agent.ps1 during the 0-state build)
-        for f in ["lab.ps1", "labsvc.ps1", "agent.ps1"] {
-            write_file(&labdir.join(f), assets::guest_file(&self.env.home, f)?)?;
+        // The control disc carries this machine's lab / labsvc / agent scripts (agent too: the
+        // base image's baked copy may be older than this program's). An OS with its own guest
+        // folder gets those - PowerShell for 2008 R2, VBScript for 2003 - so the file names and
+        // language vary by OS; every other OS gets the shared lab.ps1 / labsvc.ps1 / agent.ps1.
+        let control = assets::control_scripts_for(&self.env.home, &vm.os.key)?;
+        if control.is_empty() {
+            bail!("no control-disc scripts (agent/lab/labsvc) for os {}", vm.os.key);
+        }
+        for (name, data) in control {
+            write_file(&labdir.join(&name), data)?;
         }
         let role = if vm.role == Role::Dc { "dc" } else { "member" };
         let (logon_user, logon_password) = match &vm.logon {
@@ -989,6 +1016,16 @@ impl MultiLab {
     }
 
     fn start_vm(&self, vm: &Vm, disk: PathBuf, cds: Vec<PathBuf>) -> Result<()> {
+        // an imported Hyper-V VHD boots from the legacy IDE controller: four slots in all, the
+        // system disk plus at most three CD-ROMs (the control disc and one per mounted drive)
+        if vm.os.is_vhd() && cds.len() > 3 {
+            bail!(
+                "{}: {} boots from IDE, which has room for the control disc and at most two mounted drives ({} discs needed)",
+                vm.name,
+                vm.os.display,
+                cds.len()
+            );
+        }
         let mut o = Opts {
             name: format!("lab-{}-{}", self.name, vm.name),
             mem: vm.mem.clone(),
@@ -1001,6 +1038,9 @@ impl MultiLab {
             // the DC is isolated (no internet); every other machine keeps user-mode NAT
             no_usernet: vm.role == Role::Dc,
             no_shutdown: true,
+            // imported Hyper-V VHDs (Server 2003 / 2008 R2) boot from IDE, not AHCI
+            disk_ide: vm.os.is_vhd(),
+            no_usb: vm.os.no_usb(),
             uefi: self.uefi_vars(vm)?,
             arch: vm.arch(),
             ..Default::default()

@@ -158,6 +158,13 @@ fn die(msg: &str) -> ! {
     std::process::exit(1)
 }
 
+/// The machine's control disc: the CD whose volume label is WTL_LAB, whatever its drive index.
+/// (A real guest scans every CD drive; the index differs between AHCI and the IDE layout used
+/// for imported VHDs.)
+fn control_disc(m: &Machine) -> Option<PathBuf> {
+    m.cds.values().find(|c| IsoReader::open(c, true).map(|iso| iso.volid == "WTL_LAB").unwrap_or(false)).cloned()
+}
+
 fn fake_qemu(args: &[String]) -> i32 {
     log_argv("qemu", args);
     let mut m = Machine::default();
@@ -386,13 +393,15 @@ impl Guest {
     }
 
     fn run(&mut self, m: &Machine) -> Result<(), String> {
-        let cd = m.cds.get(&0).ok_or("no control disc")?;
-        let iso = IsoReader::open(cd, true).map_err(|e| e.to_string())?;
-        if iso.volid != "WTL_LAB" {
-            return Err(format!("control disc label {} (want WTL_LAB)", iso.volid));
-        }
-        for f in ["LAB/lab.ps1", "LAB/labsvc.ps1", "LAB/agent.ps1"] {
-            iso.read(f).ok_or(format!("{} missing on the control disc", f))?;
+        // the control disc is whichever CD is labelled WTL_LAB (a real guest scans every CD
+        // drive; its IDE/AHCI index varies - VHD-import OSes push it off index 0)
+        let cd = control_disc(m).ok_or("no control disc")?;
+        let iso = IsoReader::open(&cd, true).map_err(|e| e.to_string())?;
+        // lab / labsvc / agent, in PowerShell (.ps1) or - for Server 2003 - VBScript (.vbs)
+        for stem in ["LAB/lab", "LAB/labsvc", "LAB/agent"] {
+            if iso.read(&format!("{}.ps1", stem)).is_none() && iso.read(&format!("{}.vbs", stem)).is_none() {
+                return Err(format!("{}.ps1/.vbs missing on the control disc", stem));
+            }
         }
         let cfg = iso.read("LAB/lab.json").ok_or("LAB/lab.json missing")?;
         if !cfg.is_ascii() {
@@ -506,9 +515,9 @@ impl Guest {
         for f in cfg.get("features").and_then(Value::as_array).into_iter().flatten() {
             self.emit(&format!("WTL LAB_FEATURE machine={} name={}", machine, f.as_str().unwrap_or("")));
         }
-        // setup scripts are staged under LAB\ on the control disc: read each from disc 0
-        let cd = m.cds.get(&0).ok_or("no control disc")?;
-        let iso = IsoReader::open(cd, true).map_err(|e| e.to_string())?;
+        // setup scripts are staged under LAB\ on the control disc (the WTL_LAB-labelled CD)
+        let cd = control_disc(m).ok_or("no control disc")?;
+        let iso = IsoReader::open(&cd, true).map_err(|e| e.to_string())?;
         let setup = cfg.get("setup").and_then(Value::as_array).cloned().unwrap_or_default();
         for (i, st) in setup.iter().enumerate() {
             let n = i + 1;
@@ -637,6 +646,48 @@ impl Ctx {
         for f in ["lib/oslist.conf", "guest/lab.ps1", "guest/labsvc.ps1", "guest/agent.ps1"] {
             std::fs::copy(src.join(f), root.join(f)).unwrap();
         }
+        // the OS-specific guest folders (Server 2008 R2: PowerShell 2.0; Server 2003: VBScript)
+        // so the control disc gets that OS's own scripts, not the shared ones
+        for d in ["guest/2003", "guest/2008"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+            for e in std::fs::read_dir(src.join(d)).unwrap().flatten() {
+                if e.path().is_file() {
+                    std::fs::copy(e.path(), root.join(d).join(e.file_name())).unwrap();
+                }
+            }
+        }
+        // a workgroup single machine on Server 2003 (VBScript guest)
+        std::fs::write(
+            root.join("labs/solo2003.json"),
+            r#"{ "machines": { "WS2003": { "os": "2003", "logon": "tester" } },
+  "users": { "tester": { "password": "Test!2026" } } }
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("images/2003-client.qcow2"), "QFI\u{fb} fake base image\n").unwrap();
+        // a workgroup single machine on an imported-VHD OS (Server 2008 R2)
+        std::fs::write(
+            root.join("labs/solo2008.json"),
+            r#"{ "machines": { "WS2008": { "os": "2008", "logon": "tester" } },
+  "users": { "tester": { "password": "Test!2026" } } }
+"#,
+        )
+        .unwrap();
+        // an AD lab that (wrongly) puts a 2008 R2 member in a domain: wtl must refuse it
+        std::fs::write(
+            root.join("labs/ad2008.json"),
+            format!(
+                r#"{{ "domain": "lab.local", "netbios": "LAB", "network": {{ "subnet": "10.77.94", "lan_port": {port} }},
+  "machines": {{ "DC": {{ "os": "2019", "role": "dc" }}, "M": {{ "os": "2008", "logon": "tester" }} }},
+  "users": {{ "tester": {{ "password": "Test!2026" }} }} }}
+"#,
+                port = free_port()
+            ),
+        )
+        .unwrap();
+        // a fake base image for the 2008 workgroup run (the VHD import path is not exercised by
+        // the fake builder; the real convert+virt-customize is covered by build.rs itself)
+        std::fs::write(root.join("images/2008-client.qcow2"), "QFI\u{fb} fake base image\n").unwrap();
         // a 3-machine JSON lab: 2019 DC + a 2019 member + a win11 (UEFI) member
         let tri = format!(
             r#"{{
@@ -953,8 +1004,8 @@ fn driver(args: &[String]) -> i32 {
         c.code(&outs[i].1, 2);
         c.has(&outs[i].1, "no lab ");
         // the home's own labs and the built-in ones
-        c.has(&outs[i].1, "armmix fresh mixed pki roles school single-2012");
-        c.has(&outs[i].1, "solo tri win10 win11)");
+        c.has(&outs[i].1, "armmix fresh mixed pki roles school single-2003 single-2008 single-2012");
+        c.has(&outs[i].1, "solo solo2003 solo2008 tri win10 win11)");
         // usage errors: clap's wording, exit 2
         let i = run(cx, outs, &["frobnicate", "tri"], &[]);
         c.code(&outs[i].1, 2);
@@ -1420,6 +1471,80 @@ fn driver(args: &[String]) -> i32 {
         c.has(&outs[i].1, "  WS1             single 2019    - running");
         let i = run(cx, outs, &["restore", "solo"], &[]);
         c.code(&outs[i].1, 0);
+    });
+
+    scenario(&mut cx, "Server 2008 R2 (VHD import): workgroup run uses its own PowerShell 2.0 scripts", &|cx, c, outs| {
+        let conf = cx.cfg(
+            "s2008.json",
+            "{ \"lab\": \"solo2008\", \"mount\": { \"X\": \"../app\" }, \"steps\": [\n\
+               { \"as\": \"system\", \"run\": \"X:/setup.bat\" },\n\
+               { \"run\": \"X:/smoke.exe\" } ] }\n",
+        );
+        let i = run(cx, outs, &["run", &conf], &[]);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        c.has(o, "WS2008 ready: WTL LAB_CLIENT_READY");
+        c.has(o, "ALL STEPS OK");
+        // the control disc must carry the 2008 (PowerShell 2.0) guest scripts, not the shared
+        // PS4 ones: guest_file_for picked guest/2008/ over guest/
+        let st = cx.state("solo2008");
+        let iso = IsoReader::open(&st.join("WS2008.iso"), true).unwrap();
+        let lab = String::from_utf8_lossy(iso.read("LAB/lab.ps1").unwrap()).into_owned();
+        c.ok(lab.contains("ConvertFrom-WtlJson"), "the 2008 control disc carries the PS2 lab.ps1");
+        let svc = String::from_utf8_lossy(iso.read("LAB/labsvc.ps1").unwrap()).into_owned();
+        c.ok(svc.contains("ConvertFrom-WtlJson"), "the 2008 control disc carries the PS2 labsvc.ps1");
+        let j: Value = serde_json::from_slice(iso.read("LAB/lab.json").unwrap()).unwrap();
+        c.ok(s(&j, "mode") == "workgroup", format!("lab.json {}", j));
+        // an imported Hyper-V VHD boots from IDE, not AHCI (else old Windows 0x7Bs)
+        let argv = std::fs::read_to_string(&cx.fake_log).unwrap_or_default();
+        let line = argv.lines().rfind(|l| l.contains("lab-solo2008-WS2008")).unwrap_or("").replace('\u{1f}', " ");
+        c.ok(line.contains("id=disk0,if=ide") && !line.contains("ich9-ahci"), format!("WS2008 argv: {}", line));
+        c.ok(line.contains("usb-tablet"), format!("WS2008 keeps the USB tablet: {}", line));
+        let i = run(cx, outs, &["restore", "solo2008"], &[]);
+        c.code(&outs[i].1, 0);
+    });
+
+    scenario(&mut cx, "Server 2003 (VHD import, no PowerShell): workgroup run carries the VBScript guest", &|cx, c, outs| {
+        let conf = cx.cfg(
+            "s2003.json",
+            "{ \"lab\": \"solo2003\", \"mount\": { \"X\": \"../app\" }, \"steps\": [\n\
+               { \"as\": \"system\", \"run\": \"X:/setup.bat\" },\n\
+               { \"run\": \"X:/smoke.exe\" } ] }\n",
+        );
+        let i = run(cx, outs, &["run", &conf], &[]);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        c.has(o, "WS2003 ready: WTL LAB_CLIENT_READY");
+        c.has(o, "ALL STEPS OK");
+        // the control disc carries the VBScript agent / lab / worker and their shared library,
+        // and none of the PowerShell scripts
+        let st = cx.state("solo2003");
+        let iso = IsoReader::open(&st.join("WS2003.iso"), true).unwrap();
+        for f in ["LAB/agent.vbs", "LAB/lab.vbs", "LAB/labsvc.vbs", "LAB/common.vbs", "LAB/lab.json"] {
+            c.ok(iso.read(f).is_some(), format!("{} on the 2003 control disc", f));
+        }
+        for f in ["LAB/agent.ps1", "LAB/lab.ps1", "LAB/labsvc.ps1"] {
+            c.ok(iso.read(f).is_none(), format!("{} must not be on the 2003 control disc", f));
+        }
+        // batch / VBScript files are staged with CRLF line ends
+        let lab = String::from_utf8_lossy(iso.read("LAB/lab.vbs").unwrap()).into_owned();
+        c.ok(
+            lab.contains("InvokeLab") && lab.contains("\r\n") && !lab.replace("\r\n", "").contains('\n'),
+            "2003 lab.vbs has CRLF line ends",
+        );
+        // booted from IDE like every imported VHD
+        let argv = std::fs::read_to_string(&cx.fake_log).unwrap_or_default();
+        let line = argv.lines().rfind(|l| l.contains("lab-solo2003-WS2003")).unwrap_or("").replace('\u{1f}', " ");
+        c.ok(line.contains("id=disk0,if=ide") && !line.contains("ich9-ahci"), format!("WS2003 argv: {}", line));
+        c.ok(!line.contains("usb"), format!("WS2003 gets no USB controller (it hangs at its second boot with one): {}", line));
+        let i = run(cx, outs, &["restore", "solo2003"], &[]);
+        c.code(&outs[i].1, 0);
+    });
+
+    scenario(&mut cx, "Server 2008 R2 is refused in an AD lab (standalone only for now)", &|cx, c, outs| {
+        let i = run(cx, outs, &["status", "ad2008"], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "supported standalone only");
     });
 
     scenario(&mut cx, "a project's own lab file: a 2012 DC + a 2019 member server", &|cx, c, outs| {

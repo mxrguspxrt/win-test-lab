@@ -312,6 +312,13 @@ pub struct Opts {
     pub lan: Option<Lan>,
     pub lan_mac: Option<String>,
     pub no_usernet: bool,
+    /// put the system disk on the IDE controller instead of ich9-ahci (SATA). Imported Hyper-V
+    /// Gen1 VHDs (Server 2003 / 2008 R2) boot from IDE; old Windows 0x7Bs on an AHCI boot disk
+    /// it has no boot-start driver for. x64 only; ignored on arm64 (NVMe).
+    pub disk_ide: bool,
+    /// no USB controller and no usb-tablet (the PS/2 keyboard and mouse remain): Server 2003 hangs
+    /// at the boot after its setup when it has one. x64 only (arm64 needs USB for its input).
+    pub no_usb: bool,
     /// boot UEFI: q35 + OVMF, writable vars file
     pub uefi: Option<PathBuf>,
     /// emulated TPM 2.0 via swtpm listening in this dir
@@ -361,13 +368,29 @@ pub fn command(env: &Env, o: &Opts) -> Result<Vec<String>> {
         push(&["-chardev", &format!("socket,id=chrtpm,path={}", dir.join("swtpm.sock").display())]);
         push(&["-tpmdev", "emulator,id=tpm0,chardev=chrtpm", "-device", "tpm-tis,tpmdev=tpm0"]);
     }
-    push(&["-rtc", "base=localtime", "-vga", "std", "-usb", "-device", "usb-tablet"]);
-    push(&["-device", "ich9-ahci,id=ahci"]);
+    push(&["-rtc", "base=localtime", "-vga", "std"]);
+    if !o.no_usb {
+        push(&["-usb", "-device", "usb-tablet"]);
+    }
     let cache = o.cache.as_deref().unwrap_or("writeback");
-    push(&["-drive", &format!("id=disk0,if=none,format=qcow2,file={},cache={},discard=unmap,detect-zeroes=unmap", qesc(&o.disk), cache)]);
-    push(&["-device", "ide-hd,drive=disk0,bus=ahci.0"]);
-    for (i, c) in o.cds.iter().enumerate() {
-        push(&["-drive", &format!("file={},media=cdrom,if=ide,index={},readonly=on", qesc(c), i)]);
+    if o.disk_ide {
+        // all-IDE layout for an imported Hyper-V VHD: the boot disk on the PIIX3 IDE controller
+        // (index 0), the CD-ROMs after it (index 1..). discard/detect-zeroes are AHCI/virtio
+        // features, so they are left off the IDE disk.
+        push(&["-drive", &format!("id=disk0,if=ide,index=0,format=qcow2,file={},cache={}", qesc(&o.disk), cache)]);
+        for (i, c) in o.cds.iter().enumerate() {
+            push(&["-drive", &format!("file={},media=cdrom,if=ide,index={},readonly=on", qesc(c), i + 1)]);
+        }
+    } else {
+        push(&["-device", "ich9-ahci,id=ahci"]);
+        push(&[
+            "-drive",
+            &format!("id=disk0,if=none,format=qcow2,file={},cache={},discard=unmap,detect-zeroes=unmap", qesc(&o.disk), cache),
+        ]);
+        push(&["-device", "ide-hd,drive=disk0,bus=ahci.0"]);
+        for (i, c) in o.cds.iter().enumerate() {
+            push(&["-drive", &format!("file={},media=cdrom,if=ide,index={},readonly=on", qesc(c), i)]);
+        }
     }
     if !o.no_usernet {
         let mut net = "user,id=net0".to_string();
@@ -586,6 +609,27 @@ mod tests {
         let got: Vec<String> = command(&env(), &o).unwrap().iter().map(|a| shell_quote(a)).collect();
         let want = r"qemu-system-x86_64 -name lab-school-CL1 -machine pc -m 4096 -smp 2 -enable-kvm -cpu host\,hv_relaxed\,hv_spinlocks=0x1fff\,hv_vapic\,hv_time -rtc base=localtime -vga std -usb -device usb-tablet -device ich9-ahci\,id=ahci -drive id=disk0\,if=none\,format=qcow2\,file=/home/u/my\ labs/labs/state/school/CL1.qcow2\,cache=writeback\,discard=unmap\,detect-zeroes=unmap -device ide-hd\,drive=disk0\,bus=ahci.0 -drive file=/home/u/my\ labs/labs/state/school/CL1.iso\,media=cdrom\,if=ide\,index=0\,readonly=on -drive file=/home/u/my\ labs/labs/state/school/mount-CL1-X.iso\,media=cdrom\,if=ide\,index=1\,readonly=on -netdev user\,id=net0 -device e1000\,netdev=net0 -netdev dgram\,id=lan0\,remote.type=inet\,remote.host=239.77.30.1\,remote.port=47030\,local.type=inet\,local.host=127.0.0.1\,local.port=47030 -device e1000\,netdev=lan0\,mac=52:54:00:4c:41:11 -serial file:/home/u/my\ labs/labs/state/school/CL1.serial.log -qmp unix:/home/u/my\ labs/labs/state/school/CL1.qmp\,server=on\,wait=off -boot order=c -display none -vnc 127.0.0.1:11 -no-shutdown";
         assert_eq!(got.join(" "), want);
+    }
+
+    /// An imported Server 2003 / 2008 R2 VM: all-IDE; 2003 additionally has no USB at all.
+    #[test]
+    fn legacy_ide_and_no_usb() {
+        let o = Opts {
+            name: "lab-x-WS".into(),
+            mem: "4096".into(),
+            disk: "/s/WS.qcow2".into(),
+            cds: vec!["/s/WS.iso".into()],
+            disk_ide: true,
+            ..Default::default()
+        };
+        let a = command(&env(), &o).unwrap().join(" ");
+        assert!(a.contains("-drive id=disk0,if=ide,index=0,format=qcow2,file=/s/WS.qcow2,cache=writeback"), "{}", a);
+        assert!(a.contains("-drive file=/s/WS.iso,media=cdrom,if=ide,index=1,readonly=on"), "{}", a);
+        assert!(!a.contains("ich9-ahci"), "{}", a);
+        assert!(a.contains("-usb -device usb-tablet"), "2008 R2 keeps the tablet: {}", a);
+        let n = command(&env(), &Opts { no_usb: true, ..o }).unwrap().join(" ");
+        assert!(!n.contains("usb"), "no USB for 2003: {}", n);
+        assert!(n.contains("-rtc base=localtime -vga std -drive id=disk0,if=ide"), "{}", n);
     }
 
     #[test]

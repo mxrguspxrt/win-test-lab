@@ -1,0 +1,24 @@
+Windows Registry Editor Version 5.00
+
+; win-test-lab: registry settings merged into the imported Windows Server 2003 image (offline, with
+; libguestfs virt-win-reg --merge) before its first boot.
+;
+; The Test Drive VHD was made on Hyper-V, whose emulated IDE controller is an Intel PIIX4
+; (PCI 8086:7111); the image's boot-critical device list only knows that one. QEMU's is a PIIX3
+; (8086:7010), so without these entries Windows stops at boot with STOP 0x7B
+; (INACCESSIBLE_BOOT_DEVICE, status 0xC0000034). Same entry as the image already has for 7111:
+; the in-box IDE miniport driver "intelide" (a boot-start service) in the IDE controller class.
+
+[HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Control\CriticalDeviceDatabase\pci#ven_8086&dev_7010]
+"ClassGUID"="{4D36E96A-E325-11CE-BFC1-08002BE10318}"
+"Service"="intelide"
+
+[HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Control\CriticalDeviceDatabase\pci#ven_8086&dev_1230]
+"ClassGUID"="{4D36E96A-E325-11CE-BFC1-08002BE10318}"
+"Service"="intelide"
+
+; The build launcher: at the first logon (the automatic one after mini-setup restarts the machine)
+; Explorer runs C:\wtl-first.cmd (uploaded next to this merge), which finds the WTL_BUILD disc and
+; runs its setup.vbs. setup.vbs deletes this entry again, so it runs once.
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run]
+"WTL-Build"="C:\\wtl-first.cmd"

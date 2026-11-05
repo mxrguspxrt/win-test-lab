@@ -85,9 +85,9 @@ host's, so which Windows you can test depends on the host:
 
 | host | supported Windows | how |
 |------|-------------------|-----|
-| **Linux** (x64) | every one: Server 2012 R2 to 2025, Windows 10, Windows 11 | native, KVM. Tested. |
+| **Linux** (x64) | every one: Server 2003 R2, 2008 R2, 2012 R2 to 2025, Windows 10, Windows 11 | native, KVM. Tested. |
 | **macOS** (Apple Silicon) | **Windows 11 on Arm only** | native, Apple's hypervisor. Tested. |
-| **Windows** (x64) | every one, like Linux | native, Windows Hypervisor Platform. Compiles, not tested yet. |
+| **Windows** (x64) | every one except Server 2003 R2 and 2008 R2 (they need libguestfs, Linux only) | native, Windows Hypervisor Platform. Compiles, not tested yet. |
 
 **The macOS limit:** an Apple Silicon Mac has an Arm CPU, and Microsoft publishes an Arm64 ISO
 only for Windows 11; there is no Windows Server for Arm. Any x64 Windows (every Server, Windows
@@ -98,14 +98,36 @@ use a Linux or Windows machine. An Intel Mac runs x64 Windows natively, but is n
 
 ## Install
 
-You need QEMU and Rust (https://rustup.rs):
+You need QEMU and Rust (https://rustup.rs). On Ubuntu/Debian, [`install-deps.sh`](install-deps.sh)
+installs the lot and adds you to the `kvm` group:
 
-| host | QEMU |
+```
+./install-deps.sh          # core deps;  --all also adds the optional ones below
+```
+
+Or install them yourself:
+
+| host | QEMU and firmware |
 |------|------|
-| Debian / Ubuntu | `sudo apt install qemu-system-x86 qemu-utils ovmf` (and `sudo usermod -aG kvm $USER`) |
+| Debian / Ubuntu | `sudo apt install qemu-system-x86 qemu-system-arm qemu-utils ovmf qemu-efi-aarch64` (and `sudo usermod -aG kvm $USER`) |
 | Fedora | `sudo dnf install qemu-kvm qemu-img edk2-ovmf` |
 | macOS | `brew install qemu` |
 | Windows | `winget install SoftwareFreedomConservancy.QEMU`, and turn on the Windows feature "Windows Hypervisor Platform" |
+
+What each piece is for:
+
+- **`qemu-system-x86` + `qemu-utils` + `ovmf`** — the minimum: run any x64 Windows (every Server,
+  10, 11 x64) and build its images. `ovmf` is the x64 UEFI firmware (Windows 11 needs it).
+- **`qemu-system-arm` + `qemu-efi-aarch64`** — only to run Windows 11 on Arm.
+- **`libguestfs-tools`** (Linux only) — only for **Windows Server 2003 R2 and 2008 R2**, which are
+  imported from a VHD rather than installed from an ISO (see [docs/ISOS.md](docs/ISOS.md)). `wtl`
+  uses `virt-customize` to drop an unattended-setup answer file into the imported image. On
+  Debian/Ubuntu the kernel must also be readable (`sudo chmod 0644 /boot/vmlinuz-*`) or
+  libguestfs's supermin fails — `install-deps.sh` does this.
+- Optional: **`gcc-mingw-w64-x86-64`** (and **`gcc-mingw-w64-i686`**, for the 32-bit Server 2003)
+  to build the bundled example program, **`unar`** to unpack the 2003/2008 VHD downloads.
+
+`wtl doctor` reports what your host can actually run.
 
 ```
 cargo install win-test-lab    # installs the `wtl` command (`cargo install wtl` is the same)
@@ -114,11 +136,49 @@ wtl doctor                    # what this computer can run, which ISOs you have
 
 Or from a clone: `cargo build --release`, then use `target/release/wtl`.
 
+Windows Server 2003 and 2008 R2 are a special case: Microsoft never published a free install
+ISO for them, only pre-installed **VHD Test Drive images**, so `wtl` imports the VHD instead of
+installing from an ISO. That needs one extra tool, libguestfs, to inject the first-boot hook
+(`sudo apt install libguestfs-tools`, Fedora `sudo dnf install guestfs-tools`); every other
+Windows needs only QEMU. See [docs/ISOS.md](https://github.com/mxrguspxrt/win-test-lab/blob/main/docs/ISOS.md).
+
+## Download the Windows installers
+
+`wtl` installs Windows from Microsoft's own files. They are not part of this project (they are
+big, and Microsoft's terms do not allow redistributing them), so you download them yourself:
+click the link for each Windows you want, accept Microsoft's terms in your browser, download,
+and put the file in the **ISO folder** (`wtl home` shows where; `iso-files/` by default). Use
+Microsoft's pages only, no third-party download tools or mirrors.
+
+| Lab key | Windows | Download | What to get |
+|---------|---------|----------|-------------|
+| `2003` | Windows Server 2003 R2 Enterprise, 32-bit | [Test Drive VHD](https://www.microsoft.com/en-us/download/details.aspx?id=19727) | all 4 parts (`Win2k3R2EE.part01.exe` to `part04.rar`) |
+| `2008` | Windows Server 2008 R2 Enterprise, x64 | [Test Drive VHD](https://www.microsoft.com/en-us/download/details.aspx?id=2227) | all 3 parts (`WS2008R2Fullx64Ent.part01.exe` to `part03.rar`) |
+| `2012` | Windows Server 2012 R2 | [Evaluation Center](https://www.microsoft.com/en-us/evalcenter/evaluate-windows-server-2012-r2) | the ISO |
+| `2016` | Windows Server 2016 | [Evaluation Center](https://www.microsoft.com/en-us/evalcenter/evaluate-windows-server-2016) | the ISO |
+| `2019` | Windows Server 2019 | [Evaluation Center](https://www.microsoft.com/en-us/evalcenter/evaluate-windows-server-2019) | the ISO |
+| `2022` | Windows Server 2022 | [Evaluation Center](https://www.microsoft.com/en-us/evalcenter/evaluate-windows-server-2022) | the ISO |
+| `2025` | Windows Server 2025 | [Evaluation Center](https://www.microsoft.com/en-us/evalcenter/download-windows-server-2025) | the ISO |
+| `win10` | Windows 10 Pro 22H2 | [Download Windows 10](https://www.microsoft.com/en-us/software-download/windows10ISO) | the 64-bit ISO |
+| `win11` | Windows 11 Pro | [Download Windows 11](https://www.microsoft.com/en-us/software-download/windows11) | the "Disk Image (ISO)" for x64 |
+| `win11-arm64` | Windows 11 Pro on Arm | [Download Windows 11 on Arm](https://www.microsoft.com/en-us/software-download/windows11arm64) | the Arm64 ISO |
+
+- **ISOs (2012 R2 and newer):** the file name does not matter, `wtl` reads the Windows build and
+  CPU inside each ISO. For the Servers pick the **ISO** (not Azure or VHD), your language and the
+  **Standard** or **Datacenter** edition with *Desktop Experience*; the evaluations need no
+  product key and run for 180 days. Windows 10 and 11 install as Pro, not activated.
+- **VHDs (2003 R2 and 2008 R2):** each is a split self-extracting archive. Put all its parts in
+  one folder under the ISO folder and unpack the first one (`unar Win2k3R2EE.part01.exe`, or run
+  the `.exe` on Windows) so a `.vhd` appears. Leave it anywhere under the ISO folder: `wtl`
+  recognises it by what is inside, whatever the file is called. They are Microsoft evaluation
+  copies, so read the licence that comes with each, and they need libguestfs (see above).
+- `wtl doctor` lists which of them it found; for a missing VHD it prints the link. Details,
+  including the CPU of each OS:
+  [docs/ISOS.md](https://github.com/mxrguspxrt/win-test-lab/blob/main/docs/ISOS.md).
+
 ## Start
 
-Download the Windows ISOs you need from Microsoft into the ISO folder (`wtl home` shows where;
-links and which OS has which CPU:
-[docs/ISOS.md](https://github.com/mxrguspxrt/win-test-lab/blob/main/docs/ISOS.md)), then:
+Once the installers you need are in the ISO folder:
 
 ```
 wtl check-iso                 # what each ISO is, which OS key it serves
@@ -241,8 +301,9 @@ The other way round, a Linux or Windows x64 host can run Windows 11 on Arm only 
 Exit codes: 0 ok, 1 a step failed, 2 lab error, 3 timeout. `--show` opens the VM windows
 instead of VNC.
 
-Labs built into `wtl`: one machine each (`single-2012`, `single-2016`, `single-2019`,
-`single-2022`, `single-2025`, `single-win10`, `single-win11`, `single-win11-arm64`), AD labs (`2012`, `2016`,
+Labs built into `wtl`: one machine each (`single-2003`, `single-2008`, `single-2012`,
+`single-2016`, `single-2019`, `single-2022`, `single-2025`, `single-win10`, `single-win11`,
+`single-win11-arm64`), AD labs (`2012`, `2016`,
 `2019`, `win10`, `win11`, `mixed`, `school`, `pki`); their files are in
 [labs/](https://github.com/mxrguspxrt/win-test-lab/tree/main/labs). Run examples:
 [examples/configs/](https://github.com/mxrguspxrt/win-test-lab/tree/main/examples/configs).

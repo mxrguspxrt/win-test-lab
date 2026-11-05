@@ -23,7 +23,14 @@ if (cd wtl && cargo build --quiet && cargo clippy --quiet -- -D warnings); then 
 
 step "PowerShell lint (guest/*.ps1)"
 if command -v python3 >/dev/null; then
-    if python3 tests/ps_lint.py guest/*.ps1; then :; else rc=1; fi
+    if python3 tests/ps_lint.py; then :; else rc=1; fi
+else
+    echo "SKIP python3 not found"
+fi
+
+step "VBScript lint (guest/2003/*.vbs)"
+if command -v python3 >/dev/null; then
+    if python3 tests/vbs_lint.py; then :; else rc=1; fi
 else
     echo "SKIP python3 not found"
 fi

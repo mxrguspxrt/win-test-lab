@@ -1,0 +1,9 @@
+{
+  "$schema": "../schema/lab.schema.json",
+  "machines": {
+    "WS2003": { "os": "2003", "logon": "tester" }
+  },
+  "users": {
+    "tester": { "password": "Test!2026" }
+  }
+}

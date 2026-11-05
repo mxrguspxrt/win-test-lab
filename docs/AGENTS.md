@@ -17,6 +17,41 @@ binary `wtl`). The guest side is PowerShell in `guest/`, compiled into `wtl` (wi
 `lib/oslist.conf` and `labs/*.json`) so an installed `wtl` needs no checkout; run from a
 checkout, `wtl` reads them from disk instead. They talk over a serial log (SPEC.md).
 
+The top-level `guest/*.ps1` are the modern scripts (PowerShell 4.0, Server 2012 R2 and up). An
+OS whose key has a folder `guest/<key>/` uses that folder INSTEAD, as its whole self-contained
+guest side, whatever the language:
+
+- `guest/2008/` is PowerShell **2.0** (Server 2008 R2): no `ConvertFrom-Json`/`ConvertTo-Json`
+  (it carries its own JSON helpers) and no 2012+ cmdlets. Launch PowerShell from a `Run` key or a
+  scheduled task through `cmd.exe /c` and without `-WindowStyle Hidden`, or it silently does not
+  start. `tests/ps_lint.py` applies a PowerShell-2.0 rule set to it.
+- `guest/2003/` is **VBScript + batch** (Server 2003 has no PowerShell): `setup.vbs`,
+  `agent.vbs`, `lab.vbs`, `labsvc.vbs`, the shared `common.vbs` (VBScript has no include, so
+  they `ExecuteGlobal` it), `sysprep.inf.tmpl`, `image.reg` and `firstrun.cmd`. ASCII only; CRLF
+  line ends are added when they are staged. `tests/vbs_lint.py` checks them (there is no VBScript
+  interpreter on the Linux host, so a real VM run is the test of the logic). Found on real VMs:
+  an unquoted `[GuiRunOnce]` command keeps only its first word (so the launcher is a `Run` key
+  from `image.reg` instead); a WMI property can be `Null` and `CStr(Null)` is an error; in a
+  batch file `echo 0> file` redirects handle 0 and writes nothing (write `echo 0 > file`); the
+  guest hangs at its second boot when QEMU gives it a USB controller (`+nousb` in the table).
+
+`assets::guest_scripts_for(home, os_key)` picks the files to stage (the OS folder, else the shared
+`*.ps1`), `assets::control_scripts_for` the control-disc ones; `embed.rs` walks `guest/`
+recursively so the folders are built in. Add a new legacy OS by adding its `guest/<key>/` folder,
+not by changing the modern scripts.
+
+Those two OSes also have **no install ISO**: `lib/oslist.conf` gives them `source = vhd:<hint>`
+(the VHD is found by the unique ID in its footer, listed in `lib/vhds.conf` with its Microsoft
+download page - see `src/vhd.rs` - else by `<hint>` in its path), and `wtl build-image` imports
+a pre-installed VHD (qemu-img convert) and drops an unattended-setup
+answer file into it with libguestfs `virt-customize` instead of running Windows Setup
+(`src/build.rs`, `inject_oobe`): `oobe.xml.tmpl` -> `unattend.xml` for 2008 R2,
+`sysprep.inf.tmpl` -> `sysprep.inf` for 2003 (plus `image.reg` merged with `virt-win-reg`,
+`merge_image_registry`). They boot from IDE and are standalone-only; `src/labrun.rs` refuses
+AD / roles / LAN for them before boot. The `source` column of `lib/oslist.conf` takes options
+after the hint: `+enter` (the build presses Enter until the guest reports) and `+nousb` (no
+USB controller in the VM).
+
 Read [SPEC.md](../SPEC.md) for the design and [docs/CONFIG.md](CONFIG.md) for the formats.
 
 ## Hard constraints

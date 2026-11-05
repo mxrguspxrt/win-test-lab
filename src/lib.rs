@@ -34,4 +34,5 @@ pub mod serialwait;
 pub mod sha256;
 pub mod sys;
 pub mod util;
+pub mod vhd;
 pub mod winiso;
