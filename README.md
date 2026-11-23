@@ -14,6 +14,9 @@ win-test-lab (the `wtl` command) does the boring part for you:
   DHCP, a certificate authority (AD CS) with auto-enrollment, IIS, members and users.
 - **Run your program** inside Windows, as SYSTEM or as any lab user, and get every step's exit
   code and output back.
+- **One run file for every case.** Variables (`WTL_OS=2022 wtl run smoke.json`) choose the
+  Windows, the folders and the arguments; `extends` shares one file between many; secrets stay
+  out of the results.
 - **On Linux, macOS and Windows.** One program, `wtl`, plus QEMU. No bash, Python, root or
   Samba needed. On a Mac it currently supports Windows 11 on Arm only (see below).
 
@@ -78,6 +81,53 @@ completes and checks them.
 **Why:** with a coding agent, this becomes a loop the agent can run on its own: build your
 code, `wtl run` it on every Windows you care about, read the results, fix the bug, run again.
 
+## Variables, shared files and secrets
+
+A run file can take parameters, so one file serves every Windows version and every build:
+
+```json
+{
+  "vars": {
+    "WTL_OS": "win11",
+    "WTL_MODE": "quick",
+    "WTL_BUILD": null,
+    "WTL_LICENSE": { "secret": true }
+  },
+  "lab": "single-${WTL_OS}",
+  "name": "smoke-${WTL_OS}",
+  "mount": { "X": "${WTL_BUILD}" },
+  "steps": [
+    { "as": "system", "run": "X:/setup.ps1", "args": "-Mode ${WTL_MODE} -License ${WTL_LICENSE}" },
+    { "run": "X:/smoke.exe" }
+  ]
+}
+```
+
+```
+WTL_OS=2022 WTL_BUILD=./out WTL_LICENSE=ABCD-1234 wtl run smoke.json
+for os in 2016 2019 2022 2025 win10 win11; do WTL_OS=$os WTL_BUILD=./out wtl run smoke.json; done
+```
+
+- **`vars`** are the file's parameters: each has a default, `null` for one you must set, or
+  `{ "secret": true }`. An environment variable of the same name wins over the default.
+- **`${WTL_NAME}`** works in any value: the lab, folders, programs, arguments. Only declared
+  names are replaced (a typo is an error), and only `WTL_` names exist, so a run file can never
+  read anything else from your environment (`GITHUB_TOKEN`, cloud keys...).
+- **In Windows, too:** every declared variable is also set in each step's environment, so a
+  script can read `$env:WTL_MODE` (PowerShell) or `%WTL_MODE%` (batch), whether it runs as
+  SYSTEM, the logged-on user or another lab user.
+- **Secrets** are shown as `***` in `result.json`, in `wtl`'s output and in its error messages;
+  Windows still gets the real value.
+- **`extends`** builds one file on another and changes only what differs; paths in the base
+  stay relative to the base:
+
+```json
+{ "extends": "./smoke.json", "vars": { "WTL_OS": "2003" }, "mount": { "X": "./out32" } }
+```
+
+The whole set of rules:
+[docs/CONFIG.md](https://github.com/mxrguspxrt/win-test-lab/blob/main/docs/CONFIG.md#variables-and-extends).
+
 ## Which host runs what
 
 `wtl` runs on Linux, macOS and Windows. Windows runs fast only where its CPU matches the
@@ -98,8 +148,8 @@ use a Linux or Windows machine. An Intel Mac runs x64 Windows natively, but is n
 
 ## Install
 
-You need QEMU and Rust (https://rustup.rs). On Ubuntu/Debian, [`install-deps.sh`](install-deps.sh)
-installs the lot and adds you to the `kvm` group:
+You need QEMU and Rust (https://rustup.rs). On Ubuntu/Debian,
+[`install-deps.sh`](https://github.com/mxrguspxrt/win-test-lab/blob/main/install-deps.sh) installs the lot and adds you to the `kvm` group:
 
 ```
 ./install-deps.sh          # core deps;  --all also adds the optional ones below
@@ -120,7 +170,8 @@ What each piece is for:
   10, 11 x64) and build its images. `ovmf` is the x64 UEFI firmware (Windows 11 needs it).
 - **`qemu-system-arm` + `qemu-efi-aarch64`** — only to run Windows 11 on Arm.
 - **`libguestfs-tools`** (Linux only) — only for **Windows Server 2003 R2 and 2008 R2**, which are
-  imported from a VHD rather than installed from an ISO (see [docs/ISOS.md](docs/ISOS.md)). `wtl`
+  imported from a VHD rather than installed from an ISO (see
+  [docs/ISOS.md](https://github.com/mxrguspxrt/win-test-lab/blob/main/docs/ISOS.md)). `wtl`
   uses `virt-customize` to drop an unattended-setup answer file into the imported image. On
   Debian/Ubuntu the kernel must also be readable (`sudo chmod 0644 /boot/vmlinuz-*`) or
   libguestfs's supermin fails — `install-deps.sh` does this.
@@ -195,7 +246,9 @@ wtl restore pki       # back to the 0 state, about a second
 ```
 
 Results land in the lab's state folder, `runs/<time>/`: `result.json` (every step: machine,
-user, exit code, duration), each step's output, and a screenshot of each machine.
+user, exit code, duration; the variables used), each step's output, and a screenshot of each
+machine. Several labs can run at the same time: each VM finds its own free VNC port, and labs
+with a network need different `lan_port`s.
 
 ## Where the data lives
 
