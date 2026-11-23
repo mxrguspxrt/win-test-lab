@@ -174,7 +174,9 @@ built once (`wtl prepare`, or the first `wtl run`) by booting the overlays thems
    first; autologon as the machine's `logon` user (else Administrator); `LAB_JOINED`; reboot;
    logged on -> `LAB_CLIENT_READY`; `LAB_IDLE`.
 4. The host powers every machine off with ACPI (members first, then the DC; a second press
-   after 60 s if a user session delays it) and writes `0-state.json`.
+   after 60 s if a user session delays it) and writes `0-state.json` (`lab`, `built_at`,
+   `machines`, and `guest`: what the baked guest scripts can do, `["step-env"]` = the SYSTEM
+   worker sets the run's vars; a run with vars on a 0 state without it warns).
 
 The guest keeps its progress in `C:\WTL\lab-state.json` (`phase`: new, promoted, ready,
 joined, configure), so every reboot continues where it stopped. Roles, features and setup
@@ -183,18 +185,21 @@ scripts (below) are applied here and frozen into the 0 state. `wtl rebuild` dele
 
 ## A run
 
-`wtl run CONFIG`: restore (QMP quit, delete `<machine>.qcow2`), create new throwaway
+`wtl run CONFIG`: read the run file (its `extends` chain merged, `${WTL_NAME}` replaced by
+the `vars`, docs/CONFIG.md), restore (QMP quit, delete `<machine>.qcow2`), create new throwaway
 overlays `<machine>.qcow2` on the 0-state disks, write each machine's control disc with
 `run` filled in, write one mount disc per drive of the run for every machine that has steps
 (`mount-<machine>-<letter>.iso`, label `WTL<LETTER>`, read-only), boot all machines (DC
-first), wait for `LAB_DC_READY` and every member's `LAB_CLIENT_READY`, then read the serial
+first; each QEMU gets `-vnc 127.0.0.1:N,to=99`, takes the first free display from N itself, and
+the host reads the port it bound with QMP `query-vnc`), wait for `LAB_DC_READY` and every member's `LAB_CLIENT_READY`, then read the serial
 logs of all machines that have steps, round-robin, until each sent `LAB_RUN_DONE`. A
 machine that powers itself off while being waited for is reset; a member that does not log
 on within 5 min is reset (up to 3 times; domain autologon sometimes stops at the sign-in
 screen).
 
 Each step is checked against its `expect_exit` (or `exit=running` with `keep_running`).
-Results go to `runs/<id>/` (see docs/CONFIG.md): `result.json`, `config.json`, and per
+Results go to `runs/<id>/` (see docs/CONFIG.md): `result.json` (with the vars used, a secret
+one as `***`), `config.json`, and per
 machine the decoded `stepNout/err.txt`, `serial.log`, `screen.png`. The VMs keep running;
 `wtl up` is the same without steps.
 
@@ -222,7 +227,8 @@ Pure ASCII (PowerShell 4 reads it without a BOM), one per machine:
    "mounts": [{"host": "/abs/host/path", "letter": "X"}],
    "steps": [{"n": 1, "as_": "system|logon|user", "user": "", "password": "",
               "path": "X:\\setup.bat", "args": "", "keep_running": false, "wait": 120}],
-   "wait": 120 }
+   "wait": 120,
+   "env": {"WTL_OS": "2019"} }
 }
 ```
 
@@ -232,7 +238,12 @@ machines that have steps. `as_` is resolved per machine: a step `as` the machine
 user, or with no `as`, is `logon` (its desktop session); another lab user is `user` with that
 user's password (started by the SYSTEM worker with `LogonUser` + `CreateProcessAsUser`, as
 `NETBIOS\user` in AD mode and `.\user` in a workgroup; no desktop); `system` is the SYSTEM
-worker. lab.ps1 refuses a disc whose `fmt` is not `multi`.
+worker. `run.env` is the run's vars with their values (secrets too): lab.ps1 sets them in its
+own process for the `logon` steps and sends them with every request to the SYSTEM worker,
+which sets them for `system` steps and merges them into the user's environment block for
+`user` steps. lab.ps1 (lab.vbs) comes from the control disc on every run, but the worker and
+the agent are baked into the 0 state, so lab.ps1 must work with an older worker (it ignores
+`env`). lab.ps1 refuses a disc whose `fmt` is not `multi`.
 
 `roles`, `features`, `ad_cs`/`dhcp`/`iis` and `setup` are present only on the **build** disc
 (they are baked into the 0 state; the guest acts on them in the `configure` phase) and absent
@@ -256,7 +267,8 @@ their steps so auto-enrolled certificates are present.
 The logged-on user runs `agent.ps1` (which owns COM1) and `lab.ps1`. A scheduled task
 `WTL-Svc` (ONSTART, SYSTEM, registered while still Administrator) runs `C:\WTL\labsvc.ps1`,
 which does what that user cannot: assign mount discs their drive letters, run `system`
-steps and steps as another user. They talk through files: `C:\WTL\svc\<id>.req.json` ->
+steps and steps as another user. They talk through files: `C:\WTL\svc\<id>.req.json`
+(`{"action":"run","path":..,"args":..,"cwd":..,"timeout":..,"out":..,"err":..,"env":{..}}`) ->
 `C:\WTL\svc\<id>.res.json` (`{"ok":true,"exit":N,"secs":S}`, `{"ok":true,"timed_out":true}`,
 `{"ok":true,"running":true}` or `{"ok":false,"error":"..."}`). Step output is captured to
 `C:\WTL\run\stepN.out/err` and sent over serial by the agent's session.

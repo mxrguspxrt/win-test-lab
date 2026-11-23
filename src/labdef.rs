@@ -245,9 +245,21 @@ pub struct RunDef {
     /// Optional path or URL of the JSON Schema, for editors (ignored by `wtl`).
     #[serde(default, rename = "$schema", skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
+    /// A run file this one builds on, relative to this file (e.g. `./base.json`). Its keys are
+    /// the defaults: objects (`mount`, `vars`) merge key by key, anything else (`steps`
+    /// included) is replaced. Paths in it are relative to that file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extends: Option<String>,
+    /// Variables for `${WTL_NAME}` in this file's string values, and set in every step's
+    /// environment in the guest. Each name is `WTL_` + `A-Z 0-9 _`; the value is the default
+    /// (a host environment variable of the same name wins), `null` for one that must be set,
+    /// or `{ "default": ..., "secret": true }` for one that is never written to the results.
+    #[serde(default)]
+    pub vars: IndexMap<String, Option<VarDef>>,
     /// The lab to boot: a name (`labs/<lab>.json` in win-test-lab, e.g. `school`) or a path to
     /// a lab file, relative to this run file (e.g. `./lab.json`). A value with a `/` or `\`
-    /// or ending in `.json` is a path.
+    /// or ending in `.json` is a path. Required, here or in the file this one extends.
+    #[serde(default)]
     pub lab: String,
     /// Label for the results folder (default: the run file's stem).
     #[serde(default)]
@@ -293,6 +305,28 @@ pub struct StepDef {
     /// If true, a program still running at `wait` counts as OK and is left running.
     #[serde(default)]
     pub keep_running: bool,
+}
+
+/// One run variable: its default value, or the long form with `secret`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum VarDef {
+    /// the default value
+    Value(String),
+    Spec(VarSpec),
+}
+
+/// The long form of a run variable.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VarSpec {
+    /// The default value; absent or `null`: the variable must be set in the environment.
+    #[serde(default)]
+    pub default: Option<String>,
+    /// If true, the value is shown as `***` in `result.json` and in `wtl`'s output (the guest
+    /// still gets the real value).
+    #[serde(default)]
+    pub secret: bool,
 }
 
 /// `on`: a single machine, a list of machines, or every member.
@@ -469,6 +503,33 @@ pub struct Run {
     /// (drive letter, host path) in declaration order
     pub mounts: Vec<(String, String)>,
     pub steps: Vec<RunStep>,
+    /// the run's variables with their final values, in declaration order (set by
+    /// [`crate::runconf`]; empty for a run resolved on its own)
+    pub vars: Vec<RunVar>,
+}
+
+/// A run variable with its value (the host environment's, else the default).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunVar {
+    pub name: String,
+    pub value: String,
+    pub secret: bool,
+}
+
+impl Run {
+    /// `text` with every secret variable's value replaced by `***`, for output and results.
+    pub fn mask(&self, text: &str) -> String {
+        mask_secrets(&self.vars, text)
+    }
+}
+
+/// `text` with every secret variable's value in `vars` replaced by `***`.
+pub fn mask_secrets(vars: &[RunVar], text: &str) -> String {
+    let mut out = text.to_string();
+    for v in vars.iter().filter(|v| v.secret && !v.value.is_empty()) {
+        out = out.replace(&v.value, "***");
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -803,12 +864,17 @@ impl RunDef {
         serde_json::from_str(text).map_err(|e| anyhow::anyhow!("{}: {}", path, e))
     }
 
+    /// [`RunDef::parse`] for a run already read as JSON (by [`crate::runconf::load`]).
+    pub fn from_value(v: serde_json::Value, path: &str) -> Result<RunDef> {
+        serde_json::from_value(v).map_err(|e| anyhow::anyhow!("{}: {}", path, e))
+    }
+
     /// Validate and fill in defaults against the lab it names. `path` / `default_name` are for
     /// error messages and the results folder; `host_resolve` makes a mount's host path
     /// absolute (relative to the run file's directory).
     pub fn resolve(&self, path: &str, default_name: &str, lab: &Lab, host_resolve: impl Fn(&str) -> String) -> Result<Run> {
         if self.lab.trim().is_empty() {
-            bail!("{}: lab is empty", path);
+            bail!("{}: no lab (set \"lab\", here or in the file it extends)", path);
         }
         let name = self.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| default_name.to_string());
         if !is_safe_name(&name) {
@@ -919,7 +985,7 @@ impl RunDef {
             bail!("{}: nothing to do (no steps)", path);
         }
 
-        Ok(Run { lab: self.lab.clone(), name, wait, timeout_min, mounts, steps })
+        Ok(Run { lab: self.lab.clone(), name, wait, timeout_min, mounts, steps, vars: Vec::new() })
     }
 }
 
@@ -1226,17 +1292,27 @@ mod tests {
         }
         // examples/ is not in the published package: check the runs where it exists
         let Ok(rd) = std::fs::read_dir(root.join("examples/configs")) else { return };
+        let resolve = |p: &Path, env: &dyn Fn(&str) -> Option<String>| {
+            let (v, _) = crate::runconf::load(p, env).unwrap_or_else(|e| panic!("{}: {:#}", p.display(), e));
+            let def = RunDef::from_value(v, &p.display().to_string()).unwrap();
+            let lab = labs.get(&def.lab).unwrap_or_else(|| panic!("{}: no labs/{}.json", p.display(), def.lab));
+            def.resolve(&p.display().to_string(), "x", lab, |h| h.to_string()).unwrap_or_else(|e| panic!("{}: {:#}", p.display(), e));
+        };
         let mut runs = 0;
         for e in rd.flatten() {
             let p = e.path();
             if p.extension().is_some_and(|x| x == "json") {
-                let def = RunDef::parse(&std::fs::read_to_string(&p).unwrap(), &p.display().to_string()).unwrap();
-                let lab = labs.get(&def.lab).unwrap_or_else(|| panic!("{}: no labs/{}.json", p.display(), def.lab));
-                def.resolve(&p.display().to_string(), "x", lab, |h| h.to_string()).unwrap_or_else(|e| panic!("{}: {:#}", p.display(), e));
+                // with the vars' defaults
+                resolve(&p, &|_| None);
                 runs += 1;
             }
         }
         assert!(runs >= 4, "{} example runs", runs);
+        // single-smoke.json serves every single-<os> lab through WTL_OS
+        let single = root.join("examples/configs/single-smoke.json");
+        for os in labs.keys().filter_map(|k| k.strip_prefix("single-")) {
+            resolve(&single, &|k| (k == "WTL_OS").then(|| os.to_string()));
+        }
     }
 
     #[test]

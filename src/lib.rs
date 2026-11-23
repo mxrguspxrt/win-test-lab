@@ -7,6 +7,7 @@
 //! * [`home`]: where the data lives (ISOs, base images, 0 states) and the config files.
 //! * [`assets`]: the guest scripts, the OS table and the example labs built into the program.
 //! * [`labdef`]: the typed JSON lab and run formats, their validation and JSON Schema.
+//! * [`runconf`]: reading a run file: `extends`, `vars` and `${WTL_NAME}`.
 //! * [`labrun`]: the runner: builds a lab's 0 state, boots its machines on a private
 //!   multicast LAN, runs a config's steps on each machine and collects the results.
 //! * [`build`]: an unattended Windows install into a base image.
@@ -29,6 +30,7 @@ pub mod outputs;
 pub mod pyjson;
 pub mod qemu;
 pub mod qmp;
+pub mod runconf;
 pub mod schema;
 pub mod serialwait;
 pub mod sha256;

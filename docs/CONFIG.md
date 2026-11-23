@@ -211,7 +211,9 @@ Another lab: copy one, change the machine names (and for a LAN `network.subnet` 
 
 | field | default | meaning |
 |-------|---------|---------|
-| `lab` | (required) | The lab to boot: a name (`"school"` = `labs/school.json` in the home, else the lab `school` built into `wtl`) or a path to a lab file, relative to this run file (`"./lab.json"`, `"../labs/ad.json"`). Anything with a `/` or `\`, or ending in `.json`, is a path. |
+| `extends` | none | A run file this one builds on, relative to this file: see [Variables and extends](#variables-and-extends). |
+| `vars` | `{}` | Variables for `${WTL_NAME}` in the file and for the steps' environment: see [Variables and extends](#variables-and-extends). |
+| `lab` | (required, here or in the file it extends) | The lab to boot: a name (`"school"` = `labs/school.json` in the home, else the lab `school` built into `wtl`) or a path to a lab file, relative to this run file (`"./lab.json"`, `"../labs/ad.json"`). Anything with a `/` or `\`, or ending in `.json`, is a path. |
 | `name` | the file name without `.json` | A label for the run. |
 | `wait` | 60 | Seconds a step may run before it counts as "still running" (see `keep_running`). `wtl run --wait S` overrides it. |
 | `timeout_min` | 60 | Give up on the whole run after this many minutes. `wtl run --timeout-min M` overrides it. |
@@ -241,15 +243,81 @@ A **step**:
 machines run at the same time, so a step on CL2 does not wait for an earlier step on CL1.
 `wtl run` exits 0 if every step returned its `expect_exit`, 1 if any did not.
 
+### Variables and extends
+
+One run file can serve several cases: its `vars` are its parameters, set from the host's
+environment when you run it.
+
+```json
+{
+  "vars": {
+    "WTL_OS": "single-win11",
+    "WTL_MODE": "quick",
+    "WTL_BUILD_DIR": null,
+    "WTL_LICENSE": { "secret": true }
+  },
+  "lab": "${WTL_OS}",
+  "name": "smoke-${WTL_OS}",
+  "mount": { "X": "${WTL_BUILD_DIR}" },
+  "steps": [
+    { "as": "system", "run": "X:/setup.ps1", "args": "-Mode ${WTL_MODE} -License ${WTL_LICENSE}" }
+  ]
+}
+```
+
+```bash
+WTL_OS=single-2022 WTL_BUILD_DIR=$PWD/out WTL_LICENSE=ABCD-1234 wtl run smoke.json
+```
+
+- **Declaring.** A name is `WTL_` + `A-Z 0-9 _`, and not one of `wtl`'s own settings
+  (`WTL_HOME`, `WTL_MEM`, `WTL_PASSWORD`, ...). The value is the default: a string, `null` for
+  one that must be set, or `{ "default": ..., "secret": true }`. A host environment variable of
+  the same name wins. A value is one line (no line breaks).
+- **Using.** `${WTL_NAME}` in any string value (not in keys, `vars` or `$schema`) is replaced by
+  its value; the name must be declared. `$${` is a literal `${`, and any other `$`
+  (`$env:PATH`, `${env:TEMP}`) is left alone. The value goes in as it is: quote it in `args`
+  when it may contain spaces (`"args": "-Dir \"${WTL_DIR}\""`). The result is checked like
+  anything typed into the file (lab names, mount letters, the `run` extensions). A relative
+  `mount` folder from a variable is relative to the run file, as usual.
+- **In the guest.** Every declared variable is also set in each step's environment, so a
+  script can read `$env:WTL_MODE` (or `%WTL_MODE%`) as well as take it as an argument. Nothing
+  else from the host's environment reaches the guest.
+- **Secrets.** A `secret` variable is shown as `***` in `result.json`, in `wtl`'s output and in
+  its error messages; once secret in a base file, it stays secret. The guest gets the real
+  value, so a script that prints it puts it in its step output. The value is also on the
+  machine's control disc in the lab's state folder while the lab exists (as the lab users'
+  passwords are).
+- **Results.** `result.json` lists every variable with the value the run used.
+
+A run file may build on another with `extends`:
+
+```json
+{ "extends": "./smoke-base.json", "vars": { "WTL_OS": "single-2022" } }
+```
+
+- The path is relative to the file, local files only, no variables in it; a base may extend
+  another (at most 8 deep, no loops).
+- The base's keys are the defaults. Objects (`mount`, `vars`) merge key by key, the child's key
+  winning; anything else (`steps` included) is replaced whole.
+- Paths in a base file (`lab` when it is a path, the `mount` folders) are relative to the base
+  file, wherever the child is.
+- `vars` merge too: the child's default wins, the host's environment wins over both, and every
+  file's `${WTL_NAME}` gets the final values.
+
+**A 0 state built before run vars** (by an older `wtl`) still substitutes `${...}`, and steps
+run as the logged-on user get the variables in their environment. Steps run as `"system"` or
+as another user do not, because the SYSTEM worker is baked into the 0 state; `wtl run` warns,
+and `wtl rebuild LAB` fixes it.
+
 ## What a run produces
 
 `<state folder>/<lab>/runs/<YYYYmmdd-HHMMSS>/` (and `<state folder>/<lab>/last` points at
 the latest; the state folder is `labs/state/` in the home, see `wtl home`):
 
-    result.json          the summary: lab, config, run id, status ok|failed, and one record
-                         per step: machine, user (system|logon|user), n, script, exit,
-                         expect_exit, secs, ok
-    config.json          a copy of the run config
+    result.json          the summary: lab, config, run id, vars (a secret one as ***),
+                         status ok|failed, and one record per step: machine, user
+                         (system|logon|user), n, script, exit, expect_exit, secs, ok
+    config.json          a copy of the run config (as written: ${...} and extends unresolved)
     <machine>/step1out.txt, step1err.txt, ...   each step's stdout / stderr
     <machine>/screen.png                         the machine's screen at the end
     <machine>/serial.log                         the full guest event log

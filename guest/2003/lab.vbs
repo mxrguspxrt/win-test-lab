@@ -15,7 +15,7 @@
 ' A step may run as "system" (via the SYSTEM worker) or as "logon" (this machine's logged-on
 ' user). Running a step as another lab user is not supported on Server 2003 yet.
 
-Dim gLabStateFile, gLabWinlogon, gSlow, gSvcAnswered
+Dim gLabStateFile, gLabWinlogon, gSlow, gSvcAnswered, gRunEnv
 gLabStateFile = "C:\WTL\lab-state.txt"
 gLabWinlogon = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\"
 gSlow = 1
@@ -296,7 +296,7 @@ End Sub
 ' here in this session). Reports LAB_STEP machine= as= n= script= exit= [secs=] (after the
 ' step's OUTPUT lines).
 Sub RunLabStep(machine, n, s, timeoutS)
-  Dim as_, path, argsLine, keep, runDir, outF, errF, cwd, req, res, state, exitCode, secs, errMsg
+  Dim as_, path, argsLine, keep, runDir, outF, errF, cwd, req, res, state, exitCode, secs, errMsg, k
   as_ = JStr(s, "as_")
   If as_ = "" Then as_ = JStr(s, "as")
   path = JStr(s, "path")
@@ -326,6 +326,10 @@ Sub RunLabStep(machine, n, s, timeoutS)
     req("out") = outF
     req("err") = errF
     If keep Then req("keep_running") = "1" Else req("keep_running") = "0"
+    ' the run's vars, for the worker to set in the program's environment
+    For Each k In gRunEnv.Keys
+      req("env." & k) = gRunEnv(k)
+    Next
     Set res = SvcCall(req, timeoutS + 60)
     If res("ok") <> "1" Then
       state = "fail"
@@ -358,12 +362,23 @@ Sub RunLabStep(machine, n, s, timeoutS)
 End Sub
 
 Function InvokeLabSteps(cfg)
-  Dim run, steps, machine, defWait, i, s, stepWait, n
+  Dim run, steps, machine, defWait, i, s, stepWait, n, pe, k
   Set run = cfg.Item("run")
   machine = JStr(cfg, "machine")
   steps = JArr(run, "steps")
   defWait = JInt(run, "wait", 60)
   SetLabMounts JArr(run, "mounts")
+  ' the run's vars, in the environment of every step started here (the logged-on user's); the
+  ' SYSTEM worker gets them with each request. (Set here, not with a common.vbs helper: an older
+  ' 0 state has an older common.vbs baked in.)
+  Set gRunEnv = NewDict()
+  If JHas(run, "env") Then
+    If IsObject(run.Item("env")) Then Set gRunEnv = run.Item("env")
+  End If
+  Set pe = gSh.Environment("PROCESS")
+  For Each k In gRunEnv.Keys
+    pe(k) = CStr(gRunEnv(k))
+  Next
   n = 0
   For i = 0 To UBound(steps)
     Set s = steps(i)

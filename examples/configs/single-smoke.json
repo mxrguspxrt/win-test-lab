@@ -1,6 +1,8 @@
 {
   "$schema": "../../schema/run.schema.json",
-  "lab": "single-2008",
+  "vars": { "WTL_OS": "2019" },
+  "lab": "single-${WTL_OS}",
+  "name": "single-${WTL_OS}-smoke",
   "mount": { "X": "../smoke-test/out" },
   "steps": [
     { "as": "system", "run": "X:/setup.bat" },

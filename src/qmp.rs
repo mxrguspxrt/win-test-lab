@@ -126,6 +126,15 @@ impl Qmp {
         }
     }
 
+    /// The TCP port QEMU's VNC server listens on (`query-vnc`), e.g. 5911; None without VNC.
+    pub fn vnc_port(&mut self) -> Result<Option<u16>> {
+        let r = self.cmd("query-vnc", None)?;
+        if r.get("enabled") == Some(&Value::Bool(false)) {
+            return Ok(None);
+        }
+        Ok(r.get("service").and_then(Value::as_str).and_then(|s| s.parse().ok()))
+    }
+
     /// "running", "shutdown", "paused", ...
     pub fn status(&mut self) -> Result<String> {
         let r = self.cmd("query-status", None)?;

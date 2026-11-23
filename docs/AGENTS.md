@@ -125,7 +125,7 @@ images), `labs/state/<lab>/` (0 state, overlays, serial logs, `runs/<id>/`), `is
     cargo package --list                 # what would be published
 
 Anything touching the guest or the boot sequence also needs a real run, in each mode it
-affects: `wtl rebuild single-2019 && wtl run examples/configs/single-2019-smoke.json`
+affects: `wtl rebuild single-2019 && WTL_OS=2019 wtl run examples/configs/single-smoke.json`
 (workgroup, ~10 min) and `wtl rebuild mixed && wtl run examples/configs/mixed-smoke.json`
 (AD, ~30 min).
 

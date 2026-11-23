@@ -14,7 +14,7 @@
 
 use crate::assets;
 use crate::home::Home;
-use crate::lab::{build_base_images, indent_file, pick_vnc_display, read_trim, sock_path, write_file, BaseBuild};
+use crate::lab::{bound_vnc_display, build_base_images, indent_file, pick_vnc_display, read_trim, sock_path, write_file, BaseBuild};
 use crate::labdef::{self, Lab, Role, Run, RunStep, StepAs};
 use crate::logx::{err, log, ok, warn};
 use crate::oslist::{self, OsInfo};
@@ -23,6 +23,7 @@ use crate::qmp::{Addr, Qmp};
 use crate::serialwait::{Outcome, Wait};
 use crate::{mkiso, outputs, pyjson, sys, util};
 use anyhow::{anyhow, bail, Context, Result};
+use indexmap::IndexMap;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -137,6 +138,8 @@ struct LabRun<'a> {
     mounts: Vec<LabMount<'a>>,
     steps: Vec<LabStep<'a>>,
     wait: i64,
+    /// the run's variables, set in every step's environment (`WTL_NAME` -> value)
+    env: IndexMap<&'a str, &'a str>,
 }
 
 #[derive(Serialize)]
@@ -198,7 +201,15 @@ struct ZeroState {
     built_at: String,
     #[serde(default)]
     machines: Vec<String>,
+    /// what the guest scripts baked into it can do (see [`GUEST_FEATURES`]); none for a 0
+    /// state built by an older `wtl`
+    #[serde(default)]
+    guest: Vec<String>,
 }
+
+/// What this program's guest scripts can do once baked into a 0 state: `step-env` = the
+/// SYSTEM worker sets the run's vars in a step's environment.
+const GUEST_FEATURES: &[&str] = &["step-env"];
 
 /// One step's outcome, written into runs/<id>/result.json.
 #[derive(Serialize, Clone)]
@@ -222,6 +233,8 @@ struct RunResult {
     lab: String,
     config: String,
     run_id: String,
+    /// the run's variables and the values used (a secret one as `***`)
+    vars: IndexMap<String, String>,
     /// "ok" if every step met its expect_exit, else "failed"
     status: String,
     steps: Vec<StepResult>,
@@ -243,6 +256,8 @@ pub struct MultiLab {
     lab: Lab,
     /// the run config file (absolute), if any
     config: Option<PathBuf>,
+    /// the run's variables with their values (empty without a run)
+    run_vars: Vec<labdef::RunVar>,
     show: bool,
     wait_s: i64,
     timeout_min: i64,
@@ -471,6 +486,7 @@ impl MultiLab {
             lab_file: lab_file.to_path_buf(),
             lab,
             config,
+            run_vars: run.as_ref().map(|r| r.vars.clone()).unwrap_or_default(),
             show,
             wait_s,
             timeout_min,
@@ -686,6 +702,22 @@ impl MultiLab {
         Ok(true)
     }
 
+    /// A run with vars on a 0 state whose SYSTEM worker predates them: its `system` and
+    /// other-user steps run without the vars in their environment (`${...}` still works).
+    fn warn_old_worker(&self) {
+        let runs_by_worker = self.vms.iter().any(|v| v.steps.iter().any(|(_, s)| s.as_ != StepAs::Logon));
+        if self.run_vars.is_empty() || !runs_by_worker {
+            return;
+        }
+        let z: ZeroState = std::fs::read_to_string(&self.zero_done).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        if !z.guest.iter().any(|f| f == "step-env") {
+            warn(&format!(
+                "lab {}'s 0 state was built before run vars: steps run as \"system\" or another user will not see them as environment variables (${{...}} in the config still works); wtl rebuild {} fixes it",
+                self.name, self.arg
+            ));
+        }
+    }
+
     fn status(&self) {
         println!("lab {} ({}): {}, {} machines", self.name, self.lab_file.display(), self.mode_text(), self.vms.len());
         if self.zero_done.is_file() {
@@ -865,7 +897,8 @@ impl MultiLab {
                     }
                 })
                 .collect();
-            Some(LabRun { mounts, steps, wait: self.wait_s })
+            let env = self.run_vars.iter().map(|v| (v.name.as_str(), v.value.as_str())).collect();
+            Some(LabRun { mounts, steps, wait: self.wait_s, env })
         } else {
             None
         };
@@ -1058,9 +1091,10 @@ impl MultiLab {
         let pid = qemu::start(&argv, &self.st(&format!("{}.qemu.log", vm.name)))
             .with_context(|| format!("qemu ({}) failed to start", vm.name))?;
         write_file(&self.st(&format!("{}.pid", vm.name)), format!("{}\n", pid))?;
-        let vnc = match o.vnc {
-            Some(n) => format!("VNC 127.0.0.1:{}", 5900 + n),
-            None => "window".to_string(),
+        let vnc = match (o.vnc, &o.qmp) {
+            (Some(n), Some(qmp)) => format!("VNC 127.0.0.1:{}", 5900 + bound_vnc_display(qmp, n)),
+            (Some(n), None) => format!("VNC 127.0.0.1:{}", 5900 + n),
+            (None, _) => "window".to_string(),
         };
         write_file(&self.st(&format!("{}.vnc", vm.name)), format!("{}\n", vnc))?;
         log(&format!("  {} started ({})", vm.name, vnc));
@@ -1232,6 +1266,7 @@ impl MultiLab {
             lab: self.name.clone(),
             built_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
             machines: self.vm_names(),
+            guest: GUEST_FEATURES.iter().map(|f| f.to_string()).collect(),
         };
         write_file(&self.zero_done, pyjson::dumps(&done))?;
         ok(&format!("0 state saved for lab {} ({} machines)", self.name, self.vms.len()));
@@ -1311,6 +1346,7 @@ impl MultiLab {
         // ---- config run: each machine with steps runs them and reports; multiplex the waits
         let config = self.config.clone().unwrap_or_default();
         let config_name = config.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.warn_old_worker();
         log(&format!("running {} (steps on {} machine(s))", config_name, self.vms.iter().filter(|v| v.has_steps()).count()));
         let (status, step_results) = self.run_steps()?;
 
@@ -1335,6 +1371,7 @@ impl MultiLab {
             lab: self.name.clone(),
             config: config_name.clone(),
             run_id: run_id.clone(),
+            vars: self.run_vars.iter().map(|v| (v.name.clone(), if v.secret { "***".to_string() } else { v.value.clone() })).collect(),
             status: if status == 0 { "ok" } else { "failed" }.to_string(),
             steps: step_results,
         };
@@ -1391,7 +1428,7 @@ impl MultiLab {
     fn report_step(&self, vm: &str, line: &str, status: &mut i32) -> StepResult {
         let ev = outputs::parse_event(line);
         let g = |k: &str| ev.as_ref().and_then(|e| e.get(k)).unwrap_or("").to_string();
-        let (n, script, exit) = (g("n"), g("script"), g("exit"));
+        let (n, script, exit) = (g("n"), labdef::mask_secrets(&self.run_vars, &g("script")), g("exit"));
         // which host-side step is this (per-machine 1-based index) -> its expect_exit
         let expect =
             util::py_int(&n).and_then(|idx| self.vm(vm).steps.iter().find(|(i, _)| *i == idx)).map(|(_, s)| s.expect_exit).unwrap_or(0);
@@ -1429,11 +1466,23 @@ pub fn load_lab(path: &Path) -> Result<Lab> {
 
 /// Resolve the run file against its lab: `"lab": "school"` is `labs/school.json` in the home
 /// (else the built-in lab `school`), `"lab": "./lab.json"` (anything with a `/` or `\`, or
-/// ending in `.json`) is a lab file relative to the run file. Returns the lab file path, the
+/// ending in `.json`) is a lab file relative to the run file. `extends`, `vars` and
+/// `${WTL_NAME}` are applied first ([`crate::runconf`]). Returns the lab file path, the
 /// resolved lab, and the resolved run.
 pub fn load_run(config: &Path) -> Result<(PathBuf, Lab, Run)> {
-    let text = std::fs::read_to_string(config).map_err(|e| anyhow!("{}: {}", config.display(), e))?;
-    let def = labdef::RunDef::parse(&text, &config.display().to_string())?;
+    let (value, vars) = crate::runconf::load(config, |k| std::env::var(k).ok())?;
+    // a secret's value never shows in an error message
+    let (lab_file, lab, mut run) =
+        resolve_run(config, value).map_err(|e| anyhow!("{}", labdef::mask_secrets(&vars, &format!("{:#}", e))))?;
+    run.vars = vars;
+    Ok((lab_file, lab, run))
+}
+
+fn resolve_run(config: &Path, value: serde_json::Value) -> Result<(PathBuf, Lab, Run)> {
+    let def = labdef::RunDef::from_value(value, &config.display().to_string())?;
+    if def.lab.trim().is_empty() {
+        bail!("{}: no lab (set \"lab\", here or in the file it extends)", config.display());
+    }
     let base_dir = util::abspath(config).parent().unwrap_or(Path::new(".")).to_path_buf();
     let lab_file = if labdef::lab_is_path(&def.lab) {
         let p = Path::new(&def.lab);

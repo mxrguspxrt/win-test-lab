@@ -169,6 +169,8 @@ fn run_cli(cmd: &Cmd) -> Result<i32> {
         let p = util::canon(Path::new(target));
         match labrun::load_run(&p) {
             Ok((lab_file, _, _)) => lab_file,
+            // a run config that does not load (e.g. a required var is not set): say why
+            Err(e) if is_run_config(&p) => return Err(e.context("config error")),
             Err(_) => p, // not a run config: treat it as a lab file
         }
     } else {
@@ -187,6 +189,14 @@ fn run_cli(cmd: &Cmd) -> Result<i32> {
 
 /// `wtl doctor`: what this host can run, and which ISO serves which OS. Exit 0 if the host
 /// can run at least one OS it has an ISO for, else 1.
+/// Does this JSON file look like a run config (a `lab` or `extends` key, no `machines`)?
+fn is_run_config(p: &Path) -> bool {
+    let v: Option<serde_json::Value> = std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str(&t).ok());
+    v.as_ref()
+        .and_then(|v| v.as_object())
+        .is_some_and(|m| (m.contains_key("lab") || m.contains_key("extends")) && !m.contains_key("machines"))
+}
+
 fn doctor() -> Result<i32> {
     use crate::qemu::{Accel, Arch, Env};
     let home = Home::resolve()?;
@@ -364,9 +374,28 @@ pub(crate) fn free_port() -> Option<u16> {
     std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?.local_addr().ok().map(|a| a.port())
 }
 
-/// N (10..99, then 0..9) such that 127.0.0.1:(5900+N) is free
+/// N (10..99, then 0..9) such that 127.0.0.1:(5900+N) is free: where QEMU starts looking (it
+/// takes the next free one itself if another lab got there first, see [`bound_vnc_display`])
 pub(crate) fn pick_vnc_display() -> Option<u16> {
     (10..100).chain(0..10).find(|n| port_free(5900 + n))
+}
+
+/// The VNC display a just-started QEMU actually took (it was asked for `asked` or the next free
+/// one), read over its QMP socket; `asked` if QMP does not answer within a few seconds.
+pub(crate) fn bound_vnc_display(qmp: &crate::qmp::Addr, asked: u16) -> u16 {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let port = crate::qmp::Qmp::connect(qmp, std::time::Duration::from_secs(5)).and_then(|mut q| q.vnc_port());
+        match port {
+            Ok(Some(p)) if p >= 5900 => return p - 5900,
+            Ok(_) => return asked,
+            Err(_) if std::time::Instant::now() < end => std::thread::sleep(std::time::Duration::from_millis(250)),
+            Err(e) => {
+                crate::logx::warn(&format!("cannot ask QEMU for its VNC port ({:#}); assuming 127.0.0.1:{}", e, 5900 + asked));
+                return asked;
+            }
+        }
+    }
 }
 
 /// a unix socket path short enough (<= 100 chars; sun_path is ~108)

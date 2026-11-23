@@ -8,7 +8,7 @@
 
 use crate::assets;
 use crate::home::Home;
-use crate::lab::{pick_vnc_display, sock_path, write_file};
+use crate::lab::{bound_vnc_display, pick_vnc_display, sock_path, write_file};
 use crate::logx::{err, log, ok, warn};
 use crate::oslist::OsInfo;
 use crate::qemu::{self, Arch, Env, Opts};
@@ -692,6 +692,9 @@ pub fn build(env: &Env, b: &Build, qmp_tcp: bool) -> Result<()> {
     let argv = qemu::command(env, &o)?;
     let pid = qemu::start(&argv, &run_dir.join("qemu.log"))?;
     write_file(&run_dir.join("qemu.pid"), format!("{}\n", pid))?;
+    // the display QEMU took (the next free one if another VM got `vnc` first); asked before the
+    // keypress threads below, which hold the QMP socket while they run
+    let vnc = vnc.map(|n| bound_vnc_display(&addr, n));
     // only the UEFI "press any key to boot from CD" prompt needs the keypress, and only when an
     // installer ISO boots first (never for a VHD import, which boots from its own disk)
     if uefi && boot_d {

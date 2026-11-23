@@ -167,7 +167,20 @@ checks for the issued certificates, the web site and the scope). Full reference:
 
 ## Several Windows versions
 
-One run file per version (they can share the scripts), and a loop:
+One run file for every version, with the lab as a variable (see
+[Variables and extends](CONFIG.md#variables-and-extends)):
+
+```json
+{
+  "vars": { "WTL_OS": "single-win11" },
+  "lab": "${WTL_OS}",
+  "name": "smoke-${WTL_OS}",
+  "mount": { "X": "./app" },
+  "steps": [ { "as": "system", "run": "X:/setup.bat" }, { "run": "X:/smoke.exe" } ]
+}
+```
+
+and a loop:
 
 ```bash
 #!/usr/bin/env bash
@@ -177,15 +190,18 @@ cd "$(dirname "$0")"
 rc=0
 for v in 2012 2016 2019 win10 win11; do
     echo "=== $v"
-    wtl run "run-$v.json" || rc=1
+    WTL_OS="single-$v" wtl run run.json || rc=1
     wtl restore "single-$v" >/dev/null
 done
 exit "$rc"
 ```
 
-with e.g. `run-2016.json` = `{ "lab": "single-2016", "mount": {...}, "steps": [...] }`. The labs
-run one after the other; on a bigger host two labs may run at once if their `lan_port`s and
-VNC displays differ. (A `targets` matrix inside one run file does not exist yet.)
+A version that needs something different can have its own file that `extends` the shared one
+and changes only that: win-test-lab's `examples/configs/single-smoke.json` is such a shared file
+(`WTL_OS=2022 wtl run examples/configs/single-smoke.json`), and `single-2003-smoke.json` extends
+it with Server 2003's 32-bit build. The labs run one after the other; on a bigger host several
+labs may run at once if their `lan_port`s differ (each VM gets the next free VNC display by
+itself). (A `targets` matrix inside one run file does not exist yet.)
 
 ## Exit codes and results
 
@@ -198,7 +214,7 @@ VNC displays differ. (A `targets` matrix inside one run file does not exist yet.
 
 Results: `<state folder>/<lab>/runs/<time>/` (and `.../last` points at the newest; `wtl home`
 shows the state folder): `result.json` (every step with machine, user, exit code, duration,
-ok), `config.json`, and per machine `step<N>out.txt` / `step<N>err.txt`, `screen.png`,
+ok, and the run's vars), `config.json`, and per machine `step<N>out.txt` / `step<N>err.txt`, `screen.png`,
 `serial.log`. The run prints this path at the end. The VMs stay up for a look over VNC;
 `wtl restore <lab>` stops them.
 

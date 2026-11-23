@@ -11,7 +11,8 @@
 # user's agent owns COM1 and does the reporting), via a request/response queue under C:\WTL\svc:
 #
 #   request  C:\WTL\svc\<id>.req.json   {"action":"mount","letter":"X"}
-#                                       {"action":"run","path":"X:\\a.bat","cwd":"X:\\","timeout":60,"out":"...","err":"..."}
+#                                       {"action":"run","path":"X:\\a.bat","cwd":"X:\\","timeout":60,"out":"...","err":"...",
+#                                        "env":{"WTL_OS":"..."}}   (env: the run's vars, set for the program)
 #   result   C:\WTL\svc\<id>.res.json   {"ok":true,...} | {"ok":true,"exit":N,"secs":S} | {"ok":false,"error":".."}
 #
 # The worker writes <id>.res.json then deletes <id>.req.json. It loops forever.
@@ -59,6 +60,30 @@ function Resolve-SvcLaunch([string]$Path, [string]$UserArgs) {
     return @($file, $argLine)
 }
 
+# The request's env (the run's vars) as a hashtable: WTL_NAME -> value.
+function Get-SvcReqEnv($Req) {
+    $h = @{}
+    if ($Req.env -ne $null) {
+        foreach ($p in $Req.env.PSObject.Properties) { $h[[string]$p.Name] = [string]$p.Value }
+    }
+    return $h
+}
+
+# Set $Vars (name -> value) in this process, for the program about to start (Start-Process
+# copies the environment); returns the old values for Restore-SvcEnv.
+function Set-SvcEnv($Vars) {
+    $old = @{}
+    foreach ($k in $Vars.Keys) {
+        $old[$k] = [Environment]::GetEnvironmentVariable($k, 'Process')
+        [Environment]::SetEnvironmentVariable($k, $Vars[$k], 'Process')
+    }
+    return $old
+}
+
+function Restore-SvcEnv($Old) {
+    foreach ($k in $Old.Keys) { [Environment]::SetEnvironmentVariable($k, $Old[$k], 'Process') }
+}
+
 function Invoke-SvcRun($Req) {
     $path = [string]$Req.path
     $cwd = [string]$Req.cwd
@@ -70,6 +95,7 @@ function Invoke-SvcRun($Req) {
     $runPass = [string]$Req.password
     $runDomain = [string]$Req.domain
     $keepRunning = $false; if ($Req.keep_running) { $keepRunning = [bool]$Req.keep_running }
+    $stepEnv = Get-SvcReqEnv $Req
     $inFile = Join-Path $SvcDir 'empty.in'
     foreach ($f in @($outFile, $errFile)) { if ($f -and (Test-Path $f)) { Remove-Item $f -Force } }
     [System.IO.File]::WriteAllText($inFile, '')
@@ -80,7 +106,7 @@ function Invoke-SvcRun($Req) {
     # run as another user (not logged on): SYSTEM logs that account on and starts the program
     # with its token; output still captured. No desktop.
     if ($runUser) {
-        return (Invoke-SvcRunAs $file $argLine $cwd $outFile $errFile $runUser $runPass $runDomain $timeout $keepRunning)
+        return (Invoke-SvcRunAs $file $argLine $cwd $outFile $errFile $runUser $runPass $runDomain $timeout $keepRunning $stepEnv)
     }
 
     $sp = @{ FilePath = $file; PassThru = $true; NoNewWindow = $true;
@@ -88,7 +114,8 @@ function Invoke-SvcRun($Req) {
     if ($cwd -and (Test-Path -LiteralPath $cwd)) { $sp['WorkingDirectory'] = $cwd }
     if ($argLine) { $sp['ArgumentList'] = $argLine }
     $t0 = [DateTime]::Now
-    $proc = Start-Process @sp
+    $oldEnv = Set-SvcEnv $stepEnv
+    try { $proc = Start-Process @sp } finally { Restore-SvcEnv $oldEnv }
     try { $null = $proc.Handle } catch { }
     $deadline = $t0.AddSeconds([Math]::Max(5, $timeout))
     $timedOut = $false
@@ -159,11 +186,37 @@ public static class WtlRunAs {
         return h;
     }
 
-    // Run CMDLINE as DOMAIN\USER (DOMAIN "." = a local account). Returns { state, code, pid }:
+    // The user's environment block ENV with EXTRA ("NAME=value") added or replaced, as a new
+    // block (sorted, case-insensitive, as Windows keeps it); free it with Marshal.FreeHGlobal.
+    static IntPtr MergeEnv(IntPtr env, string[] extra) {
+        System.Collections.Generic.SortedDictionary<string, string> d =
+            new System.Collections.Generic.SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (env != IntPtr.Zero) {
+            long at = env.ToInt64();
+            while (true) {
+                string s = Marshal.PtrToStringUni(new IntPtr(at));
+                if (string.IsNullOrEmpty(s)) break;
+                int eq = s.IndexOf('=', 1);   // from 1: "=C:=C:\" entries start with '='
+                if (eq > 0) d[s.Substring(0, eq)] = s.Substring(eq + 1);
+                at += (s.Length + 1) * 2;
+            }
+        }
+        foreach (string kv in extra) {
+            int eq = kv.IndexOf('=');
+            if (eq > 0) d[kv.Substring(0, eq)] = kv.Substring(eq + 1);
+        }
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        foreach (System.Collections.Generic.KeyValuePair<string, string> p in d) sb.Append(p.Key).Append('=').Append(p.Value).Append('\0');
+        sb.Append('\0');
+        return Marshal.StringToHGlobalUni(sb.ToString());
+    }
+
+    // Run CMDLINE as DOMAIN\USER (DOMAIN "." = a local account), with EXTRAENV ("NAME=value")
+    // added to the user's environment. Returns { state, code, pid }:
     // state 0 = exited with code, 1 = still running after timeoutMs (left running; the caller
     // stops it or keeps it).
     public static long[] Run(string user, string domain, string password, string cmdline, string cwd,
-                             string outPath, string errPath, string inPath, int timeoutMs) {
+                             string outPath, string errPath, string inPath, int timeoutMs, string[] extraEnv) {
         IntPtr token;
         // an interactive logon gives the usual user token; batch, then network, where the user
         // may not log on interactively (e.g. a plain domain user on a DC)
@@ -177,6 +230,8 @@ public static class WtlRunAs {
         bool profLoaded = LoadUserProfile(token, ref prof);
         IntPtr env;
         if (!CreateEnvironmentBlock(out env, token, false)) env = IntPtr.Zero;
+        IntPtr merged = IntPtr.Zero;
+        if (extraEnv != null && extraEnv.Length > 0) merged = MergeEnv(env, extraEnv);
         IntPtr hIn = Open(inPath, false), hOut = Open(outPath, true), hErr = Open(errPath, true);
         PROCESS_INFORMATION pi;
         try {
@@ -186,11 +241,12 @@ public static class WtlRunAs {
             si.dwFlags = 0x100;   // STARTF_USESTDHANDLES
             si.hStdInput = hIn; si.hStdOutput = hOut; si.hStdError = hErr;
             uint flags = 0x00000400 | 0x08000000;   // CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW
-            if (!CreateProcessAsUser(token, null, cmdline, IntPtr.Zero, IntPtr.Zero, true, flags, env, cwd, ref si, out pi))
+            if (!CreateProcessAsUser(token, null, cmdline, IntPtr.Zero, IntPtr.Zero, true, flags, merged != IntPtr.Zero ? merged : env, cwd, ref si, out pi))
                 throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "starting " + cmdline + " as " + domain + "\\" + user + " failed");
         } finally {
             CloseHandle(hIn); CloseHandle(hOut); CloseHandle(hErr);
             if (env != IntPtr.Zero) DestroyEnvironmentBlock(env);
+            if (merged != IntPtr.Zero) Marshal.FreeHGlobal(merged);
         }
         CloseHandle(pi.hThread);
         long state = 1, code = 0;
@@ -210,7 +266,7 @@ public static class WtlRunAs {
 # Run a program as another lab user (not the logged-on one): a domain user in an AD lab
 # ($Domain = the NetBIOS name), a local user in a workgroup lab ($Domain = '.').
 function Invoke-SvcRunAs([string]$File, [string]$ArgLine, [string]$Cwd, [string]$OutFile, [string]$ErrFile,
-                         [string]$User, [string]$Pass, [string]$Domain, [int]$Timeout, [bool]$KeepRunning) {
+                         [string]$User, [string]$Pass, [string]$Domain, [int]$Timeout, [bool]$KeepRunning, $StepEnv = @{}) {
     if (-not ('WtlRunAs' -as [type])) { Add-Type -TypeDefinition $SvcRunAsSource }
     if (-not $Domain) { $Domain = '.' }
     $inFile = Join-Path $SvcDir 'empty.in'
@@ -225,7 +281,8 @@ function Invoke-SvcRunAs([string]$File, [string]$ArgLine, [string]$Cwd, [string]
     if ($Cwd -and (Test-Path -LiteralPath $Cwd)) { $wd = $Cwd }
     $t0 = [DateTime]::Now
     $r = $null
-    try { $r = [WtlRunAs]::Run($User, $Domain, $Pass, $cmdline, $wd, $OutFile, $ErrFile, $inFile, [Math]::Max(5, $Timeout) * 1000) } catch {
+    [string[]]$extra = @($StepEnv.Keys | ForEach-Object { [string]$_ + '=' + [string]$StepEnv[$_] })
+    try { $r = [WtlRunAs]::Run($User, $Domain, $Pass, $cmdline, $wd, $OutFile, $ErrFile, $inFile, [Math]::Max(5, $Timeout) * 1000, $extra) } catch {
         return @{ ok = $false; error = "run as ${Domain}\${User} failed: $($_.Exception.Message)" }
     }
     $secs = [Math]::Round(([DateTime]::Now - $t0).TotalSeconds, 1)

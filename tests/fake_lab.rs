@@ -10,7 +10,8 @@
 //!
 //! Scripts on a mounted folder steer the fake guest: a file containing FAKE_EXIT=N exits N,
 //! FAKE_LAB_FAIL makes the guest report LAB_FAIL, FAKE_HANG stops the guest, FAKE_CRASH
-//! kills the VM.
+//! kills the VM. FAKE_VNC_STEAL=1 in the environment takes the asked VNC display before the
+//! fake QEMU binds it (another program won the race), so `-vnc ...,to=N` must move on.
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -211,6 +212,7 @@ fn fake_qemu(args: &[String]) -> i32 {
                 }
             }
             "-qmp" => m.qmp = Some(split_opts(&v)[0].clone()),
+            "-vnc" => fake_vnc(&v),
             "-netdev" if v.starts_with("dgram,id=lan0") => m.lan = true,
             _ => {}
         }
@@ -256,6 +258,33 @@ fn fake_qemu(args: &[String]) -> i32 {
 }
 
 static PIDFILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// the VNC port this fake QEMU listens on (for query-vnc), and the listeners it holds
+static VNC_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+static VNC_HELD: std::sync::OnceLock<Vec<std::net::TcpListener>> = std::sync::OnceLock::new();
+
+/// `-vnc HOST:N[,to=L]` like QEMU: listen on the first free port 5900+N .. 5900+L, else die.
+fn fake_vnc(v: &str) {
+    let mut parts = v.split(',');
+    let (host, disp) = parts.next().and_then(|hd| hd.rsplit_once(':')).unwrap_or_else(|| die(&format!("-vnc {}: bad address", v)));
+    let disp: u16 = disp.parse().unwrap_or_else(|_| die(&format!("-vnc {}: bad display", v)));
+    let to: u16 = parts.find_map(|p| p.strip_prefix("to=")).and_then(|x| x.parse().ok()).unwrap_or(disp).max(disp);
+    let mut held = Vec::new();
+    if std::env::var("FAKE_VNC_STEAL").is_ok() {
+        if let Ok(l) = std::net::TcpListener::bind((host, 5900 + disp)) {
+            held.push(l);
+        }
+    }
+    for d in disp..=to {
+        if let Ok(l) = std::net::TcpListener::bind((host, 5900 + d)) {
+            held.push(l);
+            let _ = VNC_PORT.set(5900 + d);
+            let _ = VNC_HELD.set(held);
+            return;
+        }
+    }
+    die(&format!("-vnc {}: Failed to find an available port: Address already in use", v))
+}
 
 /// Exit the fake VM (unregistering it from the leak tracker first).
 fn fake_exit(code: i32) -> ! {
@@ -348,6 +377,16 @@ fn qmp_conn(c: Box<dyn ReadWrite>, shared: Arc<Mutex<Shared>>, no_shutdown: bool
                     shared.lock().unwrap().status = "shutdown".into();
                 });
             }
+            "query-vnc" => match VNC_PORT.get() {
+                Some(p) => send(
+                    &mut w,
+                    &format!(
+                        r#"{{"return": {{"enabled": true, "host": "127.0.0.1", "family": "ipv4", "service": "{}", "auth": "none", "clients": []}}}}"#,
+                        p
+                    ),
+                ),
+                None => send(&mut w, r#"{"return": {"enabled": false}}"#),
+            },
             "system_reset" => {
                 shared.lock().unwrap().status = "running".into();
                 send(&mut w, r#"{"return": {}}"#);
@@ -1306,6 +1345,30 @@ fn driver(args: &[String]) -> i32 {
         c.file(&st.join("CL1-0.qcow2"));
     });
 
+    scenario(&mut cx, "VNC: a display taken after wtl picked it -> QEMU's next free one is shown", &|cx, c, outs| {
+        // another program (another lab booting) takes the display between wtl's check and
+        // QEMU's start: QEMU moves on (to=99), and wtl reports the port QEMU really has
+        let i = run(cx, outs, &["up", "tri"], &[("FAKE_VNC_STEAL", "1")]);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        let argv = std::fs::read_to_string(&cx.fake_log).unwrap_or_default();
+        let line = argv.lines().rfind(|l| l.contains("lab-tri-CL1")).unwrap_or("").replace('\u{1f}', " ");
+        let asked: Option<u16> = line.split("-vnc 127.0.0.1:").nth(1).and_then(|r| r.split(",to=99").next()).and_then(|n| n.parse().ok());
+        c.ok(asked.is_some(), format!("CL1 argv should have -vnc 127.0.0.1:N,to=99: {}", line));
+        let shown: Option<u16> =
+            o.text.lines().find_map(|l| l.split("CL1 started (VNC 127.0.0.1:").nth(1)).and_then(|r| r.trim_end_matches(')').parse().ok());
+        c.ok(
+            matches!((asked, shown), (Some(a), Some(s)) if s > 5900 + a),
+            format!("asked display {:?}, shown port {:?}: should be past the stolen one", asked, shown),
+        );
+        let vnc_file = std::fs::read_to_string(cx.state("tri").join("CL1.vnc")).unwrap_or_default();
+        c.ok(shown.is_some_and(|p| vnc_file.trim() == format!("VNC 127.0.0.1:{}", p)), format!("CL1.vnc {:?}", vnc_file));
+        let i = run(cx, outs, &["status", "tri"], &[]);
+        c.has(&outs[i].1, vnc_file.trim());
+        let i = run(cx, outs, &["restore", "tri"], &[]);
+        c.code(&outs[i].1, 0);
+    });
+
     scenario(&mut cx, "rebuild deletes the 0 state; prepare rebuilds it", &|cx, c, outs| {
         let st = cx.state("tri");
         let i = run(cx, outs, &["rebuild", "tri"], &[]);
@@ -1469,6 +1532,80 @@ fn driver(args: &[String]) -> i32 {
         c.has(&outs[i].1, "lab solo (");
         c.has(&outs[i].1, "workgroup, 1 machines");
         c.has(&outs[i].1, "  WS1             single 2019    - running");
+        let i = run(cx, outs, &["restore", "solo"], &[]);
+        c.code(&outs[i].1, 0);
+    });
+
+    scenario(&mut cx, "run vars: extends, ${WTL_*}, the guest's env, secrets masked", &|cx, c, outs| {
+        std::fs::create_dir_all(cx.tmp.join("cfg/base")).unwrap();
+        // the base file's mount is relative to the base file (cfg/base/ -> ../../app)
+        cx.cfg(
+            "base/vars-base.json",
+            "{ \"vars\": { \"WTL_DIR\": \"../../app\", \"WTL_KEY\": { \"secret\": true }, \"WTL_TAG\": \"base\" },\n\
+               \"lab\": \"solo\", \"mount\": { \"X\": \"${WTL_DIR}\" },\n\
+               \"steps\": [ { \"as\": \"system\", \"run\": \"X:/setup.bat\", \"args\": \"-Key ${WTL_KEY} -Tag ${WTL_TAG} $env:PATH\" } ] }\n",
+        );
+        let conf = cx.cfg("vars.json", "{ \"extends\": \"./base/vars-base.json\", \"vars\": { \"WTL_TAG\": \"child\" } }\n");
+        // a required var that is not set: refused before anything starts
+        let i = run(cx, outs, &["run", &conf], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "WTL_KEY is not set");
+        let i = run(cx, outs, &["status", &conf], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "WTL_KEY is not set");
+
+        let env = [("WTL_KEY", "s3cr3t-value"), ("WTL_TAG", "fromenv")];
+        let i = run(cx, outs, &["run", &conf], &env);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        c.has(o, "[WS1 system] X:\\setup.bat -> exit 0");
+        c.lacks(o, "s3cr3t-value");
+        c.lacks(o, "built before run vars");
+        let st = cx.state("solo");
+        let iso = IsoReader::open(&st.join("WS1.iso"), true).unwrap();
+        let j: Value = serde_json::from_slice(iso.read("LAB/lab.json").unwrap()).unwrap();
+        // the guest gets every var with its real value, in declaration order
+        c.ok(
+            j["run"]["env"] == json!({ "WTL_DIR": "../../app", "WTL_KEY": "s3cr3t-value", "WTL_TAG": "fromenv" }),
+            format!("lab.json run.env {}", j["run"]["env"]),
+        );
+        let step1 = j["run"]["steps"][0].clone();
+        c.ok(step1["args"] == json!("-Key s3cr3t-value -Tag fromenv $env:PATH"), format!("step 1 {}", step1));
+        // result.json lists the values used, the secret as ***
+        let res = std::fs::canonicalize(st.join("last")).unwrap_or_default();
+        let raw = std::fs::read_to_string(res.join("result.json")).unwrap_or_default();
+        let rj: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+        c.ok(
+            rj["vars"] == json!({ "WTL_DIR": "../../app", "WTL_KEY": "***", "WTL_TAG": "fromenv" }),
+            format!("result.json vars {}", rj["vars"]),
+        );
+        c.ok(!raw.contains("s3cr3t-value"), "result.json has no secret");
+        // config.json is the run file as written
+        c.content(&res.join("config.json"), std::fs::read(&conf).unwrap_or_default().as_slice());
+
+        // a secret in an error message is masked too
+        let bad = cx.cfg(
+            "vars-bad.json",
+            "{ \"extends\": \"./base/vars-base.json\", \"steps\": [ { \"as\": \"system\", \"run\": \"X:/${WTL_KEY}.zip\" } ] }\n",
+        );
+        let i = run(cx, outs, &["run", &bad], &env);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "X:/***.zip");
+        c.lacks(&outs[i].1, "s3cr3t-value");
+
+        // a 0 state built before run vars: the SYSTEM worker cannot set them -> a warning
+        let zp = st.join("0-state.json");
+        let zero = std::fs::read_to_string(&zp).unwrap_or_default();
+        let mut z: Value = serde_json::from_str(&zero).unwrap_or(Value::Null);
+        c.ok(z["guest"] == json!(["step-env"]), format!("0-state.json {}", zero));
+        if let Some(m) = z.as_object_mut() {
+            m.remove("guest");
+        }
+        std::fs::write(&zp, z.to_string()).unwrap();
+        let i = run(cx, outs, &["run", &conf], &env);
+        c.code(&outs[i].1, 0);
+        c.has(&outs[i].1, "built before run vars");
+        std::fs::write(&zp, zero).unwrap();
         let i = run(cx, outs, &["restore", "solo"], &[]);
         c.code(&outs[i].1, 0);
     });

@@ -420,7 +420,7 @@ pub fn command(env: &Env, o: &Opts) -> Result<Vec<String>> {
     } else {
         push(&["-display", "none"]);
         if let Some(n) = o.vnc {
-            push(&["-vnc", &format!("127.0.0.1:{}", n)]);
+            push(&["-vnc", &vnc_arg(n)]);
         }
     }
     if let Some(p) = &o.pidfile {
@@ -515,7 +515,7 @@ pub fn command_arm64(env: &Env, o: &Opts) -> Result<Vec<String>> {
     } else {
         push(&["-display", "none"]);
         if let Some(n) = o.vnc {
-            push(&["-vnc", &format!("127.0.0.1:{}", n)]);
+            push(&["-vnc", &vnc_arg(n)]);
         }
     }
     if let Some(p) = &o.pidfile {
@@ -543,6 +543,16 @@ pub fn shell_quote(s: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// The last VNC display QEMU may take (port 5999).
+pub const VNC_LAST_DISPLAY: u16 = 99;
+
+/// `-vnc` for display N: QEMU takes the first free display from N up to [`VNC_LAST_DISPLAY`]
+/// itself, so two labs starting at once never fight over one port; ask it which one it got
+/// with [`crate::qmp::Qmp::vnc_port`].
+fn vnc_arg(n: u16) -> String {
+    format!("127.0.0.1:{},to={}", n, VNC_LAST_DISPLAY.max(n))
 }
 
 /// Start ARGV in the background (own session, so a terminal Ctrl-C reaches only us; the VM
@@ -607,7 +617,7 @@ mod tests {
             ..Default::default()
         };
         let got: Vec<String> = command(&env(), &o).unwrap().iter().map(|a| shell_quote(a)).collect();
-        let want = r"qemu-system-x86_64 -name lab-school-CL1 -machine pc -m 4096 -smp 2 -enable-kvm -cpu host\,hv_relaxed\,hv_spinlocks=0x1fff\,hv_vapic\,hv_time -rtc base=localtime -vga std -usb -device usb-tablet -device ich9-ahci\,id=ahci -drive id=disk0\,if=none\,format=qcow2\,file=/home/u/my\ labs/labs/state/school/CL1.qcow2\,cache=writeback\,discard=unmap\,detect-zeroes=unmap -device ide-hd\,drive=disk0\,bus=ahci.0 -drive file=/home/u/my\ labs/labs/state/school/CL1.iso\,media=cdrom\,if=ide\,index=0\,readonly=on -drive file=/home/u/my\ labs/labs/state/school/mount-CL1-X.iso\,media=cdrom\,if=ide\,index=1\,readonly=on -netdev user\,id=net0 -device e1000\,netdev=net0 -netdev dgram\,id=lan0\,remote.type=inet\,remote.host=239.77.30.1\,remote.port=47030\,local.type=inet\,local.host=127.0.0.1\,local.port=47030 -device e1000\,netdev=lan0\,mac=52:54:00:4c:41:11 -serial file:/home/u/my\ labs/labs/state/school/CL1.serial.log -qmp unix:/home/u/my\ labs/labs/state/school/CL1.qmp\,server=on\,wait=off -boot order=c -display none -vnc 127.0.0.1:11 -no-shutdown";
+        let want = r"qemu-system-x86_64 -name lab-school-CL1 -machine pc -m 4096 -smp 2 -enable-kvm -cpu host\,hv_relaxed\,hv_spinlocks=0x1fff\,hv_vapic\,hv_time -rtc base=localtime -vga std -usb -device usb-tablet -device ich9-ahci\,id=ahci -drive id=disk0\,if=none\,format=qcow2\,file=/home/u/my\ labs/labs/state/school/CL1.qcow2\,cache=writeback\,discard=unmap\,detect-zeroes=unmap -device ide-hd\,drive=disk0\,bus=ahci.0 -drive file=/home/u/my\ labs/labs/state/school/CL1.iso\,media=cdrom\,if=ide\,index=0\,readonly=on -drive file=/home/u/my\ labs/labs/state/school/mount-CL1-X.iso\,media=cdrom\,if=ide\,index=1\,readonly=on -netdev user\,id=net0 -device e1000\,netdev=net0 -netdev dgram\,id=lan0\,remote.type=inet\,remote.host=239.77.30.1\,remote.port=47030\,local.type=inet\,local.host=127.0.0.1\,local.port=47030 -device e1000\,netdev=lan0\,mac=52:54:00:4c:41:11 -serial file:/home/u/my\ labs/labs/state/school/CL1.serial.log -qmp unix:/home/u/my\ labs/labs/state/school/CL1.qmp\,server=on\,wait=off -boot order=c -display none -vnc 127.0.0.1:11\,to=99 -no-shutdown";
         assert_eq!(got.join(" "), want);
     }
 

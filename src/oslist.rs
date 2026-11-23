@@ -15,8 +15,8 @@ pub struct OsInfo {
     pub arch: String,
     pub fallback_index: String,
     pub min_disk_gb: String,
-    /// how the base image is made: "iso" (install from an ISO, the default) or "vhd:<hint>"
-    /// (import a pre-installed .vhd whose path contains <hint>, for OSes with no usable install
+    /// how the base image is made: `iso` (install from an ISO, the default) or `vhd:<hint>`
+    /// (import a pre-installed .vhd whose path contains `<hint>`, for OSes with no usable install
     /// ISO: Server 2003, 2008 R2). See [`OsInfo::vhd_hint`]. A vhd source can carry `+option`s:
     /// `+enter` ([`OsInfo::press_enter`]), `+nousb` ([`OsInfo::no_usb`]).
     pub source: String,
@@ -29,7 +29,7 @@ impl OsInfo {
         self.source.starts_with("vhd")
     }
 
-    /// For a "vhd:<hint>[+option...]" source, the <hint> (a substring of the .vhd's path); empty if none.
+    /// For a `vhd:<hint>[+option...]` source, the `<hint>` (a substring of the .vhd's path); empty if none.
     pub fn vhd_hint(&self) -> &str {
         let s = self.source.strip_prefix("vhd:").unwrap_or("");
         s.split('+').next().unwrap_or("")

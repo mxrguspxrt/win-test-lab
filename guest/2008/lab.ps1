@@ -423,6 +423,15 @@ function Set-LabMounts($Mounts) {
 # foreground), or "user" (another local lab user, started by the worker with its password).
 # Each LAB_STEP carries machine= so the host can tell the machines' reports apart.
 
+# The run's vars (lab.json run.env) as a hashtable: WTL_NAME -> value.
+function Get-LabRunEnv($Cfg) {
+    $h = @{}
+    if ($Cfg.run -ne $null -and $Cfg.run.env -ne $null) {
+        foreach ($k in @($Cfg.run.env.Keys)) { $h[[string]$k] = [string]$Cfg.run.env[$k] }
+    }
+    return $h
+}
+
 function Invoke-LabMemberSteps($Cfg) {
     $run = $Cfg.run
     $machine = [string]$Cfg.machine
@@ -431,6 +440,10 @@ function Invoke-LabMemberSteps($Cfg) {
     $defWait = 60; if ($run.wait) { try { $defWait = [int]$run.wait } catch { } }
 
     Set-LabMounts $run.mounts
+    # the run's vars, in the environment of every step started here (the logged-on user's);
+    # the SYSTEM worker gets them with each request
+    $runEnv = Get-LabRunEnv $Cfg
+    foreach ($k in $runEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $runEnv[$k], 'Process') }
 
     $n = 0
     foreach ($s in $steps) {
@@ -456,7 +469,7 @@ function Invoke-LabMultiStep($Cfg, [string]$Machine, [int]$N, $S, [int]$TimeoutS
     if (-not $cwd) { $cwd = ($path.Substring(0, 2) + '\') }
 
     $req = @{ action = 'run'; path = $path; cwd = $cwd; timeout = $TimeoutS; out = $out; err = $err;
-              args = $argsLine; keep_running = $keep }
+              args = $argsLine; keep_running = $keep; env = (Get-LabRunEnv $Cfg) }
     if ($as -eq 'user') {
         $req['user'] = [string]$S.user
         $req['password'] = [string]$S.password

@@ -8,6 +8,7 @@
 '
 '   <id>.req   action=mount  letter=X
 '              action=run    path=.. args=.. cwd=.. timeout=60 out=.. err=.. keep_running=0|1
+'                            [env.WTL_NAME=..]...   (the run's vars, set for the program)
 '   <id>.res   ok=1 [letter=X:] [exit=N secs=S] [timed_out=1 secs=S] [running=1 secs=S]
 '              ok=0 error=..
 
@@ -57,8 +58,36 @@ Sub SvcMount(req, res)
 End Sub
 
 ' action=run: run a program as SYSTEM, capture its output, wait for it up to its timeout
+' Set each NAME -> value of the Dictionary D in this process's environment (the program started
+' next inherits it); returns the old values ("" = was not set) for SvcRestoreEnv.
+Function SvcSetEnv(d)
+  Dim pe, k, old
+  Set pe = gSh.Environment("PROCESS")
+  Set old = NewDict()
+  For Each k In d.Keys
+    old(k) = pe(k)
+    pe(k) = CStr(d(k))
+  Next
+  Set SvcSetEnv = old
+End Function
+
+Sub SvcRestoreEnv(old)
+  Dim pe, k
+  Set pe = gSh.Environment("PROCESS")
+  On Error Resume Next
+  For Each k In old.Keys
+    If old(k) = "" Then
+      pe.Remove k
+    Else
+      pe(k) = old(k)
+    End If
+  Next
+  Err.Clear
+  On Error GoTo 0
+End Sub
+
 Sub SvcRun(id, req, res)
-  Dim state, exitCode, secs, errMsg, keep, timeoutS
+  Dim state, exitCode, secs, errMsg, keep, timeoutS, stepEnv, oldEnv, k
   If req("user") <> "" Then
     res("ok") = "0"
     res("error") = "running a step as another user is not supported on Windows Server 2003 yet (use system or the logon user)"
@@ -68,7 +97,13 @@ Sub SvcRun(id, req, res)
   timeoutS = 60
   If IsNumeric(req("timeout")) Then timeoutS = CLng(req("timeout"))
   If timeoutS < 5 Then timeoutS = 5
+  Set stepEnv = NewDict()
+  For Each k In req.Keys
+    If LCase(Left(k, 4)) = "env." Then stepEnv(Mid(k, 5)) = req(k)
+  Next
+  Set oldEnv = SvcSetEnv(stepEnv)
   state = RunProgram("svc" & id, req("path"), req("args"), req("cwd"), req("out"), req("err"), timeoutS, keep, exitCode, secs, errMsg)
+  SvcRestoreEnv oldEnv
   Select Case state
     Case "exit"
       res("ok") = "1"
