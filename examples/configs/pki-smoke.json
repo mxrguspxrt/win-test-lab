@@ -7,6 +7,6 @@
     { "on": "DC1", "as": "system",  "run": "X:/dhcp-scope.ps1" },
     { "on": "CL1", "as": "system",  "run": "X:/computer-cert.ps1" },
     { "on": "CL1", "as": "student", "run": "X:/user-cert.ps1" },
-    { "on": "CL1", "as": "student", "run": "X:/web.ps1" }
+    { "on": "CL1", "as": "student", "run": "X:/web.ps1", "args": "-Url http://${WTL_HOST_CA1}/" }
   ]
 }

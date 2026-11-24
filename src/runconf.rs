@@ -30,6 +30,7 @@ pub const RESERVED: &[&str] = &[
     "WTL_ENVIRONMENT_ID",
     "WTL_MACHINE",
     "WTL_RUN_ID",
+    "WTL_HOSTNAME",
     "WTL_HOME",
     "WTL_ROOT",
     "WTL_CONFIG",
@@ -174,7 +175,7 @@ pub fn check_var_name(name: &str) -> std::result::Result<(), String> {
     if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_') {
         return Err(format!("{:?} must be WTL_ followed by A-Z 0-9 _ (e.g. WTL_OS)", name));
     }
-    if RESERVED.contains(&name) {
+    if RESERVED.contains(&name) || name.starts_with("WTL_HOST_") {
         return Err(format!("{} is one of wtl's own settings; pick another name", name));
     }
     Ok(())
@@ -200,6 +201,12 @@ pub fn substitute(s: &str, vars: &IndexMap<String, String>) -> std::result::Resu
         if let Some(after) = at.strip_prefix("${") {
             if let Some(end) = after.find('}') {
                 let name = &after[..end];
+                // ${WTL_HOST_<KEY>}: a machine's computer name, filled in once the lab is known
+                if name.starts_with("WTL_HOST_") {
+                    out.push_str(&at[..2 + end + 1]);
+                    rest = &after[end + 1..];
+                    continue;
+                }
                 if is_var_ref(name) {
                     match vars.get(name) {
                         Some(v) => out.push_str(v),
@@ -212,6 +219,33 @@ pub fn substitute(s: &str, vars: &IndexMap<String, String>) -> std::result::Resu
         }
         out.push('$');
         rest = &at[1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// `${WTL_HOST_<KEY>}` in `s`: each machine's computer name (`hosts`: `WTL_HOST_CL1` ->
+/// `CL1-EXP42`), once the lab is known; [`substitute`] leaves them for this. An unknown machine is
+/// an error.
+pub fn substitute_hosts(s: &str, hosts: &IndexMap<String, String>) -> std::result::Result<String, String> {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("${WTL_HOST_") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[i..]);
+            return Ok(out);
+        };
+        let name = &after[..end];
+        match hosts.get(name) {
+            Some(h) => out.push_str(h),
+            None => {
+                let have: Vec<String> = hosts.keys().map(|k| format!("${{{}}}", k)).collect();
+                return Err(format!("${{{}}} is no machine of the lab ({})", name, have.join(" ")));
+            }
+        }
+        rest = &after[end + 1..];
     }
     out.push_str(rest);
     Ok(out)
@@ -292,6 +326,11 @@ mod tests {
         assert_eq!(substitute("${WTL_A}", &tricky).unwrap(), "${WTL_B}\"}");
         let e = substitute("${WTL_OSS}", &v).unwrap_err();
         assert!(e.contains("${WTL_OSS} is not declared"), "{}", e);
+        // machine names are left for later, then filled in
+        assert_eq!(substitute("http://${WTL_HOST_CA1}/x", &v).unwrap(), "http://${WTL_HOST_CA1}/x");
+        let hosts = vars(&[("WTL_HOST_CA1", "CA1-EXP42")]);
+        assert_eq!(substitute_hosts("http://${WTL_HOST_CA1}/x", &hosts).unwrap(), "http://CA1-EXP42/x");
+        assert!(substitute_hosts("${WTL_HOST_NOPE}", &hosts).unwrap_err().contains("no machine of the lab"));
     }
 
     #[test]
@@ -302,6 +341,8 @@ mod tests {
             assert!(check_var_name(bad).unwrap_err().contains("must be WTL_"), "{}", bad);
         }
         assert!(check_var_name("WTL_PASSWORD").unwrap_err().contains("wtl's own settings"));
+        assert!(check_var_name("WTL_HOST_CA1").unwrap_err().contains("wtl's own settings"));
+        assert!(check_var_name("WTL_HOSTNAME").unwrap_err().contains("wtl's own settings"));
     }
 
     /// Every setting `wtl` seeds from the environment is reserved.

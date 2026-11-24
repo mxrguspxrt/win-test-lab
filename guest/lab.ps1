@@ -32,11 +32,19 @@ function Set-LabPhase([string]$Phase) {
 
 function Send-LabPhase([string]$Text) { Send-WtlEvent 'LAB_PHASE' @() $Text }
 
-# multi-machine labs only: rename this Windows box to its lab machine key ($Cfg.machine) and reboot.
+# The Windows computer name this machine should have: lab.json's "hostname" (the lab key, the lab
+# file's "hostname", or an environment's own), else its key ("machine") from an older wtl.
+function Get-LabHostname($Cfg) {
+    $h = [string]$Cfg.hostname
+    if ($h) { return $h }
+    return [string]$Cfg.machine
+}
+
+# multi-machine labs only: rename this Windows box to its computer name (Get-LabHostname) and reboot.
 # Returns $true if a rename+reboot was started (caller should stop and let the reboot happen), $false
 # if the name already matches or no machine key is set.
 function Rename-LabComputer($Cfg) {
-    $want = [string]$Cfg.machine
+    $want = Get-LabHostname $Cfg
     if (-not $want -or $env:COMPUTERNAME -eq $want) { return $false }
     Set-LabShutdownFriendly
     Send-LabPhase "renaming this computer $env:COMPUTERNAME -> $want, then reboot"
@@ -238,7 +246,9 @@ function Install-LabRoles($Cfg) {
 
 # AD CS Enterprise Root CA (needs a domain; runs as a domain/enterprise admin). Idempotent: a
 # second build run finds the CA already installed and only (re)publishes templates + the GPO.
-function Install-LabAdCs($Cfg) {
+# -Again: a CA reinstalled after its host was renamed (an environment's rename): a new key,
+# database and AD objects under the same CA name.
+function Install-LabAdCs($Cfg, [switch]$Again) {
     $o = $Cfg.ad_cs
     $caName = [string]$o.ca_name
     $keyLen = 2048; if ($o.key_length) { try { $keyLen = [int]$o.key_length } catch { } }
@@ -247,10 +257,11 @@ function Install-LabAdCs($Cfg) {
     $f = Install-WindowsFeature -Name ADCS-Cert-Authority -IncludeManagementTools
     if (-not $f.Success) { throw "Install-WindowsFeature ADCS-Cert-Authority failed, exit code $($f.ExitCode)" }
     Import-Module ADCSDeployment -ErrorAction SilentlyContinue
+    $ca = @{ CAType = 'EnterpriseRootCA'; CACommonName = $caName; KeyLength = $keyLen; HashAlgorithmName = 'SHA256';
+             ValidityPeriod = 'Years'; ValidityPeriodUnits = $years; Force = $true; ErrorAction = 'Stop' }
+    if ($Again) { $ca['OverwriteExistingKey'] = $true; $ca['OverwriteExistingDatabase'] = $true; $ca['OverwriteExistingCAinDS'] = $true }
     try {
-        Install-AdcsCertificationAuthority -CAType EnterpriseRootCA -CACommonName $caName `
-            -KeyLength $keyLen -HashAlgorithmName SHA256 -ValidityPeriod Years -ValidityPeriodUnits $years `
-            -Force -ErrorAction Stop
+        Install-AdcsCertificationAuthority @ca
     } catch {
         $m = [string]$_.Exception.Message
         # 0x80070542 / "already installed": fine on a rebuild
@@ -410,6 +421,12 @@ function Install-LabDhcp($Cfg) {
 
 # IIS: Web-Server + the management console (+ ASP.NET 4.5 where available), the default site
 # serving a test page at http://<machine>/.
+# The IIS test page: names this computer, so a renamed machine writes it again.
+function Write-LabIisPage([string]$Path) {
+    $html = "<html><head><title>win-test-lab</title></head><body><h1>win-test-lab</h1><p>IIS on $env:COMPUTERNAME is up.</p></body></html>"
+    [System.IO.File]::WriteAllText((Join-Path $Path 'index.html'), $html)
+}
+
 function Install-LabIis($Cfg) {
     $o = $Cfg.iis
     Send-WtlEvent 'LAB_ROLE' @('name', 'iis', 'state', 'installing')
@@ -420,11 +437,7 @@ function Install-LabIis($Cfg) {
     $path = [string]$o.site_path
     if (-not $path) { $path = 'C:\inetpub\wwwroot' }
     if (-not (Test-Path -LiteralPath $path)) { New-Item -ItemType Directory -Path $path -Force | Out-Null }
-    $index = Join-Path $path 'index.html'
-    if (-not (Test-Path -LiteralPath $index)) {
-        $html = "<html><head><title>win-test-lab</title></head><body><h1>win-test-lab</h1><p>IIS on $env:COMPUTERNAME is up.</p></body></html>"
-        [System.IO.File]::WriteAllText($index, $html)
-    }
+    if (-not (Test-Path -LiteralPath (Join-Path $path 'index.html'))) { Write-LabIisPage $path }
     try { iisreset.exe /start | Out-Null } catch { }
     Send-WtlEvent 'LAB_ROLE' @('name', 'iis', 'state', 'ready', 'path', $path)
 }
@@ -600,7 +613,7 @@ function Invoke-LabClient($Cfg, [string]$LabDir) {
     $pass = [string]$Cfg.logon_password
     if (-not $user) { $user = 'Administrator'; $pass = [string]$Cfg.admin_password }
     $realm = [string]$Cfg.netbios
-    if (-not $ad) { $realm = [string]$Cfg.machine }
+    if (-not $ad) { $realm = Get-LabHostname $Cfg }
     if ($phase -eq 'new') {
         Set-LabNetwork $Cfg
         Set-LabShutdownFriendly
@@ -613,9 +626,9 @@ function Invoke-LabClient($Cfg, [string]$LabDir) {
         }
         Set-LabLocalAdmin $Cfg
         if (-not $ad) {
-            # workgroup: local users + groups, rename to the machine key; one reboot
+            # workgroup: local users + groups, rename to the computer name; one reboot
             New-LabLocalUsers $Cfg
-            $want = [string]$Cfg.machine
+            $want = Get-LabHostname $Cfg
             if ($want -and $env:COMPUTERNAME -ne $want) {
                 Send-LabPhase "renaming this computer $env:COMPUTERNAME -> $want"
                 Rename-Computer -NewName $want -Force -ErrorAction Stop -WarningAction SilentlyContinue
@@ -638,7 +651,7 @@ function Invoke-LabClient($Cfg, [string]$LabDir) {
         # multi-machine lab: rename to the machine key as we join (one reboot does both) so the
         # Windows computer name matches the lab's machine name.
         $join = @{ DomainName = [string]$Cfg.domain; Credential = $cred; Force = $true; ErrorAction = 'Stop'; WarningAction = 'SilentlyContinue' }
-        $want = [string]$Cfg.machine
+        $want = Get-LabHostname $Cfg
         if ($want -and $env:COMPUTERNAME -ne $want) { $join['NewName'] = $want }
         # DNS answers before the new DC finishes its first boot ("Applying computer settings" takes
         # 5-10 min on 2016/2019): keep trying for 20 min
@@ -910,6 +923,176 @@ function Invoke-LabStepForeground([int]$N, [string]$Path, [string]$ArgsLine, [st
     return @{ ok = $true; exit = (Get-ExitCodeSafe $proc); secs = $secs }
 }
 
+# ---------------------------------------------------------------- renames
+
+# The boot that renames an environment's machines (wtl up LAB --new --rename). The disc's
+# "rename": from, to (the same on a machine that only gets new certificates), ca, ca_name, dhcp,
+# iis_site_path, reenroll, reenroll_user, admin (the rest needs the domain Administrator's
+# session), peers (the DC only). Driven by what the machine is now, so every reboot simply
+# continues: its current name, the phase in C:\WTL\lab-state.json. The privileged parts of a
+# member run in rename.ps1 (on this disc) as SYSTEM through the worker; the DC's logon is the
+# domain Administrator, so it does its part itself.
+#   workgroup machine, member: renamed (a workgroup's autologon realm too), 1 reboot
+#   DC: netdom adds the new name and makes it primary, reboot, then removes the old one
+#   a CA host: its CA uninstalled, renamed, then logged on as the domain Administrator (phase
+#     rename-admin, like the build's configure) to install the CA again, back to its user
+#   then: DHCP authorized under the new name, the IIS page, the machine's certificates (and,
+#     with a new CA, the user's) requested again; LAB_RENAMED
+# Returns 'renamed' (go on as on any boot) or 'reboot'.
+function Invoke-LabRename($Cfg, [string]$LabDir) {
+    $rn = $Cfg.rename
+    $to = [string]$rn.to
+    $from = [string]$rn.from
+    $dc = ([string]$Cfg.role -eq 'dc')
+    if ((Get-LabPhase) -eq 'rename-admin') {
+        # logged on as the domain Administrator: what needs the domain's rights
+        Send-LabPhase "renamed to $env:COMPUTERNAME; as the domain Administrator now"
+        if ($rn.ca) { Install-LabAdCs $Cfg -Again }
+        if ($rn.dhcp) { Update-LabDhcpName $Cfg $from }
+        $user = [string]$Cfg.logon_user; $pass = [string]$Cfg.logon_password
+        if (-not $user) { $user = 'Administrator'; $pass = [string]$Cfg.admin_password }
+        Set-LabAutoLogon ([string]$Cfg.netbios) $user $pass
+        Set-LabPhase 'joined'
+        Send-WtlEvent 'LAB_REBOOT' @('phase', 'rename-admin')
+        Restart-Computer -Force
+        return 'reboot'
+    }
+    if ($env:COMPUTERNAME -ne $to) {
+        Send-LabPhase "renaming this computer $env:COMPUTERNAME -> $to"
+        if ($dc) {
+            Set-LabShutdownFriendly
+            if ($rn.ca) { Uninstall-LabCa }
+            $fqdn = "$to.$($Cfg.domain)"
+            $have = (& netdom.exe computername "$env:COMPUTERNAME" /enumerate:alternatenames 2>&1 | Out-String)
+            if ($have -notmatch [regex]::Escape($fqdn)) { Invoke-LabNetdom @('computername', $env:COMPUTERNAME, "/add:$fqdn") }
+            Invoke-LabNetdom @('computername', $env:COMPUTERNAME, "/makeprimary:$fqdn")
+            Send-WtlEvent 'LAB_REBOOT' @('phase', 'rename')
+            Restart-Computer -Force
+            return 'reboot'
+        }
+        if ([string]$Cfg.mode -ne 'workgroup') { Wait-LabDc $Cfg }
+        $res = Invoke-LabRenameScript $Cfg $LabDir 'rename'
+        if (-not $res.ok -or [int]$res.exit -ne 0) { throw "renaming to ${to} failed: $(Get-LabRenameError $res)" }
+        Send-WtlEvent 'LAB_REBOOT' @('phase', 'rename')
+        return 'reboot'
+    }
+    # renamed: what depends on the name
+    if ($dc) {
+        if ($from -ne $to) {
+            $old = "$from.$($Cfg.domain)"
+            # right after the boot AD may not answer yet: retry
+            for ($i = 1; $i -le 30; $i++) {
+                $have = (& netdom.exe computername "$env:COMPUTERNAME" /enumerate:alternatenames 2>&1 | Out-String)
+                if ($have -notmatch [regex]::Escape($old)) { break }
+                & netdom.exe computername "$env:COMPUTERNAME" "/remove:$old" 2>&1 | Out-Null
+                Start-Sleep -Seconds 10
+            }
+            if ($rn.ca) { Install-LabAdCs $Cfg -Again }
+            if ($rn.dhcp) { Update-LabDhcpName $Cfg $from }
+            if ([string]$rn.iis_site_path) { Write-LabIisPage ([string]$rn.iis_site_path) }
+            [void](Test-LabNative 'ipconfig.exe' @('/registerdns'))
+        }
+    } else {
+        $res = Invoke-LabRenameScript $Cfg $LabDir 'finish'
+        if (-not $res.ok -or [int]$res.exit -ne 0) { Send-LabPhase "after the rename: $(Get-LabRenameError $res)" }
+        if ($rn.reenroll_user) {
+            # this session's user: the old CA's certificates go, the new CA's come at the pulse
+            Remove-LabCertsFrom 'CurrentUser' ([string]$rn.ca_name)
+            [void](Test-LabNative 'certutil.exe' @('-user', '-pulse'))
+        }
+    }
+    Send-WtlEvent 'LAB_RENAMED' @('machine', [string]$Cfg.machine, 'from', $from, 'to', $env:COMPUTERNAME)
+    return 'renamed'
+}
+
+# netdom.exe, retried for a while (AD Web Services and DNS are slow right after a boot)
+function Invoke-LabNetdom([string[]]$Arguments) {
+    $last = ''
+    for ($i = 1; $i -le 20; $i++) {
+        $out = & netdom.exe @Arguments 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0) { return }
+        $last = "exit $LASTEXITCODE $($out.Trim())"
+        Start-Sleep -Seconds 15
+    }
+    throw "netdom $($Arguments -join ' ') failed: $last"
+}
+
+# Uninstall this machine's CA (before its host is renamed); its role binaries stay.
+function Uninstall-LabCa {
+    Import-Module ADCSDeployment -ErrorAction SilentlyContinue
+    Send-LabPhase 'uninstalling the CA, to install it again under the new name'
+    try { Uninstall-AdcsCertificationAuthority -Force -ErrorAction Stop | Out-Null } catch {
+        if ("$($_.Exception.Message)" -notmatch 'not installed|0x80070002') { throw "uninstalling the CA: $($_.Exception.Message)" }
+    }
+}
+
+# Authorize this machine's DHCP server in AD under its new name (and drop the old one).
+function Update-LabDhcpName($Cfg, [string]$From) {
+    $domain = [string]$Cfg.domain
+    try { Remove-DhcpServerInDC -DnsName "$From.$domain" -IPAddress ([string]$Cfg.ip) -ErrorAction Stop } catch { }
+    Add-DhcpServerInDC -DnsName "$env:COMPUTERNAME.$domain" -IPAddress ([string]$Cfg.ip) -ErrorAction Stop
+    try { Restart-Service dhcpserver -Force -ErrorAction Stop } catch { }
+    Send-LabPhase "DHCP authorized as $env:COMPUTERNAME.$domain"
+}
+
+# Delete the certificates issued by the CA CaName from a store's My (CurrentUser or
+# LocalMachine), so the next auto-enrollment pulse requests them under the new name / CA.
+function Remove-LabCertsFrom([string]$Location, [string]$CaName) {
+    if (-not $CaName) { return }
+    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('My', $Location)
+    $store.Open('ReadWrite')
+    try {
+        foreach ($c in @($store.Certificates)) {
+            if ($c.Issuer -match ('CN=' + [regex]::Escape($CaName) + '(,|$)')) { $store.Remove($c) }
+        }
+    } finally { $store.Close() }
+}
+
+# Run rename.ps1 (on this disc) as SYSTEM through the worker: -Mode rename | finish.
+function Invoke-LabRenameScript($Cfg, [string]$LabDir, [string]$Mode) {
+    $runDir = 'C:\WTL\run'
+    if (-not (Test-Path $runDir)) { New-Item -ItemType Directory -Path $runDir -Force | Out-Null }
+    $req = @{ action = 'run'; path = (Join-Path $LabDir 'rename.ps1'); args = ('-Mode ' + $Mode + ' -LabDir "' + $LabDir + '"');
+              cwd = $runDir; timeout = 1800; out = (Join-Path $runDir "rename-$Mode.out"); err = (Join-Path $runDir "rename-$Mode.err");
+              keep_running = $false }
+    return (Invoke-SvcRequest $req 1900)
+}
+
+function Get-LabRenameError($Res) {
+    if (-not $Res.ok) { return [string]$Res.error }
+    $e = ''
+    foreach ($f in @('C:\WTL\run\rename-rename.err', 'C:\WTL\run\rename-finish.err')) {
+        try { $e += [System.IO.File]::ReadAllText($f) } catch { }
+    }
+    return "exit $($Res.exit) $($e.Trim())"
+}
+
+# The DC, at the end of a rename: once every renamed member registered its new name in DNS,
+# delete the members' old records (a renamed computer does not remove them), and its own old one
+# (netdom removes the old name from AD, not its A record; only now, when no member needs to find
+# the DC through a record that may still name it), LAB_DNS_CLEAN.
+function Clear-LabRenamedDns($Cfg) {
+    $peers = @($Cfg.rename.peers.PSObject.Properties)
+    $own = ([string]$Cfg.rename.from -ne [string]$Cfg.rename.to)
+    if ($peers.Count -eq 0 -and -not $own) { return }
+    $zone = [string]$Cfg.domain
+    $deadline = (Get-Date).AddMinutes(60)
+    foreach ($p in $peers) {
+        $old = [string]$p.Name; $new = [string]$p.Value
+        while (-not (Get-DnsServerResourceRecord -ZoneName $zone -Name $new -RRType A -ErrorAction SilentlyContinue)) {
+            if ((Get-Date) -ge $deadline) { throw "$new did not register in DNS within 60 min" }
+            Start-Sleep -Seconds 10
+        }
+        Remove-DnsServerResourceRecord -ZoneName $zone -Name $old -RRType A -Force -ErrorAction SilentlyContinue
+    }
+    $removed = @($peers | ForEach-Object { $_.Name })
+    if ($own) {
+        Remove-DnsServerResourceRecord -ZoneName $zone -Name ([string]$Cfg.rename.from) -RRType A -Force -ErrorAction SilentlyContinue
+        $removed += [string]$Cfg.rename.from
+    }
+    Send-WtlEvent 'LAB_DNS_CLEAN' @('removed', ($removed -join ','))
+}
+
 # ---------------------------------------------------------------- who am I
 
 # Tell programs in this machine where they run. Every up / run disc carries "instance" (lab,
@@ -949,6 +1132,11 @@ function Set-LabInstance($Cfg) {
 }
 
 function Invoke-LabMulti($Cfg, [string]$LabDir) {
+    # the boot that renames an environment's machines: first the rename, then as on any boot
+    if ($Cfg.rename -ne $null) {
+        $r = Invoke-LabRename $Cfg $LabDir
+        if ($r -ne 'renamed') { return $r }
+    }
     $role = [string]$Cfg.role
     if ($role -eq 'dc') {
         # the DC uses the same promotion path; Invoke-LabDc reads domain/netbios/users/ip/dc_ip
@@ -956,6 +1144,7 @@ function Invoke-LabMulti($Cfg, [string]$LabDir) {
         if ($r -ne 'ready') { return $r }
         # the DC also needs the SYSTEM worker baked, so it can run its own steps
         Register-LabSvc $LabDir
+        if ($Cfg.rename -ne $null) { Clear-LabRenamedDns $Cfg }
         Set-LabInstance $Cfg
         if ($Cfg.run -ne $null) { return (Invoke-LabMemberSteps $Cfg) }
         return 'ready'

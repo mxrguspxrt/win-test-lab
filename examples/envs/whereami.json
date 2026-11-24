@@ -3,12 +3,14 @@
   "vars": {
     "WTL_EXPECT_ENV": null,
     "WTL_EXPECT_ID": "",
+    "WTL_EXPECT_HOST": "",
+    "WTL_EXPECT_HOST_DC": "",
     "WTL_SYSTEM_VARS": ""
   },
   "lab": "single-2019",
   "mount": { "X": "./out" },
   "steps": [
-    { "run": "X:/whereami.exe", "args": "--env ${WTL_EXPECT_ENV} --id \"${WTL_EXPECT_ID}\" --vars" },
-    { "as": "system", "run": "X:/whereami.exe", "args": "--env ${WTL_EXPECT_ENV} --id \"${WTL_EXPECT_ID}\" ${WTL_SYSTEM_VARS}" }
+    { "run": "X:/whereami.exe", "args": "--env ${WTL_EXPECT_ENV} --id \"${WTL_EXPECT_ID}\" --hostname \"${WTL_EXPECT_HOST}\" --vars" },
+    { "as": "system", "run": "X:/whereami.exe", "args": "--env ${WTL_EXPECT_ENV} --id \"${WTL_EXPECT_ID}\" --hostname \"${WTL_EXPECT_HOST}\" ${WTL_SYSTEM_VARS}" }
   ]
 }

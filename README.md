@@ -21,6 +21,9 @@ win-test-lab (the `wtl` command) does the boring part for you:
   out of the results.
 - **On Linux, macOS and Windows.** One program, `wtl`, plus QEMU. No bash, Python, root or
   Samba needed. On a Mac it currently supports Windows 11 on Arm only (see below).
+- **Works extremely well with Claude Code and Claude Desktop.** Ask it to build your program,
+  run it on every Windows version you care about with `wtl run`, read the results and fix what
+  failed, in a loop, on its own. Try it: point it at this README and your project.
 
 ## What it looks like
 
@@ -91,22 +94,21 @@ A run file can take parameters, so one file serves every Windows version and eve
 {
   "vars": {
     "WTL_OS": "win11",
-    "WTL_MODE": "quick",
     "WTL_BUILD": null,
-    "WTL_LICENSE": { "secret": true }
+    "WTL_EXAMPLE_SECRET": { "secret": true }
   },
   "lab": "single-${WTL_OS}",
   "name": "smoke-${WTL_OS}",
   "mount": { "X": "${WTL_BUILD}" },
   "steps": [
-    { "as": "system", "run": "X:/setup.ps1", "args": "-Mode ${WTL_MODE} -License ${WTL_LICENSE}" },
+    { "as": "system", "run": "X:/setup.ps1", "args": "-Secret ${WTL_EXAMPLE_SECRET}" },
     { "run": "X:/smoke.exe" }
   ]
 }
 ```
 
 ```
-WTL_OS=2022 WTL_BUILD=./out WTL_LICENSE=ABCD-1234 wtl run smoke.json
+WTL_OS=2022 WTL_BUILD=./out WTL_EXAMPLE_SECRET=s3cr3t wtl run smoke.json
 for os in 2016 2019 2022 2025 win10 win11; do WTL_OS=$os WTL_BUILD=./out wtl run smoke.json; done
 ```
 
@@ -116,7 +118,7 @@ for os in 2016 2019 2022 2025 win10 win11; do WTL_OS=$os WTL_BUILD=./out wtl run
   names are replaced (a typo is an error), and only `WTL_` names exist, so a run file can never
   read anything else from your environment (`GITHUB_TOKEN`, cloud keys...).
 - **In Windows, too:** every declared variable is also set in each step's environment, so a
-  script can read `$env:WTL_MODE` (PowerShell) or `%WTL_MODE%` (batch), whether it runs as
+  script can read `$env:WTL_OS` (PowerShell) or `%WTL_OS%` (batch), whether it runs as
   SYSTEM, the logged-on user or another lab user.
 - **Secrets** are shown as `***` in `result.json`, in `wtl`'s output and in its error messages;
   Windows still gets the real value.
@@ -150,8 +152,9 @@ wtl up school --new --name exp42 --note "new installer on the 2016 client"
 ```
 
 Inside, an environment is exactly the lab: the same computer names (`DC1`, `CL1`), the same
-domain, IPs and CA. Nothing in Windows is renamed. What tells the copies apart is their name and
-id, which `wtl` and every machine in them know.
+domain, IPs and CA. What tells the copies apart is their name and id, which `wtl` and every
+machine in them know. If the computers need other names too, `--rename` gives them real ones
+(below).
 
 ```
 wtl list
@@ -184,6 +187,46 @@ wtl rm school-exp42                      # delete it: VMs, disks, results
   `--new` builds a new one); existing environments keep the 0 state they were made from (kept
   on disk until the last one using it is removed). `wtl rebuild school-exp42` makes that
   environment fresh again from the lab's current 0 state, with the same name, id and note.
+- **Copies of a copy.** `wtl up school-exp42 --new` copies an environment (with its names, see
+  below) in seconds, one level deep.
+
+### New computer names: `--rename`
+
+When the software under test reports its own computer name (to a server, in its logs), the
+copies need names of their own. `--rename` renames machines for real: `hostname`,
+`%COMPUTERNAME%` and every Windows API answer with the new name.
+
+```
+wtl up school --new --name exp42 --rename all      # DC1-EXP42, CL1-EXP42, CL2-EXP42
+wtl up school --new --rename CL1                    # only CL1: CL1-K7Q3 (the random suffix)
+wtl up single-2019 --new --name b7 --rename WS2019=BUILD7
+wtl run tests.json --new --rename CL1 --rm         # throwaway: renamed copy, run, results kept, deleted
+```
+
+- **What to rename:** `KEY=NAME` (that name), `KEY` (the key plus the environment's suffix:
+  `CL1-EXP42`), or `all`; repeat `--rename` or use commas. A machine you do not name keeps its
+  name. Names are checked before anything boots: 1-15 of `A-Z 0-9 -`, unique, never cut short
+  (a generated one that is too long is an error: name it, or use a shorter `--name`).
+- **It takes minutes, once.** The renamed copy boots once, renames its machines and is saved; every
+  run and `restore` after that starts renamed, as fast as any. A workgroup machine or a member
+  reboots once, the DC twice (`netdom`: the new name is added, made primary, the old one
+  removed; DHCP is authorized again under it).
+- **A CA host you rename gets its CA reinstalled** under the new name (Windows cannot rename a
+  CA's host): the same CA name and templates, and the members' certificates are requested again
+  from it. Leave the CA host out of `--rename` and it keeps its name and its CA, which is faster.
+  A renamed member gets a new machine certificate under its new name either way, and the DC
+  deletes the old names from DNS.
+- **Run files stay the same**: `"on": "CL1"` is always the lab's key. `${WTL_HOST_CA1}` in a
+  run file's `run`, `args` or `mount` is the machine's computer name, and every step gets
+  `WTL_HOSTNAME` (its own) and `WTL_HOST_<KEY>` (every machine's), so a test reaches
+  `http://${WTL_HOST_CA1}/` whatever the names are.
+- **`--rm`** (with `wtl run --new`) deletes the copy after the run, also when a step failed; its
+  results move into the lab's `runs/` first, as `<time>-<environment>`.
+- A lab file can also give a machine another computer name from the start (`"hostname"`, see
+  docs/CONFIG.md): a full build under that name.
+
+`wtl status` shows each machine's computer name next to its key, and `wtl rebuild` of a renamed
+environment renames it again from the lab's current 0 state.
 
 ### Where am I? Inside Windows
 
@@ -197,13 +240,16 @@ your program or test knows where it is running. At every boot `wtl` writes it to
   "environment": "school-exp42",
   "id": "c2e5a813",
   "machine": "CL1",
+  "hostname": "CL1-EXP42",
+  "hostnames": { "DC1": "DC1-EXP42", "CL1": "CL1-EXP42", "CL2": "CL2-EXP42" },
   "note": "new installer on the 2016 client",
   "run_id": "20261124-101500-c2e5a813"
 }
 ```
 
 and the same values to the registry (`HKLM\SOFTWARE\WinTestLab`) and to every step's environment
-(`WTL_ENVIRONMENT`, `WTL_ENVIRONMENT_ID`, `WTL_MACHINE`, `WTL_RUN_ID`):
+(`WTL_ENVIRONMENT`, `WTL_ENVIRONMENT_ID`, `WTL_MACHINE`, `WTL_HOSTNAME`, `WTL_HOST_<KEY>`,
+`WTL_RUN_ID`):
 
 ```powershell
 $me = Get-Content C:\WTL\instance.json | ConvertFrom-Json
@@ -221,7 +267,8 @@ reg query HKLM\SOFTWARE\WinTestLab /v Environment
 through all of it, one command at a time, with `whereami.exe`: a small program that checks
 inside each machine that the computer name, `instance.json`, the registry and the step
 variables all say the same, and `run-all.sh`, which runs the whole walkthrough with every
-result checked (on one machine, Server 2003, or an AD lab running next to its own copy).
+result checked (on one machine, Server 2003, or an AD lab running next to its own copy), with
+or without `--rename`.
 
 ## Which host runs what
 
@@ -433,9 +480,11 @@ The other way round, a Linux or Windows x64 host can run Windows 11 on Arm only 
 ## Commands
 
     wtl run CONFIG          restore, boot, mount, run the steps, report (exit 0 = all steps passed)
-                            (--lab ENV: in that environment; --new: in a fresh one)
+                            (--lab ENV: in that environment; --new: in a fresh one,
+                            with --rename too, and --rm to delete it afterwards)
     wtl up LAB              boot the lab from its 0 state and leave it running
-    wtl up LAB --new        spawn a new environment of the lab (--name N, --note TEXT)
+    wtl up LAB --new        spawn a new environment of the lab (--name N, --note TEXT,
+                            --rename KEY=NAME|KEY|all: real new computer names)
     wtl list                every lab and environment: id, running or off, note
     wtl status LAB          0 state, machines (running/off, VNC), last run (LAB/MACHINE: one)
     wtl restore LAB         stop and throw away everything since the 0 state

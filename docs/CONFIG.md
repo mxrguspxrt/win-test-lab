@@ -114,6 +114,7 @@ A **machine**:
 | `mem` | 3072 (DC), 4096 (others) | RAM in MB. |
 | `cpus` | 2 | Virtual CPUs. |
 | `ip` | DC `.10`, the others `.20`, `.21`, ... in file order | Static IP on the lab LAN: a full `a.b.c.d`, or just the last octet (`"55"` = `<subnet>.55`). Needs `network`. |
+| `hostname` | the machine's key | Its Windows computer name, when it is not the key: 1-15 of `A-Z 0-9 -`, unique, not the domain's NetBIOS name. Set during the build; run files still name the machine by its key. (For copies with other names, `wtl up LAB --new --rename`.) |
 
 A machine's Windows install comes from a base image: `images/<os>-dc.qcow2` for the DC,
 `images/<os>-client.qcow2` for every other machine (machines with the same OS share it).
@@ -252,21 +253,20 @@ environment when you run it.
 {
   "vars": {
     "WTL_OS": "single-win11",
-    "WTL_MODE": "quick",
     "WTL_BUILD_DIR": null,
-    "WTL_LICENSE": { "secret": true }
+    "WTL_EXAMPLE_SECRET": { "secret": true }
   },
   "lab": "${WTL_OS}",
   "name": "smoke-${WTL_OS}",
   "mount": { "X": "${WTL_BUILD_DIR}" },
   "steps": [
-    { "as": "system", "run": "X:/setup.ps1", "args": "-Mode ${WTL_MODE} -License ${WTL_LICENSE}" }
+    { "as": "system", "run": "X:/setup.ps1", "args": "-Secret ${WTL_EXAMPLE_SECRET}" }
   ]
 }
 ```
 
 ```bash
-WTL_OS=single-2022 WTL_BUILD_DIR=$PWD/out WTL_LICENSE=ABCD-1234 wtl run smoke.json
+WTL_OS=single-2022 WTL_BUILD_DIR=$PWD/out WTL_EXAMPLE_SECRET=s3cr3t wtl run smoke.json
 ```
 
 - **Declaring.** A name is `WTL_` + `A-Z 0-9 _`, and not one of `wtl`'s own settings
@@ -280,10 +280,15 @@ WTL_OS=single-2022 WTL_BUILD_DIR=$PWD/out WTL_LICENSE=ABCD-1234 wtl run smoke.js
   anything typed into the file (lab names, mount letters, the `run` extensions). A relative
   `mount` folder from a variable is relative to the run file, as usual.
 - **In the guest.** Every declared variable is also set in each step's environment, so a
-  script can read `$env:WTL_MODE` (or `%WTL_MODE%`) as well as take it as an argument. Nothing
-  else from the host's environment reaches the guest. `wtl` adds four of its own to every step:
+  script can read `$env:WTL_OS` (or `%WTL_OS%`) as well as take it as an argument. Nothing
+  else from the host's environment reaches the guest. `wtl` adds its own to every step:
   `WTL_ENVIRONMENT` (the lab's or environment's name), `WTL_ENVIRONMENT_ID`, `WTL_MACHINE` (the
-  machine's name in the lab file) and `WTL_RUN_ID`; these names cannot be declared.
+  machine's key in the lab file), `WTL_HOSTNAME` (its Windows computer name), `WTL_HOST_<KEY>`
+  (every machine's computer name, e.g. `WTL_HOST_CA1`) and `WTL_RUN_ID`; these names cannot be
+  declared.
+- **Computer names in the run file.** `${WTL_HOST_<KEY>}` in a step's `run` or `args` or in a
+  `mount` folder is that machine's computer name (the lab's, or a renamed environment's), so
+  `"args": "http://${WTL_HOST_CA1}/"` works in every copy.
 - **Secrets.** A `secret` variable is shown as `***` in `result.json`, in `wtl`'s output and in
   its error messages; once secret in a base file, it stays secret. The guest gets the real
   value, so a script that prints it puts it in its step output. The value is also on the

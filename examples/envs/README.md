@@ -11,6 +11,7 @@ result checked, and stops at the first one that is wrong:
 
     examples/envs/build.sh
     examples/envs/run-all.sh single-2019      # single-2003, single-2022, ... or 2019 (an AD lab)
+    examples/envs/run-all.sh 2019 --rename    # the same with every machine renamed (<KEY>-DEMO)
 
 Running a lab also restores it, so do not point these at a lab you are using.
 
@@ -69,6 +70,22 @@ The lab itself, at the same time if you like (its id from `wtl list`): the compu
 A wrong expectation fails the run, which is the point: `WTL_EXPECT_ENV=single-2019 ... --lab
 single-2019-demo` ends with `PROBLEM: the environment is "single-2019-demo", expected
 "single-2019"`, `RESULT FAIL` and `A STEP FAILED`.
+
+## Renamed copies
+
+The same with real new computer names:
+
+    wtl up single-2019 --new --name ren --rename all
+
+`=== renaming the machines of environment single-2019-ren: WS2019 -> WS2019-REN ===`, a reboot,
+`WS2019: WTL LAB_RENAMED machine=WS2019 from=WS2019 to=WS2019-REN`, and `machines renamed and
+saved`. `wtl status single-2019-ren/WS2019` shows `hostname WS2019-REN`. Then:
+
+    WTL_EXPECT_ENV=single-2019-ren WTL_EXPECT_ID=<its id> WTL_EXPECT_HOST=WS2019-REN wtl run examples/envs/whereami.json --lab single-2019-ren
+
+prints `computer name   WS2019-REN`, `hostname=WS2019-REN` in `instance.json` and the registry,
+`WTL_HOSTNAME=WS2019-REN`, and `RESULT OK: this is WS2019 (WS2019-REN) of single-2019-ren`. The
+lab itself, at the same time, still says `WS2019`.
 
 ## 5. Fresh again, then gone
 

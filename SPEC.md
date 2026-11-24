@@ -204,6 +204,50 @@ frozen folder is deleted with the last environment that uses it (`wtl rm`, or `w
 ENV`, which points the environment at the lab's current 0 state with the same name, id and
 note). `wtl list` shows the labs with a 0 state and the environments.
 
+`wtl up ENV --new` copies an environment the same way (its overlays are hard-linked under
+`<ENV>/frozen/<its id>/`; `parent` in the copy's env.json names it), one level deep: a copy of a
+copy is refused, and `wtl rm` refuses an environment that has copies.
+
+## Renames
+
+A machine's Windows computer name (`hostname` on the control disc) is the lab file's `hostname`,
+else its key; an environment can give machines other names: `--rename` items `KEY=NAME`, `KEY`
+(`<KEY>-<the environment's suffix>`) or `all`, checked up front (1-15 of `A-Z 0-9 -`, unique,
+not the NetBIOS domain name, never truncated). env.json keeps `hostnames` (key -> name, also
+inherited by copies), `renamed` (what this environment renamed itself) and `rename_state`:
+`pending`, `done` or `failed`; an environment that is not `done` takes only `status`,
+`restore`, `stop`, `rebuild` and `rm`. Its `0-state.json` is written as `0-state.json.pending`
+and becomes the 0-state.json only when the rename is done.
+
+The rename is one boot on the environment's own `-0.qcow2` overlays, like a build, in tiers,
+each finished before the next boots: the DC (members rename through it), the CA hosts (members
+get certificates from the CA under its new name), the rest. Each machine's disc carries
+`rename`; the guest's Invoke-LabRename is driven by the machine's actual state (its name, the
+phase), so every reboot continues:
+
+- workgroup machine, member: `Rename-Computer` (members with the domain Administrator's
+  credentials) as SYSTEM through the worker's `run` action, running `rename.ps1` from the
+  control disc (2008 R2: WMI `Win32_ComputerSystem.Rename`; 2003: `rename.vbs`); a workgroup's
+  autologon domain becomes the new name; one reboot.
+- DC (its logon is the domain Administrator, so it does this itself): `netdom computername
+  /add:` + `/makeprimary:`, reboot, `/remove:` the old name; DHCP authorized under the new name.
+- a CA host (`rename.ca`): `Uninstall-AdcsCertificationAuthority` before the rename, then
+  (`rename.admin`, phase `rename-admin`) a logon as the domain Administrator that installs the
+  CA again with the build's `Install-LabAdCs -Again` (`-OverwriteExistingKey`,
+  `-OverwriteExistingDatabase`, `-OverwriteExistingCAinDS`; templates and the auto-enrollment
+  GPO as in the build), then back to the logon user; three reboots.
+- afterwards: the IIS page written again; with an auto-enrolling CA, a member's machine
+  certificates from the CA (`rename.ca_name`) are deleted and `certutil -pulse` requests them
+  under the new name; when the CA was reinstalled, every member does that, and its logon user's
+  certificates too (`reenroll_user`).
+- the DC's disc lists the renamed members (`rename.peers`, old -> new): once each new name is in
+  DNS it deletes the old A record and reports `LAB_DNS_CLEAN`.
+
+Every machine with a `rename` reports `LAB_RENAMED machine= from= to=`; then all are frozen as
+after a build. Lab files keep their own names: `"on": "CL1"` and `NAME/MACHINE` are keys; steps
+get `WTL_HOSTNAME` and `WTL_HOST_<KEY>`, and a run file's `${WTL_HOST_<KEY>}` (in `run`, `args`,
+`mount`) is filled in once its lab is known.
+
 ## A run
 
 `wtl run CONFIG`: read the run file (its `extends` chain merged, `${WTL_NAME}` replaced by
@@ -233,7 +277,7 @@ Pure ASCII (PowerShell 4 reads it without a BOM), one per machine:
 
 ```json
 {
- "fmt": "multi", "mode": "domain|workgroup", "role": "dc|member", "machine": "CL1",
+ "fmt": "multi", "mode": "domain|workgroup", "role": "dc|member", "machine": "CL1", "hostname": "CL1",
  "lan": true, "ip": "10.77.30.20", "prefix": 24, "dc_ip": "10.77.30.10", "lan_mac": "52:54:00:4c:41:11",
  "domain": "lab.local", "netbios": "LAB", "admin_password": "...",
  "users": [{"name": "student1", "password": "...", "groups": ["Students"]}],
@@ -252,7 +296,10 @@ Pure ASCII (PowerShell 4 reads it without a BOM), one per machine:
    "env": {"WTL_OS": "2019", "WTL_ENVIRONMENT": "school-k7q3", "WTL_ENVIRONMENT_ID": "4b91d07c",
            "WTL_MACHINE": "CL1", "WTL_RUN_ID": "20261124-101500-4b91d07c"} },
  "instance": null | {"environment": "school-k7q3", "id": "4b91d07c",
-                     "json": "<C:\\WTL\\instance.json, as text>", "reg": "<a .reg file, as text>"}
+                     "json": "<C:\\WTL\\instance.json, as text>", "reg": "<a .reg file, as text>"},
+ "rename": null | {"from": "CL1", "to": "CL1-EXP42", "ca": false, "ca_name": "LAB-ROOT-CA", "admin": false,
+                   "dhcp": false, "iis_site_path": "", "reenroll": true, "reenroll_user": false,
+                   "peers": {"CL1": "CL1-EXP42"}}
 }
 ```
 
@@ -349,6 +396,8 @@ Values with characters outside `A-Za-z0-9._~:\/+,@()-` are URL-escaped. Lines wi
 | `LAB_POLICY machine= state=refreshed` | lab.ps1 | run start (AD): gpupdate + certutil -pulse done |
 | `LAB_CLIENT_READY user= domain=\|workgroup= computer= [dc=] ip=` | member | logged on as its logon user |
 | `LAB_INSTANCE machine= environment= id=` | lab.ps1 | `C:\WTL\instance.json` and `HKLM\SOFTWARE\WinTestLab` written |
+| `LAB_RENAMED machine= from= to=` | lab.ps1 | the rename of an environment's machine is done (see Renames) |
+| `LAB_DNS_CLEAN removed=` | DC | the renamed members' old DNS records are deleted |
 | `LAB_IDLE` | member | 0-state build: ready to be powered off |
 | `LAB_MOUNT letter= host=` | lab.ps1 | a mount disc has its drive letter |
 | `OUTPUT stream=stepNout\|stepNerr seq=N \| base64` | lab.ps1 | step output, 768-byte chunks (max 256 KiB per stream) |

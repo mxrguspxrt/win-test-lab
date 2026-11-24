@@ -223,6 +223,11 @@ pub struct MachineDef {
     /// DC `.10`, members `.20`, `.21`, ... in declaration order.
     #[serde(default)]
     pub ip: Option<String>,
+    /// The Windows computer name, when it is not the machine's key (1-15 of `A-Z 0-9 -`). Set
+    /// during the build; run files still address the machine by its key. An environment can
+    /// rename it again (`wtl up LAB --new --rename`).
+    #[serde(default)]
+    pub hostname: Option<String>,
 }
 
 /// One user (a domain user in AD mode, a local user on every machine in workgroup mode).
@@ -477,6 +482,8 @@ pub struct Machine {
     pub cpus: u32,
     /// the static IP on the lab LAN; None without a lab LAN
     pub ip: Option<String>,
+    /// the Windows computer name (`hostname`, else the key)
+    pub hostname: String,
 }
 
 impl Machine {
@@ -803,7 +810,32 @@ impl LabDef {
                 mem: m.mem.unwrap_or_else(|| Machine::default_mem(role)),
                 cpus: m.cpus.unwrap_or(2),
                 ip,
+                hostname: match &m.hostname {
+                    Some(h) => {
+                        crate::envs::check_computer_name(h).map_err(|e| anyhow::anyhow!("{}: machine {}: hostname {}", path, name, e))?;
+                        h.to_ascii_uppercase()
+                    }
+                    None => name.clone(),
+                },
             });
+        }
+        // computer names are unique (Windows compares them without case), and not the domain's
+        for i in 0..machines.len() {
+            for j in (i + 1)..machines.len() {
+                if machines[i].hostname.eq_ignore_ascii_case(&machines[j].hostname) {
+                    bail!("{}: machines {} and {} would both be called {}", path, machines[i].name, machines[j].name, machines[j].hostname);
+                }
+            }
+            if let Mode::Domain { netbios, .. } = &mode {
+                if machines[i].hostname.eq_ignore_ascii_case(netbios) {
+                    bail!(
+                        "{}: machine {}: its computer name {} is the domain's NetBIOS name",
+                        path,
+                        machines[i].name,
+                        machines[i].hostname
+                    );
+                }
+            }
         }
 
         // duplicate IPs

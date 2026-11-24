@@ -54,7 +54,11 @@ struct LabJson<'a> {
     /// "domain" (AD: a DC, the others join) or "workgroup" (standalone machines, local users)
     mode: &'a str,
     role: &'a str,
+    /// the machine's key in the lab file (what run files and events name it by)
     machine: &'a str,
+    /// its Windows computer name (the key, a lab file's `hostname`, or an environment's own);
+    /// the build renames the machine to it, and lab.ps1 checks the logon against it
+    hostname: &'a str,
     /// the machine has a lab LAN NIC (false for a single workgroup machine)
     lan: bool,
     /// the static IP on the lab LAN ("" without one)
@@ -91,6 +95,35 @@ struct LabJson<'a> {
     /// it: the guest writes `json` to C:\WTL\instance.json and imports `reg` (a .reg file) into
     /// HKLM\SOFTWARE\WinTestLab at every `up` / `run` (null during the 0-state build)
     instance: Option<LabInstance>,
+    /// the boot that renames an environment's machines (null otherwise)
+    rename: Option<LabRename<'a>>,
+}
+
+/// One machine's part of renaming an environment (`wtl up LAB --new --rename`): from its
+/// 0-state name to `to` (the same for a machine that only re-requests its certificates), and
+/// what depends on the name. The guest's rename script does it; see SPEC.md, "Renames".
+#[derive(Serialize)]
+struct LabRename<'a> {
+    from: &'a str,
+    to: &'a str,
+    /// this machine hosts the CA: uninstall it before the rename, install it again after
+    ca: bool,
+    /// the lab's CA name, whose certificates are requested again ("" without a CA)
+    ca_name: &'a str,
+    /// a member whose CA or DHCP server needs the domain Administrator's session after the
+    /// rename (phase rename-admin)
+    admin: bool,
+    /// re-authorize this machine's DHCP server under the new name
+    dhcp: bool,
+    /// the IIS test page to write again with the new name ("" without IIS)
+    iis_site_path: &'a str,
+    /// the lab has an auto-enrolling CA: drop the old machine certificate, request a new one
+    reenroll: bool,
+    /// the CA was reinstalled: also drop the logon user's old certificates
+    reenroll_user: bool,
+    /// the DC only: the members being renamed (old -> new computer name), whose old DNS
+    /// records it deletes once their new ones are registered
+    peers: IndexMap<&'a str, &'a str>,
 }
 
 #[derive(Serialize)]
@@ -183,6 +216,8 @@ struct LabStep<'a> {
 /// One machine's runtime identity (name == the QEMU/state id).
 struct Vm {
     name: String,
+    /// the Windows computer name: the lab's (`hostname`, else the key) or an environment's own
+    hostname: String,
     role: Role,
     os: OsInfo,
     mem: String,
@@ -252,6 +287,8 @@ struct RunResult {
     /// the environment it ran in (the lab's own name for the lab itself) and its id
     environment: String,
     id: String,
+    /// every machine's Windows computer name (key -> hostname)
+    hostnames: IndexMap<String, String>,
     config: String,
     run_id: String,
     /// the run's variables and the values used (a secret one as `***`)
@@ -285,6 +322,10 @@ pub struct MultiLab {
     only: Option<String>,
     /// this run's id (`<time>-<id>`); empty outside `wtl run`
     run_id: String,
+    /// the boot that renames an environment's machines is under way (`rename_machines`)
+    renaming: bool,
+    /// the machines being renamed by it (key -> old computer name, the parent's)
+    rename_from: IndexMap<String, String>,
     show: bool,
     wait_s: i64,
     timeout_min: i64,
@@ -414,16 +455,36 @@ pub fn open_env(home: &Home, name: &str) -> Result<Option<(PathBuf, Lab, EnvTarg
 }
 
 /// `wtl up LAB --new`, `wtl run --new`: build the lab's 0 state if it has none, then make a new
-/// environment of it (named `<lab>-<name>`, or `<lab>-<4 random>`). Returns it, ready to boot.
-pub fn spawn(lab_file: &Path, lab: Lab, opts: &RunOpts, name: Option<&str>, note: &str) -> Result<(PathBuf, Lab, EnvTarget)> {
+/// environment of it (named `<lab>-<name>`, or `<lab>-<4 random>`), or of the environment
+/// `from` (a copy of a copy is refused). With `renames` (`--rename` items), its machines are
+/// renamed right away, which takes a few minutes. Returns it, ready to boot.
+pub fn spawn(
+    lab_file: &Path,
+    lab: Lab,
+    opts: &RunOpts,
+    from: Option<EnvTarget>,
+    name: Option<&str>,
+    note: &str,
+    renames: &[String],
+) -> Result<(PathBuf, Lab, EnvTarget)> {
     envs::check_note(note)?;
-    let mut parent = MultiLab::new("prepare", lab_file, None, None, lab, opts, None)?;
+    let mut parent = MultiLab::new("prepare", lab_file, None, None, lab, opts, from)?;
     let code = parent.dispatch()?;
     if code != 0 {
         return Err(Exit(code).into());
     }
-    let (env_name, _) = parent.spawn_env(name, note)?;
-    open_env(&parent.env.home, &env_name)?.ok_or_else(|| anyhow!("environment {} was not saved", env_name))
+    let (env_name, f) = parent.spawn_env(name, note, renames)?;
+    let home = parent.env.home.clone();
+    if f.rename_state.is_some() {
+        let (lf, l, t) = open_env(&home, &env_name)?.ok_or_else(|| anyhow!("environment {} was not saved", env_name))?;
+        let mut e = MultiLab::new("rename", &lf, None, None, l, opts, Some(t))?;
+        let mut arches: Vec<Arch> = e.vms.iter().map(|v| v.arch()).collect();
+        arches.dedup();
+        e.env.check_tools(&arches)?;
+        sys::install_interrupt_handler();
+        e.rename_and_save()?;
+    }
+    open_env(&home, &env_name)?.ok_or_else(|| anyhow!("environment {} was not saved", env_name))
 }
 
 /// `wtl rm ENV`: stop an environment's VMs and delete its folder (disks, results). The lab's
@@ -442,6 +503,10 @@ pub fn remove_env(name: &str) -> i32 {
             }
             None => bail!("no environment {} (wtl list shows them)", name),
         };
+        let copies: Vec<String> = envs::all(&home).into_iter().filter(|(_, e)| e.parent() == name).map(|(n, _)| n).collect();
+        if !copies.is_empty() {
+            bail!("{} has copies ({}): wtl rm them first", name, copies.join(", "));
+        }
         let state = home.state_dir.join(name);
         match open_env(&home, name) {
             Ok(Some((lab_file, lab, target))) => {
@@ -451,10 +516,35 @@ pub fn remove_env(name: &str) -> i32 {
             Err(e) => warn(&format!("{:#}; deleting it without stopping its VMs", e)),
         }
         std::fs::remove_dir_all(&state).with_context(|| format!("cannot delete {}", state.display()))?;
-        envs::gc_frozen(&home, &home.state_dir.join(&f.lab));
+        envs::gc_frozen(&home, &home.state_dir.join(f.parent()));
         ok(&format!("environment {} deleted (lab {} and its other environments untouched)", name, f.lab));
         Ok(0)
     })())
+}
+
+/// `wtl run --new --rm`: move the environment's last results into its lab's runs/ (as
+/// `<time>-<environment>`), then delete it. Returns the exit code of the deletion.
+pub fn keep_results_and_remove(name: &str) -> i32 {
+    exit_code((|| {
+        let home = Home::resolve()?;
+        let f = envs::load(&home, name)?.ok_or_else(|| anyhow!("no environment {}", name))?;
+        let state = home.state_dir.join(name);
+        let last = state.join("last");
+        let res = match std::fs::symlink_metadata(&last) {
+            Ok(md) if md.file_type().is_symlink() => Some(util::canon(&last)),
+            Ok(_) => read_trim(&last).map(|t| util::canon(&state.join(t))),
+            Err(_) => None,
+        };
+        if let Some(res) = res.filter(|r| r.is_dir()) {
+            let runs = home.state_dir.join(&f.lab).join("runs");
+            std::fs::create_dir_all(&runs).with_context(|| format!("cannot create {}", runs.display()))?;
+            let dst = runs.join(format!("{}-{}", util::basename(&res.to_string_lossy()), name));
+            std::fs::rename(&res, &dst).with_context(|| format!("cannot move {} to {}", res.display(), dst.display()))?;
+            ok(&format!("results kept: {}", dst.display()));
+        }
+        Ok(0)
+    })())
+    .max(remove_env(name))
 }
 
 /// `wtl list`: every lab with a 0 state and every environment, with its id, whether it is
@@ -517,6 +607,12 @@ fn zero_id_at(zero_done: &Path) -> String {
         let _ = write_file(zero_done, pyjson::dumps(&z));
     }
     z.id
+}
+
+/// A machine key as the end of a variable name: `CL1` -> `CL1` (`WTL_HOST_CL1`); anything but
+/// A-Z 0-9 becomes `_` (`web.1` -> `WEB_1`).
+pub fn host_var(key: &str) -> String {
+    key.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' }).collect()
 }
 
 /// Every lab LAN port the home's own and the built-in labs use.
@@ -628,6 +724,7 @@ impl MultiLab {
             let idx = 0x10 + i; // MAC/host-id suffix, DC/first = 0x10
             vms.push(Vm {
                 name: m.name.clone(),
+                hostname: target.as_ref().and_then(|(_, f)| f.hostnames.get(&m.name).cloned()).unwrap_or_else(|| m.hostname.clone()),
                 role: m.role,
                 os,
                 mem: m.mem.to_string(),
@@ -692,6 +789,8 @@ impl MultiLab {
             envf: target.map(|(_, f)| f),
             only: opts.machine.clone(),
             run_id: String::new(),
+            renaming: false,
+            rename_from: IndexMap::new(),
             show,
             wait_s,
             timeout_min,
@@ -935,12 +1034,20 @@ impl MultiLab {
         zero_id_at(&self.zero_done)
     }
 
-    /// Make a new environment of this lab from its 0 state (which must exist): its own state
-    /// folder with thin overlays on the lab's 0-state disks, a random id, its own LAN port.
-    fn spawn_env(&self, name: Option<&str>, note: &str) -> Result<EnvTarget> {
+    /// Make a new environment from this lab's (or this environment's) 0 state, which must
+    /// exist: its own state folder with thin overlays on those 0-state disks, a random id, its own
+    /// LAN port, and the computer names it inherits plus `renames` (`--rename` items; renamed by
+    /// [`spawn`] right after). A copy of an environment is one level deep only, and renames come
+    /// from a lab.
+    fn spawn_env(&self, name: Option<&str>, note: &str, renames: &[String]) -> Result<EnvTarget> {
         let home = &self.env.home;
-        if self.envf.is_some() {
-            bail!("{} is an environment; make new ones from its lab ({})", self.name, self.instance().lab);
+        if let Some(pf) = &self.envf {
+            if pf.parent() != pf.lab {
+                bail!("{} is a copy of {} already; copy that one (or the lab {}) instead", self.name, pf.parent(), pf.lab);
+            }
+            if !renames.is_empty() {
+                bail!("--rename makes new names from a lab: wtl up {} --new --rename ...", pf.lab);
+            }
         }
         let free = |n: &str| -> Result<bool> { Ok(!home.state_dir.join(n).exists() && assets::lab_file(home, n)?.is_none()) };
         let env_name = match name {
@@ -966,6 +1073,13 @@ impl MultiLab {
                 pick.ok_or_else(|| anyhow!("no free environment name for {}", self.name))?
             }
         };
+        // the names first: a bad --rename must fail before anything is made
+        let current: Vec<(String, String)> = self.vms.iter().map(|v| (v.name.clone(), v.hostname.clone())).collect();
+        let suffix = env_name.strip_prefix(&format!("{}-", self.name)).unwrap_or(&env_name);
+        let renamed = envs::plan_renames(&self.name, &current, suffix, renames)?;
+        if !renames.is_empty() && renamed.is_empty() {
+            bail!("--rename {}: nothing to rename (every name is already the machine's)", renames.join(","));
+        }
         let state = home.state_dir.join(&env_name);
         std::fs::create_dir_all(&state).with_context(|| format!("cannot create {}", state.display()))?;
         let made = (|| {
@@ -974,8 +1088,10 @@ impl MultiLab {
                 Some(_) => Some(envs::pick_lan_port(home, &lab_ports(home))?),
                 None => None,
             };
+            let mut hostnames = self.envf.as_ref().map(|pf| pf.hostnames.clone()).unwrap_or_default();
+            hostnames.extend(renamed.clone());
             let f = EnvFile {
-                lab: self.name.clone(),
+                lab: self.envf.as_ref().map(|pf| pf.lab.clone()).unwrap_or_else(|| self.name.clone()),
                 lab_file: util::canon(&self.lab_file),
                 id: envs::random_hex(8),
                 note: note.to_string(),
@@ -983,14 +1099,19 @@ impl MultiLab {
                 zero_id,
                 frozen,
                 lan_port,
+                parent: self.name.clone(),
+                hostnames,
+                rename_state: (!renamed.is_empty()).then(|| "pending".to_string()),
+                renamed,
             };
             envs::save(&state, &f)?;
-            self.write_env_zero(&state, &env_name, &f.id)?;
+            self.write_env_zero(&state, &env_name, &f.id, f.rename_state.is_some())?;
             Ok::<_, anyhow::Error>(f)
         })();
         match made {
             Ok(f) => {
-                ok(&format!("environment {} (id {}) made from lab {}'s 0 state", env_name, f.id, self.name));
+                let what = if self.envf.is_some() { "environment" } else { "lab" };
+                ok(&format!("environment {} (id {}) made from {} {}'s 0 state", env_name, f.id, what, self.name));
                 Ok((env_name, f))
             }
             Err(e) => {
@@ -1034,29 +1155,145 @@ impl MultiLab {
 
     /// An environment's own 0-state.json: the lab's (when built, which machines, what its guest
     /// scripts can do) with the environment's name and id.
-    fn write_env_zero(&self, env_state: &Path, env_name: &str, id: &str) -> Result<()> {
+    /// With `pending` (its machines are still to be renamed) it is written as
+    /// `0-state.json.pending`, made the 0-state.json once the rename is done.
+    fn write_env_zero(&self, env_state: &Path, env_name: &str, id: &str, pending: bool) -> Result<()> {
         let z: ZeroState = std::fs::read_to_string(&self.zero_done).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
         let ez = ZeroState { lab: env_name.to_string(), built_at: z.built_at, machines: z.machines, guest: z.guest, id: id.to_string() };
-        write_file(&env_state.join("0-state.json"), pyjson::dumps(&ez))
+        let _ = std::fs::remove_file(env_state.join("0-state.json"));
+        let _ = std::fs::remove_file(env_state.join("0-state.json.pending"));
+        write_file(&env_state.join(if pending { "0-state.json.pending" } else { "0-state.json" }), pyjson::dumps(&ez))
     }
 
-    /// `wtl rebuild ENV`: this environment fresh again from its lab's current 0 state, keeping
-    /// its name, id, note and LAN port.
+    /// `wtl rebuild ENV`: this environment fresh again from its parent's current 0 state (the
+    /// lab's, or the environment it is a copy of), keeping its name, id, note and LAN port, and
+    /// doing its own renames again.
     fn refresh_env(&mut self) -> Result<()> {
         let Some(mut f) = self.envf.clone() else { bail!("not an environment") };
         self.restore()?;
-        let lab = load_lab(&f.lab_file)?;
-        let parent = MultiLab::new("prepare", &f.lab_file, None, None, lab, &RunOpts::default(), None)?;
+        let parent = match open_env(&self.env.home, f.parent())? {
+            Some((lf, l, t)) => MultiLab::new("prepare", &lf, None, None, l, &RunOpts::default(), Some(t))?,
+            None => {
+                let lab = load_lab(&f.lab_file)?;
+                MultiLab::new("prepare", &f.lab_file, None, None, lab, &RunOpts::default(), None)?
+            }
+        };
         let (zero_id, frozen) = parent.fill_env(&self.state)?;
         f.zero_id = zero_id;
         f.frozen = frozen;
+        f.hostnames = parent.envf.as_ref().map(|pf| pf.hostnames.clone()).unwrap_or_default();
+        f.hostnames.extend(f.renamed.clone());
+        f.rename_state = (!f.renamed.is_empty()).then(|| "pending".to_string());
         envs::save(&self.state, &f)?;
-        parent.write_env_zero(&self.state, &self.name, &f.id)?;
+        parent.write_env_zero(&self.state, &self.name, &f.id, f.rename_state.is_some())?;
         envs::gc_frozen(&self.env.home, &parent.state);
+        self.envf = Some(f.clone());
+        if !f.renamed.is_empty() {
+            self.rename_and_save()?;
+        }
         let built =
             std::fs::read_to_string(&self.zero_done).ok().and_then(|t| serde_json::from_str::<ZeroState>(&t).ok()).unwrap_or_default();
-        ok(&format!("environment {} is fresh again from lab {}'s 0 state (built {})", self.name, f.lab, built.built_at));
+        ok(&format!("environment {} is fresh again from {}'s 0 state (built {})", self.name, f.parent(), built.built_at));
+        Ok(())
+    }
+
+    /// Rename this environment's machines ([`rename_machines`](Self::rename_machines)) and
+    /// record the outcome: "done" makes the pending 0-state.json its 0 state; "failed" leaves it
+    /// usable only for `wtl rebuild` / `wtl rm`.
+    fn rename_and_save(&mut self) -> Result<()> {
+        let r = self.rename_machines();
+        let Some(mut f) = self.envf.clone() else { bail!("not an environment") };
+        f.rename_state = Some(if r.is_ok() { "done" } else { "failed" }.to_string());
+        envs::save(&self.state, &f)?;
         self.envf = Some(f);
+        match r {
+            Ok(()) => {
+                std::fs::rename(self.st("0-state.json.pending"), &self.zero_done).context("saving the renamed 0 state")?;
+                Ok(())
+            }
+            Err(e) => {
+                // the reason is printed already (or follows); say what to do with the environment
+                err(&format!(
+                    "renaming the machines of environment {} failed (its VMs keep running to look at; wtl rebuild {} tries again, wtl rm {} deletes it)",
+                    self.name, self.name, self.name
+                ));
+                Err(e)
+            }
+        }
+    }
+
+    /// The boot that renames this environment's machines (`renamed` in its env.json), written
+    /// straight into its 0-state disks, like a build. In tiers, each finished before the next
+    /// boots: the DC (members can only rename through a DC that has its new name), then the CA
+    /// hosts (members get their certificates from the CA under its new name), then the rest. A
+    /// machine with a rename block reports LAB_RENAMED; the DC then waits until the renamed
+    /// members registered their new names and deletes their old DNS records (LAB_DNS_CLEAN).
+    /// Then every machine is frozen, as after a build.
+    fn rename_machines(&mut self) -> Result<()> {
+        let Some(f) = self.envf.clone() else { bail!("not an environment") };
+        self.rename_from =
+            f.renamed.keys().map(|k| (k.clone(), self.lab.machine(k).map(|m| m.hostname.clone()).unwrap_or_else(|| k.clone()))).collect();
+        let plan: Vec<String> = f.renamed.iter().map(|(k, n)| format!("{} -> {}", self.rename_from[k], n)).collect();
+        log(&format!("=== renaming the machines of environment {}: {} ===", self.name, plan.join(", ")));
+        for (k, _) in &f.renamed {
+            if self.vm(k).ad_cs.is_some() {
+                log(&format!(
+                    "{} hosts the CA {}: it is reinstalled under its new name, and the members get new certificates",
+                    k,
+                    self.vm(k).ad_cs.as_ref().map(|o| o.ca_name.as_str()).unwrap_or("")
+                ));
+            }
+        }
+        self.renaming = true;
+        let r = self.rename_boot();
+        self.renaming = false;
+        r
+    }
+
+    fn rename_boot(&mut self) -> Result<()> {
+        self.restore()?;
+        self.offsets.clear();
+        let names = self.vm_names();
+        let tier = |l: &MultiLab, n: &str| match (l.vm(n).role, l.vm(n).ad_cs.is_some()) {
+            (Role::Dc, _) => 0,
+            (_, true) => 1,
+            _ => 2,
+        };
+        let mut first = true;
+        for t in 0..3 {
+            let group: Vec<String> = names.iter().filter(|n| tier(self, n) == t).cloned().collect();
+            for vm in &group {
+                self.boot_vm(vm, false, first)?;
+                first = false;
+            }
+            for vm in &group {
+                let renamed = self.rename_block(self.vm(vm)).is_some();
+                if renamed {
+                    // its reboots ride along: LAB_RENAMED comes from the logon after the last one
+                    let line = self.wait_ev(vm, "LAB_RENAMED", "LAB_FAIL,ERROR", &format!("{} rename", vm))?;
+                    ok(&format!("{}: {}", vm, line));
+                }
+                if self.vm(vm).role == Role::Dc {
+                    self.wait_ev(vm, "LAB_DC_READY", "LAB_FAIL,ERROR", "domain controller")?;
+                } else {
+                    // a machine that just boots: its logon, with the build's reset for a stuck one
+                    if !renamed {
+                        self.wait_logon(vm, &format!("{} logon", vm))?;
+                    }
+                    self.wait_ev(vm, "LAB_CLIENT_READY", "LAB_FAIL,ERROR", vm)?;
+                    self.wait_ev(vm, "LAB_IDLE", "LAB_FAIL,ERROR", vm)?;
+                }
+            }
+        }
+        // the DC deletes the old DNS records (the renamed members', its own) once all are renamed
+        if let Some(dc) = self.dc_name() {
+            if self.rename_block(self.vm(&dc)).is_some_and(|r| !r.peers.is_empty() || r.from != r.to) {
+                let line = self.wait_ev(&dc, "LAB_DNS_CLEAN", "LAB_FAIL,ERROR", "DNS cleanup")?;
+                ok(&format!("{}: {}", dc, line));
+            }
+        }
+        self.freeze_lab()?;
+        ok(&format!("environment {}: machines renamed and saved", self.name));
         Ok(())
     }
 
@@ -1067,9 +1304,10 @@ impl MultiLab {
 
     /// Who this lab or environment is, for the machines inside it and for the results.
     fn instance(&self) -> Instance {
+        let hostnames: IndexMap<String, String> = self.vms.iter().map(|v| (v.name.clone(), v.hostname.clone())).collect();
         match &self.envf {
-            Some(e) => Instance { lab: e.lab.clone(), environment: self.name.clone(), id: e.id.clone(), note: e.note.clone() },
-            None => Instance { lab: self.name.clone(), environment: self.name.clone(), id: self.zero_id(), note: String::new() },
+            Some(e) => Instance { lab: e.lab.clone(), environment: self.name.clone(), id: e.id.clone(), note: e.note.clone(), hostnames },
+            None => Instance { lab: self.name.clone(), environment: self.name.clone(), id: self.zero_id(), note: String::new(), hostnames },
         }
     }
 
@@ -1090,6 +1328,13 @@ impl MultiLab {
                     println!("  note: {}", f.note);
                 }
                 println!("  made {}{}", f.created_at, f.lan_port.map(|p| format!(", lab LAN port {}", p)).unwrap_or_default());
+                if f.parent() != f.lab {
+                    println!("  a copy of environment {}", f.parent());
+                }
+                if let Some(st) = &f.rename_state {
+                    let r: Vec<String> = f.renamed.iter().map(|(k, n)| format!("{} -> {}", k, n)).collect();
+                    println!("  renamed ({}): {}", st, r.join(", "));
+                }
             }
             None => {
                 let id = if inst.id.is_empty() { String::new() } else { format!(" (id {})", inst.id) };
@@ -1114,7 +1359,8 @@ impl MultiLab {
                 None => "off".into(),
             };
             let ip = if v.ip.is_empty() { "-" } else { v.ip.as_str() };
-            println!("  {:<15} {:<6} {:<7} {} {}", v.name, role, v.os.key, ip, pid);
+            let host = if v.hostname != v.name { format!("  hostname {}", v.hostname) } else { String::new() };
+            println!("  {:<15} {:<6} {:<7} {} {}{}", v.name, role, v.os.key, ip, pid, host);
         }
         if let Some(last) = self.last_run() {
             println!("  last run: {}", last.display());
@@ -1152,6 +1398,17 @@ impl MultiLab {
     }
 
     fn dispatch(&mut self) -> Result<i32> {
+        if let Some(f) = &self.envf {
+            if !f.usable() && !matches!(self.cmd, "status" | "rebuild" | "restore" | "stop") {
+                bail!(
+                    "environment {}'s rename {} (wtl rebuild {} renames it again, wtl rm {} deletes it)",
+                    self.name,
+                    if f.rename_state.as_deref() == Some("failed") { "failed" } else { "did not finish" },
+                    self.name,
+                    self.name
+                );
+            }
+        }
         match self.cmd {
             "stop" => {
                 self.stop_vms(false)?;
@@ -1241,6 +1498,49 @@ impl MultiLab {
     }
 
     /// The control disc for one machine: LAB\lab.ps1 + LAB\labsvc.ps1 + LAB\lab.json.
+    /// A machine's part of the rename boot (`rename_machines`), or None: a renamed machine gets
+    /// its rename; when a CA is reinstalled, every other member re-requests its certificates
+    /// under the new CA (a block with `from` = `to`).
+    fn rename_block<'a>(&'a self, vm: &'a Vm) -> Option<LabRename<'a>> {
+        if !self.renaming {
+            return None;
+        }
+        let autoenroll = self.vms.iter().any(|v| v.ad_cs.as_ref().is_some_and(|o| o.autoenroll));
+        let ca_reinstalled = self.vms.iter().any(|v| v.ad_cs.is_some() && self.rename_from.contains_key(&v.name));
+        let members_renamed = self.vms.iter().any(|v| v.role != Role::Dc && self.rename_from.contains_key(&v.name));
+        let from = match self.rename_from.get(&vm.name) {
+            Some(old) => old.as_str(),
+            // a member that only gets certificates from the reinstalled CA
+            None if ca_reinstalled && autoenroll && vm.role != Role::Dc && vm.ad_cs.is_none() => vm.hostname.as_str(),
+            // the DC deletes the renamed members' old DNS records, renamed itself or not
+            None if vm.role == Role::Dc && members_renamed => vm.hostname.as_str(),
+            None => return None,
+        };
+        let renamed = from != vm.hostname;
+        let peers = if vm.role == Role::Dc {
+            self.vms
+                .iter()
+                .filter(|v| v.role != Role::Dc)
+                .filter_map(|v| self.rename_from.get(&v.name).map(|old| (old.as_str(), v.hostname.as_str())))
+                .collect()
+        } else {
+            IndexMap::new()
+        };
+        let ca_name = self.vms.iter().find_map(|v| v.ad_cs.as_ref().map(|o| o.ca_name.as_str())).unwrap_or("");
+        Some(LabRename {
+            from,
+            to: &vm.hostname,
+            ca: renamed && vm.ad_cs.is_some(),
+            ca_name,
+            admin: renamed && vm.role != Role::Dc && (vm.ad_cs.is_some() || vm.dhcp.is_some()),
+            dhcp: renamed && vm.dhcp.is_some(),
+            iis_site_path: if renamed { vm.iis.as_ref().map(|o| o.site_path.as_str()).unwrap_or("") } else { "" },
+            reenroll: autoenroll && vm.role != Role::Dc && vm.ad_cs.is_none() && (renamed || ca_reinstalled),
+            reenroll_user: autoenroll && ca_reinstalled && vm.role != Role::Dc && vm.ad_cs.is_none(),
+            peers,
+        })
+    }
+
     fn make_cd(&self, vm: &Vm, out: &Path, build: bool) -> Result<()> {
         let stage = self.st(&format!("cd-{}", vm.name));
         let _ = std::fs::remove_dir_all(&stage);
@@ -1269,8 +1569,10 @@ impl MultiLab {
             .map(|u| LabUser { name: &u.name, password: &u.password, groups: u.groups.iter().map(String::as_str).collect() })
             .collect();
 
-        // who this machine is: on every disc but the build's (the 0 state stays anonymous)
-        let inst = if build { None } else { Some(self.instance()) };
+        // who this machine is: on every disc but the build's and the rename's (a 0 state stays
+        // anonymous)
+        let inst = if build || self.renaming { None } else { Some(self.instance()) };
+        let rename = self.rename_block(vm);
         // the run block (only on a real run, never during the build or `up`)
         let run = if !build && self.cmd == "run" && vm.has_steps() {
             let mounts = vm.mounts.iter().map(|(l, h)| LabMount { host: h, letter: l }).collect();
@@ -1297,6 +1599,10 @@ impl MultiLab {
                 env.insert("WTL_ENVIRONMENT_ID".into(), i.id.clone());
                 env.insert("WTL_MACHINE".into(), vm.name.clone());
                 env.insert("WTL_RUN_ID".into(), self.run_id.clone());
+                env.insert("WTL_HOSTNAME".into(), vm.hostname.clone());
+                for v in &self.vms {
+                    env.insert(format!("WTL_HOST_{}", host_var(&v.name)), v.hostname.clone());
+                }
             }
             Some(LabRun { mounts, steps, wait: self.wait_s, env })
         } else {
@@ -1308,7 +1614,8 @@ impl MultiLab {
         // disc; the guest acts on them in phase "new". Keep them off the run disc.
         let roles: Vec<&str> = if build { vm.roles.iter().map(|r| r.as_str()).collect() } else { Vec::new() };
         let features: Vec<&str> = if build { vm.features.iter().map(String::as_str).collect() } else { Vec::new() };
-        let ad_cs = if build {
+        // the CA's options: on the build disc, and on the rename disc of a CA host it reinstalls
+        let ad_cs = if build || rename.as_ref().is_some_and(|r| r.ca) {
             vm.ad_cs.as_ref().map(|o| LabAdCs {
                 ca_name: &o.ca_name,
                 key_length: o.key_length,
@@ -1338,6 +1645,7 @@ impl MultiLab {
             mode: if self.lab.is_ad() { "domain" } else { "workgroup" },
             role,
             machine: &vm.name,
+            hostname: &vm.hostname,
             lan: self.lab.network.is_some(),
             ip: &vm.ip,
             prefix: 24,
@@ -1349,7 +1657,7 @@ impl MultiLab {
             users,
             logon_user,
             logon_password,
-            shutdown_when_ready: build && vm.role != Role::Dc,
+            shutdown_when_ready: (build || self.renaming) && vm.role != Role::Dc,
             slow: self.slow(&vm.name),
             roles,
             features,
@@ -1363,6 +1671,7 @@ impl MultiLab {
                 let (json, reg) = envs::instance_files(&i, &vm.name, &self.run_id, vm.os.key != "2003");
                 LabInstance { environment: i.environment, id: i.id, json, reg }
             }),
+            rename,
         };
         write_file(&labdir.join("lab.json"), pyjson::dumps_indent(&j, 1))?;
         mkiso::make_iso(&stage, out, "WTL_LAB").with_context(|| format!("mkiso {} failed", vm.name))?;
@@ -1513,24 +1822,44 @@ impl MultiLab {
         let mut order = self.vm_names();
         order.sort_by_key(|n| if self.vm(n).role == Role::Dc { 0 } else { 1 });
         for (i, name) in order.iter().enumerate() {
-            let vm_idx = self.vms.iter().position(|v| &v.name == name).unwrap();
-            let (disk, cd, mut cds) = {
-                let vm = &self.vms[vm_idx];
-                let cd = self.st(&format!("{}.iso", vm.name));
-                // the build writes the domain straight into the frozen 0-state disk; a run
-                // writes to a throwaway overlay on top of it
-                let disk = if build { self.zero_disk(&vm.name) } else { self.run_disk(&vm.name) };
-                (disk, cd.clone(), vec![cd])
-            };
-            self.make_cd(&self.vms[vm_idx], &cd, build)?;
-            // mount discs only matter on a real run
-            if !build && self.cmd == "run" {
-                cds.extend(self.make_mount_isos(&self.vms[vm_idx])?);
+            self.boot_vm(name, build, i == 0)?;
+        }
+        Ok(())
+    }
+
+    /// Write one machine's control disc (and a run's mount discs) and start it. The build and
+    /// the rename write straight into its 0-state disk; a run or `up` into a throwaway overlay.
+    fn boot_vm(&mut self, name: &str, build: bool, first: bool) -> Result<()> {
+        let vm_idx = self.vms.iter().position(|v| v.name == name).expect("known vm");
+        let cd = self.st(&format!("{}.iso", name));
+        let disk = if build || self.renaming { self.zero_disk(name) } else { self.run_disk(name) };
+        let mut cds = vec![cd.clone()];
+        self.make_cd(&self.vms[vm_idx], &cd, build)?;
+        // mount discs only matter on a real run
+        if !build && self.cmd == "run" {
+            cds.extend(self.make_mount_isos(&self.vms[vm_idx])?);
+        }
+        self.start_vm(&self.vms[vm_idx], disk, cds)?;
+        if first {
+            self.settle(1.0)?; // let the DC's multicast endpoint come up first
+        }
+        Ok(())
+    }
+
+    /// Let first logons finish, then power every machine off cleanly, members first, DC last:
+    /// what is on their 0-state disks is then a 0 state.
+    fn freeze_lab(&self) -> Result<()> {
+        // let first logons finish (profile, group policy) before the freeze
+        self.settle(20.0)?;
+        let mut order = self.vm_names();
+        order.sort_by_key(|n| if self.vm(n).role == Role::Dc { 1 } else { 0 });
+        for vm in &order {
+            log(&format!("shutting {} down cleanly", vm));
+            if !self.freeze_off(vm)? {
+                bail!("{} did not power off; 0 state not saved (wtl rebuild {}, then retry)", vm, self.arg);
             }
-            self.start_vm(&self.vms[vm_idx], disk, cds)?;
-            if i == 0 {
-                self.settle(1.0)?; // let the DC's multicast endpoint come up first
-            }
+            let _ = std::fs::remove_file(self.st(&format!("{}.pid", vm)));
+            let _ = std::fs::remove_file(self.st(&format!("{}.iso", vm)));
         }
         Ok(())
     }
@@ -1624,6 +1953,14 @@ impl MultiLab {
         if self.zero_done.is_file() {
             return Ok(());
         }
+        if self.envf.is_some() {
+            bail!(
+                "environment {} has no 0 state (its rename did not finish): wtl rebuild {} makes it again, wtl rm {} deletes it",
+                self.name,
+                self.name,
+                self.name
+            );
+        }
         log(&format!("=== building the 0 state of lab {} ({}; {} machines, once) ===", self.name, self.mode_text(), self.vms.len()));
         self.restore()?;
         self.build_bases()?;
@@ -1654,19 +1991,7 @@ impl MultiLab {
             ok(&format!("{} ready: {}", m, line));
             self.wait_ev(m, "LAB_IDLE", "LAB_FAIL,ERROR", m)?;
         }
-        // let first logons finish (profile, group policy) before the freeze; then power off,
-        // members first, DC last
-        self.settle(20.0)?;
-        let mut order = self.vm_names();
-        order.sort_by_key(|n| if self.vm(n).role == Role::Dc { 1 } else { 0 });
-        for vm in &order {
-            log(&format!("shutting {} down cleanly", vm));
-            if !self.freeze_off(vm)? {
-                bail!("{} did not power off; 0 state not saved (wtl rebuild {}, then retry)", vm, self.arg);
-            }
-            let _ = std::fs::remove_file(self.st(&format!("{}.pid", vm)));
-            let _ = std::fs::remove_file(self.st(&format!("{}.iso", vm)));
-        }
+        self.freeze_lab()?;
         let done = ZeroState {
             lab: self.name.clone(),
             built_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
@@ -1689,7 +2014,7 @@ impl MultiLab {
         }
         for v in &self.vms {
             // who is logged on: DOMAIN\user in AD mode, MACHINE\user (a local account) otherwise
-            let realm = if self.lab.is_ad() { self.lab.netbios().to_string() } else { v.name.clone() };
+            let realm = if self.lab.is_ad() { self.lab.netbios().to_string() } else { v.hostname.clone() };
             let who = match &v.logon {
                 Some(u) => format!("logon {}\\{}", realm, u),
                 None => format!("{}\\Administrator", realm),
@@ -1703,7 +2028,7 @@ impl MultiLab {
             eprintln!(
                 "    {} {:<15} {}  {}  {}",
                 role,
-                v.name,
+                if v.hostname != v.name { format!("{} ({})", v.name, v.hostname) } else { v.name.clone() },
                 ip,
                 read_trim(&self.st(&format!("{}.vnc", v.name))).unwrap_or_default(),
                 who
@@ -1784,6 +2109,7 @@ impl MultiLab {
             lab: inst.lab,
             environment: inst.environment,
             id: inst.id,
+            hostnames: inst.hostnames,
             config: config_name.clone(),
             run_id: self.run_id.clone(),
             vars: self.run_vars.iter().map(|v| (v.name.clone(), if v.secret { "***".to_string() } else { v.value.clone() })).collect(),
@@ -1945,6 +2271,29 @@ fn finish_run(
             util::normpath(&base_dir.join(p)).to_string_lossy().into_owned()
         }
     };
+    // ${WTL_HOST_<KEY>}: a machine's computer name, known only now (the lab's, or the
+    // environment's own)
+    let mut def = def;
+    let hosts: IndexMap<String, String> = lab
+        .machines
+        .iter()
+        .map(|m| {
+            let h = target.as_ref().and_then(|(_, f)| f.hostnames.get(&m.name).cloned()).unwrap_or_else(|| m.hostname.clone());
+            (format!("WTL_HOST_{}", host_var(&m.name)), h)
+        })
+        .collect();
+    let sub = |v: &str, what: &str| -> Result<String> {
+        crate::runconf::substitute_hosts(v, &hosts).map_err(|e| anyhow!("{}: {}: {}", config.display(), what, e))
+    };
+    for (i, st) in def.steps.iter_mut().enumerate() {
+        st.run = sub(&st.run, &format!("step {} run", i + 1))?;
+        if let Some(a) = &st.args {
+            st.args = Some(sub(a, &format!("step {} args", i + 1))?);
+        }
+    }
+    for (letter, host) in def.mount.iter_mut() {
+        *host = sub(host, &format!("mount {}", letter))?;
+    }
     let default_name = util::stem(util::basename(&config.to_string_lossy())).to_string();
     let run = def.resolve(&config.display().to_string(), &default_name, &lab, host_resolve)?;
     Ok((lab_file, lab, run, target))

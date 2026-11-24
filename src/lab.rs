@@ -122,6 +122,15 @@ pub struct Target {
     /// machines (C:\WTL\instance.json)
     #[arg(long, value_name = "TEXT", requires = "new")]
     pub note: Option<String>,
+    /// with --new: give machines new Windows computer names (renamed for real, a few minutes):
+    /// KEY=NAME, KEY (-> KEY-SUFFIX, the environment's suffix: CL1-EXP42), or all; repeat it or use
+    /// commas. Machines not named keep theirs; a CA host named gets its CA reinstalled
+    #[arg(long, value_name = "ITEMS", requires = "new")]
+    pub rename: Vec<String>,
+    /// `run --new`: delete the environment after the run (also when a step failed); its
+    /// results are moved into the lab's runs/ first
+    #[arg(long, requires = "new")]
+    pub rm: bool,
     /// `run`: run in this lab or environment instead of the one the run file names
     #[arg(long, value_name = "LAB", conflicts_with = "new")]
     pub lab: Option<String>,
@@ -194,6 +203,9 @@ fn run_cli(cmd: &Cmd) -> Result<i32> {
     if t.new && cmd != "up" && cmd != "run" {
         bail!("--new works with wtl up and wtl run");
     }
+    if t.rm && cmd != "run" {
+        bail!("--rm works with wtl run --new (wtl rm ENV deletes an environment)");
+    }
     if t.lab.is_some() && cmd != "run" {
         bail!("--lab works with wtl run (the other commands take the lab or environment itself)");
     }
@@ -206,18 +218,24 @@ fn run_cli(cmd: &Cmd) -> Result<i32> {
         }
         let config = util::canon(Path::new(target));
         let (lab_file, lab, run, env) = labrun::load_run(&config, t.lab.as_deref()).context("config error")?;
-        let (lab_file, lab, env) = if t.new {
-            if let Some((n, f)) = &env {
-                bail!("--new makes a new environment of a lab, but {} is an environment (of lab {})", n, f.lab);
-            }
-            match labrun::spawn(&lab_file, lab, &opts, t.name.as_deref(), note) {
-                Ok((lf, l, e)) => (lf, l, Some(e)),
+        let (lab_file, lab, run, env) = if t.new {
+            let made = match labrun::spawn(&lab_file, lab, &opts, env, t.name.as_deref(), note, &t.rename) {
+                Ok((_, _, (n, _))) => n,
                 Err(e) => return Ok(labrun::exit_code(Err(e))),
-            }
+            };
+            // the run file again, against the new environment: its computer names (${WTL_HOST_*})
+            let (lf, l, r, e) = labrun::load_run(&config, Some(&made)).context("config error")?;
+            (lf, l, r, e)
         } else {
-            (lab_file, lab, env)
+            (lab_file, lab, run, env)
         };
-        return Ok(labrun::run(cmd, &lab_file, Some(config), Some(run), lab, &opts, env));
+        let made = env.as_ref().map(|(n, _)| n.clone());
+        let code = labrun::run(cmd, &lab_file, Some(config), Some(run), lab, &opts, env);
+        if let (true, Some(name)) = (t.rm, made) {
+            let rm = labrun::keep_results_and_remove(&name);
+            return Ok(if code == 0 { rm } else { code });
+        }
+        return Ok(code);
     }
     // the other commands take a LAB name, an environment, a lab .json file, or a run config
     // (which names its lab); `status` also LAB/MACHINE
@@ -260,10 +278,7 @@ fn run_cli(cmd: &Cmd) -> Result<i32> {
         None => labrun::load_lab(&lab_file).context("lab error")?,
     };
     let (lab_file, lab, env) = if t.new {
-        if let Some((n, f)) = &env {
-            bail!("--new makes a new environment of a lab, but {} is an environment (of lab {}): wtl up {} --new", n, f.lab, f.lab);
-        }
-        match labrun::spawn(&lab_file, lab, &opts, t.name.as_deref(), note) {
+        match labrun::spawn(&lab_file, lab, &opts, env, t.name.as_deref(), note, &t.rename) {
             Ok((lf, l, e)) => (lf, l, Some(e)),
             Err(e) => return Ok(labrun::exit_code(Err(e))),
         }

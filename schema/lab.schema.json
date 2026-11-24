@@ -218,6 +218,14 @@
             "string",
             "null"
           ]
+        },
+        "hostname": {
+          "description": "The Windows computer name, when it is not the machine's key (1-15 of `A-Z 0-9 -`). Set during the build; run files still address the machine by its key. An environment can rename it again (`wtl up LAB --new --rename`).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false

@@ -458,9 +458,11 @@ impl Guest {
     fn run_multi(&mut self, m: &Machine, cfg: &Value) -> Result<(), String> {
         let role = s(cfg, "role").to_string();
         let machine = s(cfg, "machine").to_string();
-        // like guest/lab.ps1: DOMAIN\user in AD mode, MACHINE\user (a local account) in a
+        // the Windows computer name (an environment's own, or the lab's)
+        let host = if s(cfg, "hostname").is_empty() { machine.clone() } else { s(cfg, "hostname").to_string() };
+        // like guest/lab.ps1: DOMAIN\user in AD mode, COMPUTER\user (a local account) in a
         // workgroup; Administrator when the machine has no logon user
-        let realm = if s(cfg, "mode") == "workgroup" { machine.clone() } else { s(cfg, "netbios").to_string() };
+        let realm = if s(cfg, "mode") == "workgroup" { host.clone() } else { s(cfg, "netbios").to_string() };
         let logon = if s(cfg, "logon_user").is_empty() { "Administrator" } else { s(cfg, "logon_user") };
         let user = format!("{}%5C{}", realm, logon);
         // a workgroup machine without a lab LAN must not get a lab NIC
@@ -473,9 +475,47 @@ impl Guest {
             cfg.get("roles").and_then(Value::as_array).map(|a| a.iter().filter(|r| r.as_str() != Some("ad-ds")).count()).unwrap_or(0);
         let has_config = roles_non_adds > 0 || arr("features") > 0 || arr("setup") > 0;
         self.emit(&format!("WTL AGENT_START os=fake build=17763 machine={}", machine));
+        // the boot that renames an environment's machine: like guest/lab.ps1's Invoke-LabRename
+        let rename = cfg.get("rename").filter(|r| !r.is_null()).cloned();
+        if let Some(rn) = &rename {
+            let (from, to) = (s(rn, "from").to_string(), s(rn, "to").to_string());
+            // what the disc asked for, so the test can check every machine's part
+            let flag = |k: &str| if rn[k] == json!(true) { "1" } else { "0" };
+            let peers: Vec<String> = rn["peers"]
+                .as_object()
+                .map(|m| m.iter().map(|(o, n)| format!("{}>{}", o, n.as_str().unwrap_or(""))).collect())
+                .unwrap_or_default();
+            self.emit(&format!(
+                "WTL LAB_PHASE | rename plan machine={} from={} to={} ca={} admin={} dhcp={} iis={} reenroll={} reenroll_user={} ca_name={} peers={}",
+                machine, from, to, flag("ca"), flag("admin"), flag("dhcp"), wtl_value(s(rn, "iis_site_path")), flag("reenroll"), flag("reenroll_user"), wtl_value(s(rn, "ca_name")), peers.join(",")
+            ));
+            if std::env::var("FAKE_RENAME_FAIL").is_ok() && from != to {
+                return Err(format!("{}: Rename-Computer {} failed (FAKE_RENAME_FAIL)", machine, to));
+            }
+            if from != to {
+                self.emit(&format!("WTL LAB_PHASE | renaming this computer {} -> {}", from, to));
+                if rn["ca"] == json!(true) {
+                    self.emit("WTL LAB_PHASE | uninstalling the CA, to install it again under the new name");
+                }
+                // a DC: netdom add + make primary, reboot; a member: rename, reboot
+                self.emit("WTL LAB_REBOOT phase=rename");
+                self.raw("garbage after reboot \u{0}\r\n");
+                self.emit(&format!("WTL AGENT_START os=fake build=17763 machine={}", machine));
+                if rn["admin"] == json!(true) {
+                    self.emit(&format!("WTL LAB_PHASE | renamed to {}; as the domain Administrator now", to));
+                    self.emit("WTL LAB_REBOOT phase=rename-admin");
+                    self.raw("garbage after reboot \u{0}\r\n");
+                    self.emit(&format!("WTL AGENT_START os=fake build=17763 machine={}", machine));
+                }
+                if rn["ca"] == json!(true) {
+                    self.emit(&format!("WTL LAB_ROLE machine={} name=ad-cs state=ready ca={}", machine, wtl_value(s(rn, "ca_name"))));
+                }
+            }
+            self.emit(&format!("WTL LAB_RENAMED machine={} from={} to={}", machine, from, to));
+        }
         if role == "dc" {
             let is_run = cfg.get("run").map(|r| !r.is_null()).unwrap_or(false);
-            if !is_run {
+            if !is_run && rename.is_none() {
                 // 0-state build: rename to the machine key + reboot before promotion (the host's
                 // wait_ev must ride through this extra reboot), then promote and report ready
                 self.emit(&format!("WTL LAB_START role=dc machine={} phase=new user=DC2019%5CAdministrator", machine));
@@ -489,7 +529,16 @@ impl Guest {
                 }
             }
             self.emit(&format!("WTL LAB_START role=dc machine={} phase=ready user=LAB%5CAdministrator", machine));
-            self.emit(&format!("WTL LAB_DC_READY domain={} dc={} computer={} | {}", s(cfg, "domain"), machine, machine, self.name));
+            self.emit(&format!("WTL LAB_DC_READY domain={} dc={} computer={} | {}", s(cfg, "domain"), host, host, self.name));
+            let peers = rename.as_ref().and_then(|r| r["peers"].as_object().cloned()).unwrap_or_default();
+            let own = rename.as_ref().is_some_and(|r| s(r, "from") != s(r, "to"));
+            if !peers.is_empty() || own {
+                let mut old: Vec<String> = peers.keys().cloned().collect();
+                if own {
+                    old.push(s(rename.as_ref().unwrap(), "from").to_string());
+                }
+                self.emit(&format!("WTL LAB_DNS_CLEAN removed={}", old.join(",")));
+            }
             if is_run {
                 return self.run_multi_steps(m, cfg, &machine);
             }
@@ -497,6 +546,13 @@ impl Guest {
         }
         if role != "member" {
             return Err(format!("unknown role {}", role));
+        }
+        if rename.is_some() {
+            // after a rename: logged on again, frozen like after a build
+            self.emit(&format!("WTL LAB_START role=member machine={} phase=joined user={}", machine, user));
+            self.emit(&format!("WTL LAB_CLIENT_READY user={} machine={} computer={}", user, machine, host));
+            self.emit("WTL LAB_IDLE");
+            return Ok(());
         }
         if cfg.get("shutdown_when_ready").and_then(Value::as_bool) == Some(true) {
             // 0-state build: rename+join in one reboot, autologon
@@ -525,7 +581,7 @@ impl Guest {
             return Ok(());
         }
         self.emit(&format!("WTL LAB_START role=member machine={} phase=ready user={}", machine, user));
-        self.emit(&format!("WTL LAB_CLIENT_READY user={} machine={} computer={}", user, machine, machine));
+        self.emit(&format!("WTL LAB_CLIENT_READY user={} machine={} computer={}", user, machine, host));
         if cfg.get("run").map(|r| !r.is_null()).unwrap_or(false) {
             return self.run_multi_steps(m, cfg, &machine);
         }
@@ -1569,7 +1625,18 @@ fn driver(args: &[String]) -> i32 {
         let run_env = j["run"]["env"].as_object().cloned().unwrap_or_default();
         let names: Vec<&str> = run_env.keys().map(String::as_str).collect();
         c.ok(
-            names == ["WTL_DIR", "WTL_KEY", "WTL_TAG", "WTL_ENVIRONMENT", "WTL_ENVIRONMENT_ID", "WTL_MACHINE", "WTL_RUN_ID"]
+            names
+                == [
+                    "WTL_DIR",
+                    "WTL_KEY",
+                    "WTL_TAG",
+                    "WTL_ENVIRONMENT",
+                    "WTL_ENVIRONMENT_ID",
+                    "WTL_MACHINE",
+                    "WTL_RUN_ID",
+                    "WTL_HOSTNAME",
+                    "WTL_HOST_WS1",
+                ]
                 && run_env["WTL_DIR"] == json!("../../app")
                 && run_env["WTL_KEY"] == json!("s3cr3t-value")
                 && run_env["WTL_TAG"] == json!("fromenv")
@@ -1879,7 +1946,7 @@ fn driver(args: &[String]) -> i32 {
         let lj: Value = serde_json::from_slice(iso.read("LAB/lab.json").unwrap()).unwrap();
         let inst: Value = serde_json::from_str(lj["instance"]["json"].as_str().unwrap_or("null")).unwrap_or(Value::Null);
         c.ok(
-            inst == json!({ "lab": "solo", "environment": "solo-exp42", "id": id, "machine": "WS1", "note": "first try: new installer", "run_id": "" }),
+            inst == json!({ "lab": "solo", "environment": "solo-exp42", "id": id, "machine": "WS1", "hostname": "WS1", "hostnames": { "WS1": "WS1" }, "note": "first try: new installer", "run_id": "" }),
             format!("instance.json {}", inst),
         );
         let reg = lj["instance"]["reg"].as_str().unwrap_or("");
@@ -1946,10 +2013,23 @@ fn driver(args: &[String]) -> i32 {
                 && env["WTL_RUN_ID"] == rj["run_id"],
             format!("step env {}", env),
         );
-        // --new and --lab are refused where they make no sense
-        let i = run(cx, outs, &["up", "solo-exp42", "--new"], &[]);
+        // a copy of an environment (one level deep): its own, from solo-exp42's 0 state
+        let i = run(cx, outs, &["up", "solo-exp42", "--new", "--name", "copy"], &[]);
+        c.code(&outs[i].1, 0);
+        c.has(&outs[i].1, "environment solo-exp42-copy (id ");
+        c.has(&outs[i].1, "made from environment solo-exp42's 0 state");
+        let cj = env_json("solo-exp42-copy");
+        c.ok(cj["lab"] == json!("solo") && cj["parent"] == json!("solo-exp42"), format!("copy env.json {}", cj));
+        let i = run(cx, outs, &["up", "solo-exp42-copy", "--new"], &[]);
         c.code(&outs[i].1, 2);
-        c.has(&outs[i].1, "is an environment (of lab solo)");
+        c.has(&outs[i].1, "is a copy of solo-exp42 already");
+        // the environment a copy was made from cannot go first
+        let i = run(cx, outs, &["rm", "solo-exp42"], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "has copies (solo-exp42-copy)");
+        let i = run(cx, outs, &["rm", "solo-exp42-copy"], &[]);
+        c.code(&outs[i].1, 0);
+        // --new and --lab are refused where they make no sense
         let i = run(cx, outs, &["status", "solo", "--name", "x"], &[]);
         c.code(&outs[i].1, 2);
         let i = run(cx, outs, &["rm", "solo"], &[]);
@@ -1972,7 +2052,7 @@ fn driver(args: &[String]) -> i32 {
         // an environment made fresh again: from the lab's new 0 state, same id
         let i = run(cx, outs, &["rebuild", "solo-exp42"], &[]);
         c.code(&outs[i].1, 0);
-        c.has(&outs[i].1, "environment solo-exp42 is fresh again from lab solo's 0 state");
+        c.has(&outs[i].1, "environment solo-exp42 is fresh again from solo's 0 state");
         let ej2 = env_json("solo-exp42");
         c.ok(ej2["id"] == json!(id) && ej2["frozen"] != ej["frozen"], format!("refreshed env.json {}", ej2));
         // the old frozen 0 state goes with the last environment that uses it
@@ -2002,6 +2082,151 @@ fn driver(args: &[String]) -> i32 {
             format!("env.json lan_port {}", env_json("tri-lan")["lan_port"]),
         );
         let i = run(cx, outs, &["rm", "tri-lan"], &[]);
+        c.code(&outs[i].1, 0);
+    });
+
+    scenario(&mut cx, "renames: --rename, tiers, CA reinstall plan, state, copies, ${WTL_HOST_*}, --rm", &|cx, c, outs| {
+        let env_json = |name: &str| -> Value {
+            serde_json::from_slice(&std::fs::read(cx.state(name).join("env.json")).unwrap_or_default()).unwrap_or(Value::Null)
+        };
+        // bad names fail before anything is made
+        let i = run(cx, outs, &["up", "solo", "--new", "--rename", "NOPE"], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "has no machine NOPE");
+        let i = run(cx, outs, &["up", "solo", "--new", "--name", "averyverylongname", "--rename", "WS1"], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "characters (Windows allows 15)");
+        c.ok(!cx.state("solo-averyverylongname").exists(), "nothing made for a bad name");
+        let i = run(cx, outs, &["up", "solo", "--rename", "WS1"], &[]);
+        c.code(&outs[i].1, 2); // clap: --rename needs --new
+
+        // a workgroup machine: renamed for real, then saved
+        let i = run(cx, outs, &["up", "solo", "--new", "--name", "rn", "--rename", "all"], &[]);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        c.has(o, "=== renaming the machines of environment solo-rn: WS1 -> WS1-RN ===");
+        c.has(o, "WS1: WTL LAB_RENAMED machine=WS1 from=WS1 to=WS1-RN");
+        c.has(o, "environment solo-rn: machines renamed and saved");
+        c.has(o, "single WS1 (WS1-RN)");
+        let ej = env_json("solo-rn");
+        c.ok(ej["hostnames"] == json!({ "WS1": "WS1-RN" }) && ej["rename_state"] == json!("done"), format!("env.json {}", ej));
+        c.file(&cx.state("solo-rn").join("0-state.json"));
+        c.no_file(&cx.state("solo-rn").join("0-state.json.pending"));
+        let iso = IsoReader::open(&cx.state("solo-rn").join("WS1.iso"), true).unwrap();
+        let lj: Value = serde_json::from_slice(iso.read("LAB/lab.json").unwrap()).unwrap();
+        let inst: Value = serde_json::from_str(lj["instance"]["json"].as_str().unwrap_or("null")).unwrap_or(Value::Null);
+        c.ok(
+            lj["hostname"] == json!("WS1-RN") && inst["hostname"] == json!("WS1-RN") && lj["rename"].is_null(),
+            format!("up disc {} {}", lj["hostname"], inst),
+        );
+        let i = run(cx, outs, &["status", "solo-rn"], &[]);
+        c.has(&outs[i].1, "hostname WS1-RN");
+        c.has(&outs[i].1, "renamed (done): WS1 -> WS1-RN");
+        // run files use ${WTL_HOST_<KEY>}; steps get WTL_HOSTNAME
+        let conf = cx.cfg(
+            "hosts-run.json",
+            "{ \"lab\": \"solo\", \"mount\": { \"X\": \"../app\" }, \"steps\": [ { \"as\": \"system\", \"run\": \"X:/setup.bat\", \"args\": \"--host ${WTL_HOST_WS1}\" } ] }\n",
+        );
+        let i = run(cx, outs, &["run", &conf, "--lab", "solo-rn"], &[]);
+        c.code(&outs[i].1, 0);
+        let iso = IsoReader::open(&cx.state("solo-rn").join("WS1.iso"), true).unwrap();
+        let lj: Value = serde_json::from_slice(iso.read("LAB/lab.json").unwrap()).unwrap();
+        c.ok(lj["run"]["steps"][0]["args"] == json!("--host WS1-RN"), format!("step args {}", lj["run"]["steps"][0]["args"]));
+        c.ok(
+            lj["run"]["env"]["WTL_HOSTNAME"] == json!("WS1-RN") && lj["run"]["env"]["WTL_HOST_WS1"] == json!("WS1-RN"),
+            format!("env {}", lj["run"]["env"]),
+        );
+        let res = std::fs::canonicalize(cx.state("solo-rn").join("last")).unwrap_or_default();
+        let rj: Value = serde_json::from_slice(&std::fs::read(res.join("result.json")).unwrap_or_default()).unwrap_or(Value::Null);
+        c.ok(rj["hostnames"] == json!({ "WS1": "WS1-RN" }), format!("result.json hostnames {}", rj["hostnames"]));
+        let i = run(cx, outs, &["run", &conf, "--lab", "solo"], &[]);
+        c.code(&outs[i].1, 0);
+        // a copy of a renamed environment keeps its names and needs no rename
+        let i = run(cx, outs, &["up", "solo-rn", "--new", "--name", "c"], &[]);
+        c.code(&outs[i].1, 0);
+        c.lacks(&outs[i].1, "renaming the machines");
+        c.ok(env_json("solo-rn-c")["hostnames"] == json!({ "WS1": "WS1-RN" }), format!("copy {}", env_json("solo-rn-c")));
+        let i = run(cx, outs, &["up", "solo-rn", "--new", "--rename", "WS1=X1"], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "--rename makes new names from a lab");
+        // rebuild replays the rename
+        let i = run(cx, outs, &["rebuild", "solo-rn-c"], &[]);
+        c.code(&outs[i].1, 0);
+        c.lacks(&outs[i].1, "renaming the machines");
+        let i = run(cx, outs, &["rm", "solo-rn-c"], &[]);
+        c.code(&outs[i].1, 0);
+        let i = run(cx, outs, &["rebuild", "solo-rn"], &[]);
+        c.code(&outs[i].1, 0);
+        c.has(&outs[i].1, "=== renaming the machines of environment solo-rn: WS1 -> WS1-RN ===");
+        // a failed rename: the environment is kept for a look, but only rebuild / rm act on it
+        let i = run(cx, outs, &["up", "solo", "--new", "--name", "bad", "--rename", "WS1"], &[("FAKE_RENAME_FAIL", "1")]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "renaming the machines of environment solo-bad failed");
+        c.ok(env_json("solo-bad")["rename_state"] == json!("failed"), format!("{}", env_json("solo-bad")));
+        let i = run(cx, outs, &["up", "solo-bad"], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "environment solo-bad's rename failed");
+        let i = run(cx, outs, &["rebuild", "solo-bad"], &[]);
+        c.code(&outs[i].1, 0);
+        c.ok(env_json("solo-bad")["rename_state"] == json!("done"), "rebuild renamed it");
+        for e in ["solo-bad", "solo-rn"] {
+            let i = run(cx, outs, &["rm", e], &[]);
+            c.code(&outs[i].1, 0);
+        }
+        // run --new --rename: the run file's ${WTL_HOST_*} are the new environment's names
+        let i = run(cx, outs, &["run", &conf, "--new", "--name", "hz", "--rename", "WS1"], &[]);
+        c.code(&outs[i].1, 0);
+        let iso = IsoReader::open(&cx.state("solo-hz").join("WS1.iso"), true).unwrap();
+        let lj: Value = serde_json::from_slice(iso.read("LAB/lab.json").unwrap()).unwrap();
+        c.ok(lj["run"]["steps"][0]["args"] == json!("--host WS1-HZ"), format!("run --new --rename args {}", lj["run"]["steps"][0]["args"]));
+        let i = run(cx, outs, &["rm", "solo-hz"], &[]);
+        c.code(&outs[i].1, 0);
+        // a throwaway renamed run: results kept in the lab's runs/, the environment gone
+        let i = run(cx, outs, &["run", &conf, "--new", "--rename", "WS1", "--rm"], &[]);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        c.has(o, "results kept: ");
+        let kept = o.text.lines().find_map(|l| l.split("results kept: ").nth(1)).unwrap_or("").trim().to_string();
+        let rj: Value =
+            serde_json::from_slice(&std::fs::read(Path::new(&kept).join("result.json")).unwrap_or_default()).unwrap_or(Value::Null);
+        let env = s(&rj, "environment").to_string();
+        c.ok(kept.contains("/solo/runs/") && env.starts_with("solo-") && !cx.state(&env).exists(), format!("kept {} env {}", kept, env));
+        c.ok(
+            rj["hostnames"]["WS1"].as_str().is_some_and(|h| h.starts_with("WS1-") && h != "WS1"),
+            format!("hostnames {}", rj["hostnames"]),
+        );
+        let i = run(cx, outs, &["restore", "solo"], &[]);
+        c.code(&outs[i].1, 0);
+
+        // an AD lab with a CA: the DC first, then the CA host, then the member; each part right
+        let i = run(cx, outs, &["up", "roles", "--new", "--name", "x1", "--rename", "all"], &[]);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        c.has(o, "DC -> DC-X1, CA -> CA-X1, CL -> CL-X1");
+        c.has(o, "CA hosts the CA PKI-ROOT-CA: it is reinstalled under its new name");
+        c.has(o, "rename plan machine=DC from=DC to=DC-X1 ca=0 admin=0 dhcp=1 iis= reenroll=0 reenroll_user=0 ca_name=PKI-ROOT-CA peers=CA>CA-X1,CL>CL-X1");
+        c.has(o, "rename plan machine=CA from=CA to=CA-X1 ca=1 admin=1 dhcp=0 iis=C:\\inetpub\\wwwroot reenroll=0 reenroll_user=0");
+        c.has(o, "rename plan machine=CL from=CL to=CL-X1 ca=0 admin=0 dhcp=0 iis= reenroll=1 reenroll_user=1");
+        c.has(o, "DC: WTL LAB_DNS_CLEAN removed=CA,CL,DC");
+        // positions after the rename began (the same command built the lab's 0 state first)
+        let start = o.text.find("=== renaming the machines").unwrap_or(0);
+        let pos = |needle: &str| o.text[start..].find(needle).unwrap_or(usize::MAX);
+        c.ok(
+            pos("DC: WTL LAB_RENAMED") < pos("CA started") && pos("CA: WTL LAB_RENAMED") < pos("CL started"),
+            "tiers: the DC renamed before the CA boots, the CA before the member",
+        );
+        // only the member: the CA keeps its name (no reinstall), the member still re-enrolls
+        let i = run(cx, outs, &["up", "roles", "--new", "--name", "x2", "--rename", "CL"], &[]);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        c.lacks(o, "is reinstalled under its new name");
+        c.has(o, "rename plan machine=CL from=CL to=CL-X2 ca=0 admin=0 dhcp=0 iis= reenroll=1 reenroll_user=0");
+        c.has(o, "peers=CL>CL-X2");
+        for e in ["roles-x1", "roles-x2"] {
+            let i = run(cx, outs, &["rm", e], &[]);
+            c.code(&outs[i].1, 0);
+        }
+        let i = run(cx, outs, &["restore", "roles"], &[]);
         c.code(&outs[i].1, 0);
     });
 

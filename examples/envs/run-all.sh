@@ -2,16 +2,20 @@
 # run-all.sh - environments end to end on real VMs, every result checked; stops at the first
 # failure. The same commands as README.md, one after the other.
 #
-#   examples/envs/build.sh                    # once: out/whereami.exe (and out32/ for 2003)
-#   examples/envs/run-all.sh single-2019      # or single-2003, single-2022, ... or 2019 (AD)
+#   examples/envs/build.sh                         # once: out/whereami.exe (and out32/ for 2003)
+#   examples/envs/run-all.sh single-2019           # or single-2003, single-2022, ... or 2019 (AD)
+#   examples/envs/run-all.sh single-2019 --rename  # the same with every machine renamed
 #
-# It makes the environment LAB-demo, runs whereami.exe in it and in LAB itself at the same time
-# (each must know which one it is), makes it fresh again, and deletes it. LAB is restored at the
-# end (its own VMs are stopped). WTL=path/to/wtl uses another wtl than the one on the PATH.
+# It makes the environment LAB-demo (with --rename: every machine renamed to <KEY>-DEMO), runs
+# whereami.exe in it and in LAB itself at the same time (each must know which one it is and
+# have its computer name), makes it fresh again, and deletes it. LAB is restored at the end
+# (its own VMs are stopped). WTL=path/to/wtl uses another wtl than the one on the PATH.
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 wtl=${WTL:-wtl}
 lab=${1:-}
+rename=${2:-}
+[ -z "$rename" ] || [ "$rename" = --rename ] || { echo "usage: run-all.sh LAB [--rename]"; exit 2; }
 case $lab in
   single-2003) cfg=$here/whereami-2003.json; exe=$here/out32/whereami.exe ;;
   2019) cfg=$here/whereami-ad.json; exe=$here/out/whereami.exe ;;
@@ -43,10 +47,13 @@ check_run() { # NAME ID LOG
 
 [ -f "$exe" ] || fail "no $exe: run examples/envs/build.sh first"
 
-step "1. a new environment of $lab: $env"
+step "1. a new environment of $lab: $env${rename:+, every machine renamed}"
 "$wtl" rm "$env" > /dev/null 2>&1
-"$wtl" up "$lab" --new --name demo --note "whereami demo" > "$logs/up.log" 2>&1 || fail "wtl up $lab --new failed (see $logs/up.log)"
+renames=()
+[ -n "$rename" ] && renames=(--rename all)
+"$wtl" up "$lab" --new --name demo --note "whereami demo" "${renames[@]}" > "$logs/up.log" 2>&1 || fail "wtl up $lab --new failed (see $logs/up.log)"
 grep "environment $env (id" "$logs/up.log" | head -1
+grep "LAB_RENAMED" "$logs/up.log" | grep -v "\[guest\]"
 grep -A20 "^  environment $env" "$logs/up.log"
 
 step "2. wtl list: $env is there, running, with its note"
@@ -60,10 +67,20 @@ grep -q "^$env .* $lab .* $id .* running .*whereami demo" "$logs/list.log" || fa
 
 step "3. wtl status: the environment, and one machine of it"
 machine=$("$wtl" status "$lab" | awk '$2 == "single" || $2 == "member" { print $1; exit }')
+dcm=$("$wtl" status "$lab" | awk '$2 == "dc" { print $1; exit }')
+# the computer names to expect: the lab keeps its own; with --rename the copy's are <KEY>-DEMO
+host_lab=$machine; host_lab_dc=$dcm; host_env=$machine; host_env_dc=$dcm
+if [ -n "$rename" ]; then
+  host_env=$(echo "$machine-DEMO" | tr a-z A-Z)
+  [ -n "$dcm" ] && host_env_dc=$(echo "$dcm-DEMO" | tr a-z A-Z)
+fi
 "$wtl" status "$env" | tee "$logs/status.log"
 grep -q "environment $env (id $id) of lab $lab" "$logs/status.log" || fail "wtl status $env does not say what it is"
 "$wtl" status "$env/$machine" | tee "$logs/status-machine.log"
 grep -q "^  $machine " "$logs/status-machine.log" || fail "wtl status $env/$machine does not show $machine"
+if [ -n "$rename" ]; then
+  grep -q "hostname $host_env" "$logs/status-machine.log" || fail "wtl status $env/$machine does not show its computer name $host_env"
+fi
 
 # SYSTEM steps see the step variables only from a 0 state built by wtl 0.3+ (its SYSTEM worker)
 state_dir=$("$wtl" home | awk '$1 == "state_dir" { print $2 }')
@@ -71,9 +88,11 @@ sysvars=""
 grep -q '"step-env"' "$state_dir/$lab/0-state.json" 2>/dev/null && sysvars="--vars"
 
 step "4. whereami.exe in $env (id $id) and in $lab (id $lab_id), at the same time"
-WTL_EXPECT_ENV=$env WTL_EXPECT_ID=$id WTL_SYSTEM_VARS=$sysvars "$wtl" run "$cfg" --lab "$env" > "$logs/run-env.log" 2>&1 &
+WTL_EXPECT_ENV=$env WTL_EXPECT_ID=$id WTL_EXPECT_HOST=$host_env WTL_EXPECT_HOST_DC=$host_env_dc WTL_SYSTEM_VARS=$sysvars \
+  "$wtl" run "$cfg" --lab "$env" > "$logs/run-env.log" 2>&1 &
 a=$!
-WTL_EXPECT_ENV=$lab WTL_EXPECT_ID=$lab_id WTL_SYSTEM_VARS=$sysvars "$wtl" run "$cfg" --lab "$lab" > "$logs/run-lab.log" 2>&1 &
+WTL_EXPECT_ENV=$lab WTL_EXPECT_ID=$lab_id WTL_EXPECT_HOST=$host_lab WTL_EXPECT_HOST_DC=$host_lab_dc WTL_SYSTEM_VARS=$sysvars \
+  "$wtl" run "$cfg" --lab "$lab" > "$logs/run-lab.log" 2>&1 &
 b=$!
 wait $a
 wait $b
@@ -82,9 +101,13 @@ check_run "$env" "$id" "$logs/run-env.log"
 echo "in $lab:"
 check_run "$lab" "$lab_id" "$logs/run-lab.log"
 
-step "5. wtl rebuild $env: fresh again from $lab's 0 state, same id"
-"$wtl" rebuild "$env" | tee "$logs/rebuild.log"
+step "5. wtl rebuild $env: fresh again from $lab's 0 state, same id${rename:+, renamed again}"
+"$wtl" rebuild "$env" > "$logs/rebuild.log" 2>&1 || fail "wtl rebuild $env failed (see $logs/rebuild.log)"
+grep -v "\[guest\]" "$logs/rebuild.log" | tail -3
 [ "$(id_of "$env")" = "$id" ] || fail "$env has another id after wtl rebuild"
+if [ -n "$rename" ]; then
+  "$wtl" status "$env/$machine" | grep -q "hostname $host_env" || fail "$env/$machine is not $host_env after wtl rebuild"
+fi
 
 step "6. wtl rm $env"
 "$wtl" rm "$env" | tee "$logs/rm.log"

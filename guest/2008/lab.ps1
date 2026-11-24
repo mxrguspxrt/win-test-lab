@@ -334,7 +334,9 @@ function Invoke-LabClient($Cfg, [string]$LabDir) {
     $user = [string]$Cfg.logon_user
     $pass = [string]$Cfg.logon_password
     if (-not $user) { $user = 'Administrator'; $pass = [string]$Cfg.admin_password }
-    $want = [string]$Cfg.machine
+    # the Windows computer name: lab.json's "hostname" (an environment's own, or the lab key)
+    $want = [string]$Cfg.hostname
+    if (-not $want) { $want = [string]$Cfg.machine }
     if ($phase -eq 'new') {
         foreach ($k in @('roles', 'features', 'setup')) {
             if (@($Cfg.$k | Where-Object { $_ }).Count -gt 0) { throw "Windows Server 2008 R2 machines have no '$k' yet" }
@@ -581,8 +583,40 @@ function Set-LabInstance($Cfg) {
     }
 }
 
+# ---------------------------------------------------------------- renames
+
+# The boot that renames an environment's machine (wtl up LAB --new --rename; the disc's
+# "rename": from, to). rename.ps1 (on this disc) renames it as SYSTEM through the worker, points
+# the automatic logon (COMPUTER\user) at the new name and reboots; on the next logon LAB_RENAMED.
+# Returns 'renamed' (go on as on any boot) or 'reboot'.
+function Invoke-LabRename($Cfg, [string]$LabDir) {
+    $to = [string]$Cfg.rename.to
+    if ($env:COMPUTERNAME -ne $to) {
+        Send-LabPhase "renaming this computer $env:COMPUTERNAME -> $to"
+        $runDir = 'C:\WTL\run'
+        if (-not (Test-Path $runDir)) { New-Item -ItemType Directory -Path $runDir -Force | Out-Null }
+        $req = @{ action = 'run'; path = (Join-Path $LabDir 'rename.ps1'); args = ('-LabDir "' + $LabDir + '"'); cwd = $runDir;
+                  timeout = 600; out = (Join-Path $runDir 'rename.out'); err = (Join-Path $runDir 'rename.err'); keep_running = $false }
+        $res = Invoke-SvcRequest $req 700
+        if (-not $res.ok) { throw "renaming to ${to}: $($res.error)" }
+        if ([int]$res.exit -ne 0) {
+            $e = ''; try { $e = [System.IO.File]::ReadAllText((Join-Path $runDir 'rename.err')) } catch { }
+            throw "renaming to ${to}: rename.ps1 exited $($res.exit) $($e.Trim())"
+        }
+        Send-WtlEvent 'LAB_REBOOT' @('phase', 'rename')
+        return 'reboot'
+    }
+    Send-WtlEvent 'LAB_RENAMED' @('machine', [string]$Cfg.machine, 'from', [string]$Cfg.rename.from, 'to', $env:COMPUTERNAME)
+    return 'renamed'
+}
+
 function Invoke-LabMulti($Cfg, [string]$LabDir) {
     if ([string]$Cfg.role -ne 'member') { throw "Windows Server 2008 R2 machines cannot have the role '$($Cfg.role)' yet" }
+    # the boot that renames an environment's machine: first the rename, then as on any boot
+    if ($Cfg.rename -ne $null) {
+        $rr = Invoke-LabRename $Cfg $LabDir
+        if ($rr -ne 'renamed') { return $rr }
+    }
     $r = Invoke-LabClient $Cfg $LabDir
     if ($r -ne 'ready') { return $r }
     # the 0-state build: the finished machine is frozen; the host powers it off via ACPI

@@ -171,7 +171,7 @@ pub fn guest_scripts_for(home: &Home, os_key: &str) -> Result<Vec<(String, Vec<u
 /// extension), staged into `LAB\` so the logon agent can find and run them.
 pub fn control_scripts_for(home: &Home, os_key: &str) -> Result<Vec<(String, Vec<u8>)>> {
     // common.* is the shared library the VBScript agent / worker load (VBScript has no include)
-    let stems = ["agent.", "lab.", "labsvc.", "common."];
+    let stems = ["agent.", "lab.", "labsvc.", "common.", "rename."];
     Ok(guest_scripts_for(home, os_key)?.into_iter().filter(|(n, _)| stems.iter().any(|s| n.starts_with(s))).collect())
 }
 

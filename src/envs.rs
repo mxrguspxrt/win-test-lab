@@ -15,6 +15,7 @@
 use crate::home::Home;
 use crate::util;
 use anyhow::{anyhow, bail, Context, Result};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -36,6 +37,38 @@ pub struct EnvFile {
     /// its own lab LAN port (a lab with a `network`)
     #[serde(default)]
     pub lan_port: Option<u16>,
+    /// what it was copied from: the lab's state name, or the environment it is a copy of
+    /// (`wtl up ENV --new`); empty in an older env.json (= the lab)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub parent: String,
+    /// the machines with another Windows computer name than their lab's (`--rename`, or copied
+    /// from a renamed parent): machine key -> computer name
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub hostnames: IndexMap<String, String>,
+    /// the renames this environment did itself: "pending" while its machines are renamed,
+    /// "done", or "failed" (then only `wtl rebuild` and `wtl rm` act on it); absent without any
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rename_state: Option<String>,
+    /// the renames this environment did itself (machine key -> computer name), replayed by
+    /// `wtl rebuild`
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub renamed: IndexMap<String, String>,
+}
+
+impl EnvFile {
+    /// What it was copied from (a lab, or an environment).
+    pub fn parent(&self) -> &str {
+        if self.parent.is_empty() {
+            &self.lab
+        } else {
+            &self.parent
+        }
+    }
+
+    /// Usable for boots and runs: not half renamed.
+    pub fn usable(&self) -> bool {
+        self.rename_state.as_deref().is_none_or(|s| s == "done")
+    }
 }
 
 /// The file name of an environment's description in its state folder.
@@ -108,6 +141,78 @@ pub fn random_suffix() -> String {
     s
 }
 
+/// A Windows computer name: 1-15 of `A-Z 0-9 -`, not only digits, not starting or ending with
+/// `-` (what NetBIOS and DNS both accept).
+pub fn check_computer_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 15
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.bytes().all(|b| b.is_ascii_digit());
+    if !ok {
+        bail!("{:?} is not a Windows computer name (1-15 of A-Z 0-9 -, not only digits, no - at either end)", name);
+    }
+    Ok(())
+}
+
+/// The new computer names from `--rename` items (each may hold several, comma-separated):
+/// `KEY=NAME` that name, `KEY` the generated `<KEY>-<SUFFIX>`, `all` every machine generated.
+/// `machines` are the keys with their current computer names; `suffix` is the environment's own
+/// part of its name (`exp42` of `school-exp42`). A machine not named keeps its name; `KEY=NAME`
+/// wins over `all`. Names are upper case, valid, unique and never cut short.
+pub fn plan_renames(lab: &str, machines: &[(String, String)], suffix: &str, items: &[String]) -> Result<IndexMap<String, String>> {
+    let key_of = |k: &str| machines.iter().find(|(m, _)| m.eq_ignore_ascii_case(k)).map(|(m, _)| m.clone());
+    let keys = || machines.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>().join(" ");
+    let generated = |k: &str| -> Result<String> {
+        let n = format!("{}-{}", k, suffix).to_ascii_uppercase();
+        if n.len() > 15 {
+            bail!(
+                "--rename {}: {} would be {} characters (Windows allows 15): give it a name ({}=NAME) or the environment a shorter --name",
+                k,
+                n,
+                n.len(),
+                k
+            );
+        }
+        Ok(n)
+    };
+    let mut generated_for: Vec<String> = Vec::new();
+    let mut exact: IndexMap<String, String> = IndexMap::new();
+    for item in items.iter().flat_map(|i| i.split(',')).map(str::trim).filter(|i| !i.is_empty()) {
+        match item.split_once('=') {
+            Some((k, n)) => {
+                let key =
+                    key_of(k.trim()).ok_or_else(|| anyhow!("--rename {}: {} has no machine {} (machines: {})", item, lab, k, keys()))?;
+                exact.insert(key, n.trim().to_ascii_uppercase());
+            }
+            None if item.eq_ignore_ascii_case("all") => generated_for.extend(machines.iter().map(|(m, _)| m.clone())),
+            None => generated_for
+                .push(key_of(item).ok_or_else(|| anyhow!("--rename {}: {} has no machine {} (machines: {})", item, lab, item, keys()))?),
+        }
+    }
+    let mut out: IndexMap<String, String> = IndexMap::new();
+    for (k, _) in machines {
+        if let Some(n) = exact.get(k) {
+            out.insert(k.clone(), n.clone());
+        } else if generated_for.contains(k) {
+            out.insert(k.clone(), generated(k)?);
+        }
+    }
+    // a name that is the machine's current one is no rename
+    out.retain(|k, n| !machines.iter().any(|(m, cur)| m == k && cur.eq_ignore_ascii_case(n)));
+    for n in out.values() {
+        check_computer_name(n)?;
+    }
+    let finals: Vec<String> = machines.iter().map(|(k, cur)| out.get(k).cloned().unwrap_or_else(|| cur.to_ascii_uppercase())).collect();
+    for (i, n) in finals.iter().enumerate() {
+        if finals[..i].contains(n) {
+            bail!("two machines of {} would both be called {}", lab, n);
+        }
+    }
+    Ok(out)
+}
+
 /// A note is one line (it goes into the registry, JSON and the status table).
 pub fn check_note(note: &str) -> Result<()> {
     if note.chars().any(|c| c.is_control()) {
@@ -149,12 +254,15 @@ pub fn of_lab(home: &Home, lab_state_name: &str) -> Vec<(String, EnvFile)> {
 /// written as UTF-16). `wow64` adds the 32-bit registry view, for 32-bit programs on 64-bit
 /// Windows.
 pub fn instance_files(i: &Instance, machine: &str, run_id: &str, wow64: bool) -> (String, String) {
+    let hostname = i.hostnames.get(machine).map(String::as_str).unwrap_or(machine);
     let json = crate::pyjson::dumps_indent(
         &serde_json::json!({
             "lab": i.lab,
             "environment": i.environment,
             "id": i.id,
             "machine": machine,
+            "hostname": hostname,
+            "hostnames": i.hostnames,
             "note": i.note,
             "run_id": run_id,
         }),
@@ -162,11 +270,12 @@ pub fn instance_files(i: &Instance, machine: &str, run_id: &str, wow64: bool) ->
     );
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let values = format!(
-        "\"Lab\"=\"{}\"\r\n\"Environment\"=\"{}\"\r\n\"Id\"=\"{}\"\r\n\"Machine\"=\"{}\"\r\n\"Note\"=\"{}\"\r\n\"RunId\"=\"{}\"\r\n",
+        "\"Lab\"=\"{}\"\r\n\"Environment\"=\"{}\"\r\n\"Id\"=\"{}\"\r\n\"Machine\"=\"{}\"\r\n\"Hostname\"=\"{}\"\r\n\"Note\"=\"{}\"\r\n\"RunId\"=\"{}\"\r\n",
         esc(&i.lab),
         esc(&i.environment),
         esc(&i.id),
         esc(machine),
+        esc(hostname),
         esc(&i.note),
         esc(run_id)
     );
@@ -178,13 +287,14 @@ pub fn instance_files(i: &Instance, machine: &str, run_id: &str, wow64: bool) ->
 }
 
 /// Who a running lab or environment is: the lab, the environment's name (the lab's own name for
-/// the lab itself), its id and note.
+/// the lab itself), its id and note, and every machine's computer name (key -> hostname).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Instance {
     pub lab: String,
     pub environment: String,
     pub id: String,
     pub note: String,
+    pub hostnames: IndexMap<String, String>,
 }
 
 #[cfg(test)]
@@ -203,19 +313,59 @@ mod tests {
     }
 
     #[test]
+    fn rename_plans() {
+        let pki: Vec<(String, String)> = ["DC1", "CA1", "CL1"].iter().map(|k| (k.to_string(), k.to_string())).collect();
+        let items = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        let show = |p: IndexMap<String, String>| p.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>();
+        assert_eq!(
+            show(plan_renames("pki", &pki, "exp42", &items(&["all"])).unwrap()),
+            ["DC1=DC1-EXP42", "CA1=CA1-EXP42", "CL1=CL1-EXP42"]
+        );
+        // only what is listed; KEY=NAME wins over all; commas; any case
+        assert_eq!(show(plan_renames("pki", &pki, "k7q3", &items(&["cl1"])).unwrap()), ["CL1=CL1-K7Q3"]);
+        assert_eq!(
+            show(plan_renames("pki", &pki, "x", &items(&["all,cl1=alice-pc"])).unwrap()),
+            ["DC1=DC1-X", "CA1=CA1-X", "CL1=ALICE-PC"]
+        );
+        let e = plan_renames("pki", &pki, "averyverylong", &items(&["CL1"])).unwrap_err().to_string();
+        assert!(e.contains("would be 17 characters") && e.contains("CL1=NAME"), "{}", e);
+        let e = plan_renames("pki", &pki, "x", &items(&["NOPE"])).unwrap_err().to_string();
+        assert!(e.contains("has no machine NOPE"), "{}", e);
+        let e = plan_renames("pki", &pki, "x", &items(&["CL1=DC1"])).unwrap_err().to_string();
+        assert!(e.contains("both be called DC1"), "{}", e);
+        // renaming to its current name is no rename
+        assert!(plan_renames("pki", &pki, "x", &items(&["CL1=cl1"])).unwrap().is_empty());
+        for bad in ["A_B", "-AB", "1234", "ABCDEFGHIJKLMNOP", ""] {
+            assert!(check_computer_name(bad).is_err(), "{}", bad);
+        }
+        assert!(check_computer_name("CL1-EXP42").is_ok());
+    }
+
+    #[test]
     fn instance_files_escape_and_views() {
-        let i =
-            Instance { lab: "school".into(), environment: "school-exp42".into(), id: "c2e5a813".into(), note: "a \"q\" \\ Ünï".into() };
+        let hostnames: IndexMap<String, String> =
+            [("DC1", "DC1-EXP42"), ("CL1", "CL1-EXP42")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let i = Instance {
+            lab: "school".into(),
+            environment: "school-exp42".into(),
+            id: "c2e5a813".into(),
+            note: "a \"q\" \\ Ünï".into(),
+            hostnames,
+        };
         let (json, reg) = instance_files(&i, "CL1", "20261124-101500-c2e5a813", true);
         assert!(json.is_ascii(), "{}", json);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["environment"], "school-exp42");
         assert_eq!(v["note"], "a \"q\" \\ Ünï");
         assert_eq!(v["machine"], "CL1");
+        assert_eq!(v["hostname"], "CL1-EXP42");
+        assert_eq!(v["hostnames"]["DC1"], "DC1-EXP42");
+        assert!(reg.contains("\"Hostname\"=\"CL1-EXP42\"\r\n"), "{}", reg);
         assert!(reg.starts_with("Windows Registry Editor Version 5.00\r\n"));
         assert!(reg.contains("\"Note\"=\"a \\\"q\\\" \\\\ Ünï\"\r\n"), "{}", reg);
         assert!(reg.contains("[HKEY_LOCAL_MACHINE\\SOFTWARE\\Wow6432Node\\WinTestLab]"));
         let (_, reg32) = instance_files(&i, "WS2003", "", false);
+        assert!(reg32.contains("\"Hostname\"=\"WS2003\"\r\n"), "{}", reg32);
         assert!(!reg32.contains("Wow6432Node"));
     }
 }

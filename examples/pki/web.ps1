@@ -1,6 +1,9 @@
 # web.ps1 - the IIS default site on CA1 answers over the lab LAN. Run on CL1. Exit 0 on HTTP 200.
+#   web.ps1 [-Url http://NAME/]   (pki-smoke.json passes http://${WTL_HOST_CA1}/: CA1's computer
+#                                  name, also in an environment with renamed machines)
+param([string]$Url = 'http://CA1/')
 $ErrorActionPreference = 'Stop'
-$url = 'http://CA1/'
+$url = $Url
 try {
     $req = [System.Net.HttpWebRequest]::Create($url)
     $req.Timeout = 20000

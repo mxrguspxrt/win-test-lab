@@ -2,17 +2,20 @@
  * whereami.c - inside a lab machine: which lab, environment and machine is this? Checks that
  * every place wtl records it agrees, and (optionally) that it is what you expect.
  *
- *   whereami.exe [--env NAME] [--id ID] [--machine NAME] [--vars]
+ *   whereami.exe [--env NAME] [--id ID] [--machine KEY] [--hostname NAME] [--vars]
  *
  * Reads, and prints:
- *   - the computer name (an environment keeps the lab's machine names)
- *   - C:\WTL\instance.json                       (lab, environment, id, machine, note, run_id)
+ *   - the computer name (the machine's hostname: its lab key, or the new name of a renamed
+ *     environment's machine)
+ *   - C:\WTL\instance.json                       (lab, environment, id, machine, hostname, note,
+ *                                                 run_id)
  *   - HKLM\SOFTWARE\WinTestLab                   (the same values; on 64-bit Windows both the
  *                                                 64-bit and the 32-bit registry view)
- *   - with --vars: the step's WTL_ENVIRONMENT, WTL_ENVIRONMENT_ID, WTL_MACHINE, WTL_RUN_ID
- * and checks that they all say the same, that the computer name is the machine's, and that
- * environment / id / machine are --env / --id / --machine when given (an empty value skips
- * that check). Ends with "RESULT OK" (exit 0) or "RESULT FAIL: N problem(s)" (exit 1).
+ *   - with --vars: the step's WTL_ENVIRONMENT, WTL_ENVIRONMENT_ID, WTL_MACHINE, WTL_HOSTNAME,
+ *     WTL_RUN_ID
+ * and checks that they all say the same, that the computer name is the hostname they name, and
+ * that environment / id / machine / hostname are --env / --id / --machine / --hostname when
+ * given (an empty value skips that check). Ends with "RESULT OK" (exit 0) or "RESULT FAIL: N problem(s)" (exit 1).
  *
  * Build: examples/envs/build.sh (gcc-mingw-w64-x86-64; gcc-mingw-w64-i686 for Server 2003).
  * One .exe, no DLLs, no data files.
@@ -99,7 +102,7 @@ static void same(const char *what, const char *got, const char *want)
 
 int main(int argc, char **argv)
 {
-    const char *want_env = "", *want_id = "", *want_machine = "";
+    const char *want_env = "", *want_id = "", *want_machine = "", *want_host = "";
     int vars = 0, i;
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--env") && i + 1 < argc)
@@ -108,10 +111,12 @@ int main(int argc, char **argv)
             want_id = argv[++i];
         else if (!strcmp(argv[i], "--machine") && i + 1 < argc)
             want_machine = argv[++i];
+        else if (!strcmp(argv[i], "--hostname") && i + 1 < argc)
+            want_host = argv[++i];
         else if (!strcmp(argv[i], "--vars"))
             vars = 1;
         else {
-            printf("usage: whereami.exe [--env NAME] [--id ID] [--machine NAME] [--vars]\n");
+            printf("usage: whereami.exe [--env NAME] [--id ID] [--machine KEY] [--hostname NAME] [--vars]\n");
             return 2;
         }
     }
@@ -132,14 +137,17 @@ int main(int argc, char **argv)
         printf("  PROBLEM: C:\\WTL\\instance.json is missing\n");
         problems++;
     }
-    char lab[VAL], env[VAL], id[VAL], machine[VAL], note[VAL], run_id[VAL];
+    char lab[VAL], env[VAL], id[VAL], machine[VAL], hostname[VAL], note[VAL], run_id[VAL];
     json_get(json, "lab", lab);
     json_get(json, "environment", env);
     json_get(json, "id", id);
     json_get(json, "machine", machine);
+    json_get(json, "hostname", hostname);
+    if (!hostname[0]) /* from wtl 0.4: the computer name was the machine key */
+        strcpy(hostname, machine);
     json_get(json, "note", note);
     json_get(json, "run_id", run_id);
-    printf("instance.json   lab=%s environment=%s id=%s machine=%s run_id=%s\n", lab, env, id, machine, run_id);
+    printf("instance.json   lab=%s environment=%s id=%s machine=%s hostname=%s run_id=%s\n", lab, env, id, machine, hostname, run_id);
     if (note[0])
         printf("                note: %s\n", note);
     if (!env[0] || !id[0] || !machine[0]) {
@@ -147,16 +155,16 @@ int main(int argc, char **argv)
         problems++;
     }
 
-    /* the computer name is the machine's own (environments keep the lab's names) */
-    if (_stricmp(host, machine) != 0)
-        problem("the computer name", host, machine);
+    /* the computer name is the machine's hostname (renamed for real in a renamed environment) */
+    if (_stricmp(host, hostname) != 0)
+        problem("the computer name", host, hostname);
 
     /* the registry: the 64-bit view, and the 32-bit one on 64-bit Windows */
     REGSAM views[2] = {KEY_WOW64_64KEY, KEY_WOW64_32KEY};
     const char *view_names[2] = {"64-bit", "32-bit"};
     int nviews = is_64bit_windows() ? 2 : 1;
     for (i = 0; i < nviews; i++) {
-        char r_env[VAL], r_id[VAL], r_machine[VAL], r_run[VAL], what[64];
+        char r_env[VAL], r_id[VAL], r_machine[VAL], r_host[VAL], r_run[VAL], what[64];
         const char *vn = nviews == 1 ? "" : view_names[i];
         if (!reg_get(views[i], "Environment", r_env)) {
             printf("  PROBLEM: HKLM\\SOFTWARE\\WinTestLab is missing (%s view)\n", nviews == 1 ? "the" : vn);
@@ -165,30 +173,37 @@ int main(int argc, char **argv)
         }
         reg_get(views[i], "Id", r_id);
         reg_get(views[i], "Machine", r_machine);
+        reg_get(views[i], "Hostname", r_host);
+        if (!r_host[0])
+            strcpy(r_host, r_machine);
         reg_get(views[i], "RunId", r_run);
-        printf("registry %-6s  environment=%s id=%s machine=%s run_id=%s\n", vn, r_env, r_id, r_machine, r_run);
+        printf("registry %-6s  environment=%s id=%s machine=%s hostname=%s run_id=%s\n", vn, r_env, r_id, r_machine, r_host, r_run);
         snprintf(what, sizeof what, "registry %sEnvironment", nviews == 1 ? "" : (i ? "(32-bit) " : "(64-bit) "));
         same(what, r_env, env);
         snprintf(what, sizeof what, "registry %sId", nviews == 1 ? "" : (i ? "(32-bit) " : "(64-bit) "));
         same(what, r_id, id);
         snprintf(what, sizeof what, "registry %sMachine", nviews == 1 ? "" : (i ? "(32-bit) " : "(64-bit) "));
         same(what, r_machine, machine);
+        snprintf(what, sizeof what, "registry %sHostname", nviews == 1 ? "" : (i ? "(32-bit) " : "(64-bit) "));
+        same(what, r_host, hostname);
         snprintf(what, sizeof what, "registry %sRunId", nviews == 1 ? "" : (i ? "(32-bit) " : "(64-bit) "));
         same(what, r_run, run_id);
     }
 
     /* the step's own variables */
     if (vars) {
-        char v_env[VAL] = "", v_id[VAL] = "", v_machine[VAL] = "", v_run[VAL] = "";
+        char v_env[VAL] = "", v_id[VAL] = "", v_machine[VAL] = "", v_host[VAL] = "", v_run[VAL] = "";
         GetEnvironmentVariableA("WTL_ENVIRONMENT", v_env, VAL);
         GetEnvironmentVariableA("WTL_ENVIRONMENT_ID", v_id, VAL);
         GetEnvironmentVariableA("WTL_MACHINE", v_machine, VAL);
+        GetEnvironmentVariableA("WTL_HOSTNAME", v_host, VAL);
         GetEnvironmentVariableA("WTL_RUN_ID", v_run, VAL);
-        printf("step variables  WTL_ENVIRONMENT=%s WTL_ENVIRONMENT_ID=%s WTL_MACHINE=%s WTL_RUN_ID=%s\n", v_env, v_id, v_machine,
-               v_run);
+        printf("step variables  WTL_ENVIRONMENT=%s WTL_ENVIRONMENT_ID=%s WTL_MACHINE=%s WTL_HOSTNAME=%s WTL_RUN_ID=%s\n", v_env, v_id,
+               v_machine, v_host, v_run);
         same("WTL_ENVIRONMENT", v_env, env);
         same("WTL_ENVIRONMENT_ID", v_id, id);
         same("WTL_MACHINE", v_machine, machine);
+        same("WTL_HOSTNAME", v_host, hostname);
         same("WTL_RUN_ID", v_run, run_id);
     }
 
@@ -199,11 +214,13 @@ int main(int argc, char **argv)
         same("the id", id, want_id);
     if (want_machine[0] && _stricmp(machine, want_machine) != 0)
         problem("the machine", machine, want_machine);
+    if (want_host[0] && _stricmp(hostname, want_host) != 0)
+        problem("the hostname", hostname, want_host);
 
     if (problems) {
         printf("RESULT FAIL: %d problem(s)\n", problems);
         return 1;
     }
-    printf("RESULT OK: this is %s of %s (id %s)\n", machine, env, id);
+    printf("RESULT OK: this is %s (%s) of %s (id %s)\n", machine, host, env, id);
     return 0;
 }

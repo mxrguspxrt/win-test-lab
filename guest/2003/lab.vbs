@@ -199,7 +199,9 @@ Function InvokeLabClient(cfg, labDir)
     user = "Administrator"
     pass = JStr(cfg, "admin_password")
   End If
-  want = JStr(cfg, "machine")
+  ' the Windows computer name: lab.json's "hostname" (an environment's own, or the lab key)
+  want = JStr(cfg, "hostname")
+  If want = "" Then want = JStr(cfg, "machine")
   If want = "" Then want = gNet.ComputerName
 
   If phase = "new" Then
@@ -441,9 +443,53 @@ Sub SetLabInstance(cfg)
   End If
 End Sub
 
+' ---------------------------------------------------------------- renames
+
+' The boot that renames an environment's machine (wtl up LAB --new --rename; the disc's "rename":
+' from, to). rename.vbs (on this disc) renames it as SYSTEM through the worker, points the
+' automatic logon (COMPUTER\user) at the new name and reboots; on the next logon LAB_RENAMED.
+' Returns "renamed" (go on as on any boot) or "reboot".
+Function InvokeLabRename(cfg, labDir)
+  Dim rn, toName, req, res, runDir
+  Set rn = cfg.Item("rename")
+  toName = JStr(rn, "to")
+  If LCase(gNet.ComputerName) <> LCase(toName) Then
+    LabPhase "renaming this computer " & gNet.ComputerName & " -> " & toName
+    runDir = gWtlDir & "\run"
+    EnsureFolder runDir
+    Set req = NewDict()
+    req("action") = "run"
+    req("path") = labDir & "\rename.vbs"
+    req("args") = Chr(34) & toName & Chr(34)
+    req("cwd") = runDir
+    req("timeout") = "300"
+    req("out") = runDir & "\rename.out"
+    req("err") = runDir & "\rename.err"
+    req("keep_running") = "0"
+    Set res = SvcCall(req, 400)
+    If res("ok") <> "1" Then Fail "renaming to " & toName & ": " & res("error")
+    If res("exit") <> "0" Then Fail "renaming to " & toName & ": rename.vbs exited " & res("exit")
+    SendEvent "LAB_REBOOT", Array("phase", "rename"), ""
+    InvokeLabRename = "reboot"
+    Exit Function
+  End If
+  SendEvent "LAB_RENAMED", Array("machine", JStr(cfg, "machine"), "from", JStr(rn, "from"), "to", gNet.ComputerName), ""
+  InvokeLabRename = "renamed"
+End Function
+
 Function InvokeLabMulti(cfg, labDir)
   Dim r
   If JStr(cfg, "role") <> "member" Then Fail "Windows Server 2003 machines cannot have the role '" & JStr(cfg, "role") & "' yet"
+  ' the boot that renames an environment's machine: first the rename, then as on any boot
+  If JHas(cfg, "rename") Then
+    If IsObject(cfg.Item("rename")) Then
+      r = InvokeLabRename(cfg, labDir)
+      If r <> "renamed" Then
+        InvokeLabMulti = r
+        Exit Function
+      End If
+    End If
+  End If
   r = InvokeLabClient(cfg, labDir)
   If r <> "ready" Then
     InvokeLabMulti = r
