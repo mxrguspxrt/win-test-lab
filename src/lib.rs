@@ -8,6 +8,7 @@
 //! * [`assets`]: the guest scripts, the OS table and the example labs built into the program.
 //! * [`labdef`]: the typed JSON lab and run formats, their validation and JSON Schema.
 //! * [`runconf`]: reading a run file: `extends`, `vars` and `${WTL_NAME}`.
+//! * [`envs`]: environments, copies of a lab spawned from its 0 state (`wtl up LAB --new`).
 //! * [`labrun`]: the runner: builds a lab's 0 state, boots its machines on a private
 //!   multicast LAN, runs a config's steps on each machine and collects the results.
 //! * [`build`]: an unattended Windows install into a base image.
@@ -19,6 +20,7 @@
 pub mod assets;
 pub mod build;
 pub mod cli;
+pub mod envs;
 pub mod home;
 pub mod lab;
 pub mod labdef;

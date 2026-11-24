@@ -213,7 +213,7 @@ Another lab: copy one, change the machine names (and for a LAN `network.subnet` 
 |-------|---------|---------|
 | `extends` | none | A run file this one builds on, relative to this file: see [Variables and extends](#variables-and-extends). |
 | `vars` | `{}` | Variables for `${WTL_NAME}` in the file and for the steps' environment: see [Variables and extends](#variables-and-extends). |
-| `lab` | (required, here or in the file it extends) | The lab to boot: a name (`"school"` = `labs/school.json` in the home, else the lab `school` built into `wtl`) or a path to a lab file, relative to this run file (`"./lab.json"`, `"../labs/ad.json"`). Anything with a `/` or `\`, or ending in `.json`, is a path. |
+| `lab` | (required, here or in the file it extends) | The lab to boot: a name (`"school"` = `labs/school.json` in the home, else the lab `school` built into `wtl`; or an environment of a lab, `"school-k7q3"`, see the README's *Environments*) or a path to a lab file, relative to this run file (`"./lab.json"`, `"../labs/ad.json"`). Anything with a `/` or `\`, or ending in `.json`, is a path. `wtl run CONFIG --lab NAME` overrides it; `wtl run CONFIG --new` runs in a new environment of it. |
 | `name` | the file name without `.json` | A label for the run. |
 | `wait` | 60 | Seconds a step may run before it counts as "still running" (see `keep_running`). `wtl run --wait S` overrides it. |
 | `timeout_min` | 60 | Give up on the whole run after this many minutes. `wtl run --timeout-min M` overrides it. |
@@ -281,7 +281,9 @@ WTL_OS=single-2022 WTL_BUILD_DIR=$PWD/out WTL_LICENSE=ABCD-1234 wtl run smoke.js
   `mount` folder from a variable is relative to the run file, as usual.
 - **In the guest.** Every declared variable is also set in each step's environment, so a
   script can read `$env:WTL_MODE` (or `%WTL_MODE%`) as well as take it as an argument. Nothing
-  else from the host's environment reaches the guest.
+  else from the host's environment reaches the guest. `wtl` adds four of its own to every step:
+  `WTL_ENVIRONMENT` (the lab's or environment's name), `WTL_ENVIRONMENT_ID`, `WTL_MACHINE` (the
+  machine's name in the lab file) and `WTL_RUN_ID`; these names cannot be declared.
 - **Secrets.** A `secret` variable is shown as `***` in `result.json`, in `wtl`'s output and in
   its error messages; once secret in a base file, it stays secret. The guest gets the real
   value, so a script that prints it puts it in its step output. The value is also on the
@@ -304,17 +306,20 @@ A run file may build on another with `extends`:
 - `vars` merge too: the child's default wins, the host's environment wins over both, and every
   file's `${WTL_NAME}` gets the final values.
 
-**A 0 state built before run vars** (by an older `wtl`) still substitutes `${...}`, and steps
-run as the logged-on user get the variables in their environment. Steps run as `"system"` or
-as another user do not, because the SYSTEM worker is baked into the 0 state; `wtl run` warns,
-and `wtl rebuild LAB` fixes it.
+**A 0 state built before step variables** (by `wtl` 0.2 or older) still substitutes `${...}`,
+and steps run as the logged-on user get the variables (and `WTL_ENVIRONMENT`...) in their
+environment. Steps run as `"system"` or as another user do not, because the SYSTEM worker is
+baked into the 0 state; `wtl run` warns, and `wtl rebuild LAB` fixes it (for an environment:
+`wtl rebuild LAB`, then `wtl rebuild ENV`). `C:\WTL\instance.json` and the registry are written
+on any 0 state.
 
 ## What a run produces
 
 `<state folder>/<lab>/runs/<YYYYmmdd-HHMMSS>/` (and `<state folder>/<lab>/last` points at
 the latest; the state folder is `labs/state/` in the home, see `wtl home`):
 
-    result.json          the summary: lab, config, run id, vars (a secret one as ***),
+    result.json          the summary: lab, environment and its id, config, run id
+                         (<time>-<id>), vars (a secret one as ***),
                          status ok|failed, and one record per step: machine, user
                          (system|logon|user), n, script, exit, expect_exit, secs, ok
     config.json          a copy of the run config (as written: ${...} and extends unresolved)

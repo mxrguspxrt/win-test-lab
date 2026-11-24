@@ -390,6 +390,57 @@ Function InvokeLabSteps(cfg)
   InvokeLabSteps = "done"
 End Function
 
+' ---------------------------------------------------------------- who am I
+
+' Tell programs in this machine where they run. Every up / run disc carries "instance" (lab,
+' environment, id, machine, note, run id), as the exact text of C:\WTL\instance.json and of a
+' .reg file for HKLM\SOFTWARE\WinTestLab, which the SYSTEM worker imports (the logged-on user is
+' no administrator; its "run" action is in every 0 state). Only helpers an older baked
+' common.vbs has too. Best effort: a failure is reported, never fatal.
+Sub SetLabInstance(cfg)
+  Dim i, f, runDir, regF, req, res, msg
+  If Not JHas(cfg, "instance") Then Exit Sub
+  If Not IsObject(cfg.Item("instance")) Then Exit Sub
+  Set i = cfg.Item("instance")
+  runDir = gWtlDir & "\run"
+  EnsureFolder runDir
+  regF = runDir & "\instance.reg"
+  msg = ""
+  On Error Resume Next
+  Set f = gFso.CreateTextFile(gWtlDir & "\instance.json", True, False)
+  f.Write JStr(i, "json")
+  f.Close
+  ' Unicode = UTF-16 with a BOM, what reg import reads
+  Set f = gFso.CreateTextFile(regF, True, True)
+  f.Write JStr(i, "reg")
+  f.Close
+  If Err.Number <> 0 Then msg = Err.Description
+  Err.Clear
+  On Error GoTo 0
+  If msg = "" Then
+    Set req = NewDict()
+    req("action") = "run"
+    req("path") = gSh.ExpandEnvironmentStrings("%SystemRoot%") & "\system32\reg.exe"
+    req("args") = "import " & Chr(34) & regF & Chr(34)
+    req("cwd") = runDir
+    req("timeout") = "60"
+    req("out") = runDir & "\instance.out"
+    req("err") = runDir & "\instance.err"
+    req("keep_running") = "0"
+    Set res = SvcCall(req, 120)
+    If res("ok") <> "1" Then
+      msg = res("error")
+    ElseIf res("exit") <> "0" Then
+      msg = "reg import exited " & res("exit")
+    End If
+  End If
+  If msg = "" Then
+    SendEvent "LAB_INSTANCE", Array("machine", JStr(cfg, "machine"), "environment", JStr(i, "environment"), "id", JStr(i, "id")), ""
+  Else
+    LabPhase "could not record the environment (C:\WTL\instance.json, registry): " & msg
+  End If
+End Sub
+
 Function InvokeLabMulti(cfg, labDir)
   Dim r
   If JStr(cfg, "role") <> "member" Then Fail "Windows Server 2003 machines cannot have the role '" & JStr(cfg, "role") & "' yet"
@@ -404,6 +455,7 @@ Function InvokeLabMulti(cfg, labDir)
     InvokeLabMulti = "reboot"
     Exit Function
   End If
+  SetLabInstance cfg
   If JHas(cfg, "run") Then
     If IsObject(cfg.Item("run")) Then
       InvokeLabMulti = InvokeLabSteps(cfg)

@@ -1,0 +1,14 @@
+{
+  "$schema": "../../schema/run.schema.json",
+  "vars": {
+    "WTL_EXPECT_ENV": null,
+    "WTL_EXPECT_ID": "",
+    "WTL_SYSTEM_VARS": ""
+  },
+  "lab": "single-2019",
+  "mount": { "X": "./out" },
+  "steps": [
+    { "run": "X:/whereami.exe", "args": "--env ${WTL_EXPECT_ENV} --id \"${WTL_EXPECT_ID}\" --vars" },
+    { "as": "system", "run": "X:/whereami.exe", "args": "--env ${WTL_EXPECT_ENV} --id \"${WTL_EXPECT_ID}\" ${WTL_SYSTEM_VARS}" }
+  ]
+}

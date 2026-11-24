@@ -1,0 +1,6 @@
+{
+  "$schema": "../../schema/run.schema.json",
+  "extends": "./whereami.json",
+  "lab": "single-2003",
+  "mount": { "X": "./out32" }
+}

@@ -14,6 +14,8 @@ win-test-lab (the `wtl` command) does the boring part for you:
   DHCP, a certificate authority (AD CS) with auto-enrollment, IIS, members and users.
 - **Run your program** inside Windows, as SYSTEM or as any lab user, and get every step's exit
   code and output back.
+- **Many environments from one lab.** `wtl up school --new` spawns a fresh copy of a whole lab
+  in seconds, on its own private network; every machine in it knows which copy it is.
 - **One run file for every case.** Variables (`WTL_OS=2022 wtl run smoke.json`) choose the
   Windows, the folders and the arguments; `extends` shares one file between many; secrets stay
   out of the results.
@@ -127,6 +129,99 @@ for os in 2016 2019 2022 2025 win10 win11; do WTL_OS=$os WTL_BUILD=./out wtl run
 
 The whole set of rules:
 [docs/CONFIG.md](https://github.com/mxrguspxrt/win-test-lab/blob/main/docs/CONFIG.md#variables-and-extends).
+
+## Environments: many copies of one lab, on the fly
+
+A lab's 0 state is built once. From it you can spawn as many **environments** as you like, with
+no config files: each is a full copy of the lab (every machine, the domain, the CA), made in
+seconds, running on its own private network.
+
+```
+wtl up school --new
+  environment school-k7q3 (id 4b91d07c) made from lab school's 0 state
+  ...
+  environment school-k7q3 (id 4b91d07c) of lab school: domain lab.local
+    DC     DC1   10.77.30.10  VNC 127.0.0.1:5910  LAB\Administrator
+    member CL1   10.77.30.20  VNC 127.0.0.1:5911  logon LAB\student1
+    member CL2   10.77.30.21  VNC 127.0.0.1:5912  logon LAB\student2
+
+wtl up school --new --name exp42 --note "new installer on the 2016 client"
+  environment school-exp42 (id c2e5a813) made from lab school's 0 state
+```
+
+Inside, an environment is exactly the lab: the same computer names (`DC1`, `CL1`), the same
+domain, IPs and CA. Nothing in Windows is renamed. What tells the copies apart is their name and
+id, which `wtl` and every machine in them know.
+
+```
+wtl list
+  NAME           FROM     ID        STATE     NOTE
+  school         -        8f3c1a2e  off
+  school-k7q3    school   4b91d07c  running
+  school-exp42   school   c2e5a813  running   new installer on the 2016 client
+```
+
+Every command takes an environment's name, and `NAME/MACHINE` is one machine in it:
+
+```
+wtl run smoke.json --lab school-exp42    # run a file's steps in that environment
+wtl run smoke.json --new                 # ... or in a fresh one, made for this run
+wtl status school-exp42                  # its machines, VNC addresses, last run
+wtl status school-exp42/CL1              # one machine
+wtl restore school-exp42                 # back to the 0 state it was made from
+wtl stop school-exp42                    # power off, keep its changes
+wtl rm school-exp42                      # delete it: VMs, disks, results
+```
+
+- **Fast and small.** An environment is a thin disk layer on the lab's 0 state: no reinstall,
+  no rebuild, and it only takes the disk space its own changes need.
+- **Isolated.** Each environment gets its own private LAN, so `school`, `school-k7q3` and
+  `school-exp42` run side by side and never see each other, although their machines have the
+  same names and IPs.
+- **Named for you.** Without `--name` the name is the lab plus 4 random characters. The `id` is
+  always random, so two people's `school-exp42` never look the same.
+- **Rebuilding is safe.** `wtl rebuild school` deletes the lab's 0 state (the next run or
+  `--new` builds a new one); existing environments keep the 0 state they were made from (kept
+  on disk until the last one using it is removed). `wtl rebuild school-exp42` makes that
+  environment fresh again from the lab's current 0 state, with the same name, id and note.
+
+### Where am I? Inside Windows
+
+Every machine of every environment can tell which lab, environment, machine and run it is, so
+your program or test knows where it is running. At every boot `wtl` writes it to
+`C:\WTL\instance.json`:
+
+```json
+{
+  "lab": "school",
+  "environment": "school-exp42",
+  "id": "c2e5a813",
+  "machine": "CL1",
+  "note": "new installer on the 2016 client",
+  "run_id": "20261124-101500-c2e5a813"
+}
+```
+
+and the same values to the registry (`HKLM\SOFTWARE\WinTestLab`) and to every step's environment
+(`WTL_ENVIRONMENT`, `WTL_ENVIRONMENT_ID`, `WTL_MACHINE`, `WTL_RUN_ID`):
+
+```powershell
+$me = Get-Content C:\WTL\instance.json | ConvertFrom-Json
+"I am $($me.machine) in $($me.environment) ($($me.id))"
+```
+
+```bat
+reg query HKLM\SOFTWARE\WinTestLab /v Environment
+```
+
+`run_id` is empty outside `wtl run` (after `wtl up`). On the host, `result.json` carries the same
+`environment`, `id` and `run_id`.
+
+[examples/envs](https://github.com/mxrguspxrt/win-test-lab/tree/main/examples/envs) walks
+through all of it, one command at a time, with `whereami.exe`: a small program that checks
+inside each machine that the computer name, `instance.json`, the registry and the step
+variables all say the same, and `run-all.sh`, which runs the whole walkthrough with every
+result checked (on one machine, Server 2003, or an AD lab running next to its own copy).
 
 ## Which host runs what
 
@@ -338,12 +433,16 @@ The other way round, a Linux or Windows x64 host can run Windows 11 on Arm only 
 ## Commands
 
     wtl run CONFIG          restore, boot, mount, run the steps, report (exit 0 = all steps passed)
+                            (--lab ENV: in that environment; --new: in a fresh one)
     wtl up LAB              boot the lab from its 0 state and leave it running
-    wtl status LAB          0 state, machines (running/off, VNC), last run
+    wtl up LAB --new        spawn a new environment of the lab (--name N, --note TEXT)
+    wtl list                every lab and environment: id, running or off, note
+    wtl status LAB          0 state, machines (running/off, VNC), last run (LAB/MACHINE: one)
     wtl restore LAB         stop and throw away everything since the 0 state
     wtl stop LAB            power off, keeping changes until the next run
+    wtl rm ENV              delete an environment: VMs, disks, results
     wtl prepare LAB         build the 0 state now
-    wtl rebuild LAB         delete the 0 state; the next run builds it again
+    wtl rebuild LAB         a new 0 state; the next run builds it (environments keep theirs)
     wtl doctor              what this host can run: QEMU per CPU, acceleration, firmware, ISOs
     wtl check-iso [FILE]    an ISO's Windows build, CPU and editions (--sha256 HASH to verify it)
     wtl home                where the data is, and where each setting comes from
@@ -352,7 +451,7 @@ The other way round, a Linux or Windows x64 host can run Windows 11 on Arm only 
     wtl schema [DIR]        write the JSON Schemas of the lab and run files
 
 Exit codes: 0 ok, 1 a step failed, 2 lab error, 3 timeout. `--show` opens the VM windows
-instead of VNC.
+instead of VNC. Wherever a command takes a LAB, it also takes an environment's name.
 
 Labs built into `wtl`: one machine each (`single-2003`, `single-2008`, `single-2012`,
 `single-2016`, `single-2019`, `single-2022`, `single-2025`, `single-win10`, `single-win11`,

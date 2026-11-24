@@ -23,9 +23,13 @@ use std::path::{Path, PathBuf};
 /// How many files deep an `extends` chain may go.
 pub const MAX_EXTENDS: usize = 8;
 
-/// `wtl`'s own settings, read from the environment by `wtl` itself: no run variable may use
-/// these names.
+/// `wtl`'s own settings, read from the environment by `wtl` itself, and the variables `wtl`
+/// sets in every step itself (who and where it runs): no run variable may use these names.
 pub const RESERVED: &[&str] = &[
+    "WTL_ENVIRONMENT",
+    "WTL_ENVIRONMENT_ID",
+    "WTL_MACHINE",
+    "WTL_RUN_ID",
     "WTL_HOME",
     "WTL_ROOT",
     "WTL_CONFIG",

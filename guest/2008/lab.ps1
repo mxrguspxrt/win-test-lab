@@ -543,12 +543,51 @@ function Invoke-LabStepForeground([int]$N, [string]$Path, [string]$ArgsLine, [st
     return @{ ok = $true; exit = (Get-ExitCodeSafe $proc); secs = $secs }
 }
 
+# ---------------------------------------------------------------- who am I
+
+# Tell programs in this machine where they run. Every up / run disc carries "instance" (lab,
+# environment, id, machine, note, run id), as the exact text of C:\WTL\instance.json (readable
+# by everyone) and of a .reg file for HKLM\SOFTWARE\WinTestLab. The registry needs an
+# administrator: imported here when this session is one, else by the SYSTEM worker (its "run"
+# action, which every 0 state's worker has). Best effort: a failure is reported, never fatal.
+function Set-LabInstance($Cfg) {
+    $i = $Cfg.instance
+    if ($i -eq $null) { return }
+    try {
+        [System.IO.File]::WriteAllText('C:\WTL\instance.json', [string]$i.json)
+        $runDir = 'C:\WTL\run'
+        if (-not (Test-Path $runDir)) { New-Item -ItemType Directory -Path $runDir -Force | Out-Null }
+        $reg = Join-Path $runDir 'instance.reg'
+        [System.IO.File]::WriteAllText($reg, [string]$i.reg, [System.Text.Encoding]::Unicode)
+        $regExe = Join-Path $env:SystemRoot 'System32\reg.exe'
+        $me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+        $code = -1
+        if ($me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            $ErrorActionPreference = 'Continue'
+            & $regExe import $reg 2>&1 | Out-Null
+            $code = $LASTEXITCODE
+        }
+        if ($code -ne 0) {
+            $req = @{ action = 'run'; path = $regExe; args = ('import "' + $reg + '"'); cwd = $runDir; timeout = 60;
+                      out = (Join-Path $runDir 'instance.out'); err = (Join-Path $runDir 'instance.err'); keep_running = $false }
+            $res = Invoke-SvcRequest $req 180
+            if (-not $res.ok) { throw [string]$res.error }
+            $code = [int]$res.exit
+        }
+        if ($code -ne 0) { throw "reg import exited $code" }
+        Send-WtlEvent 'LAB_INSTANCE' @('machine', [string]$Cfg.machine, 'environment', [string]$i.environment, 'id', [string]$i.id)
+    } catch {
+        Send-LabPhase "could not record the environment (C:\WTL\instance.json, registry): $($_.Exception.Message)"
+    }
+}
+
 function Invoke-LabMulti($Cfg, [string]$LabDir) {
     if ([string]$Cfg.role -ne 'member') { throw "Windows Server 2008 R2 machines cannot have the role '$($Cfg.role)' yet" }
     $r = Invoke-LabClient $Cfg $LabDir
     if ($r -ne 'ready') { return $r }
     # the 0-state build: the finished machine is frozen; the host powers it off via ACPI
     if ($Cfg.shutdown_when_ready) { Send-WtlEvent 'LAB_IDLE'; return 'reboot' }
+    Set-LabInstance $Cfg
     if ($Cfg.run -ne $null) { return (Invoke-LabMemberSteps $Cfg) }
     return 'ready'
 }

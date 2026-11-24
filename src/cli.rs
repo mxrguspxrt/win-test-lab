@@ -4,6 +4,8 @@
 //! ```text
 //! wtl run CONFIG              restore the lab to its 0 state, boot it, run the steps
 //! wtl up|restore|stop|status|prepare|rebuild LAB|CONFIG
+//! wtl up LAB --new            spawn an environment (a copy of the lab's 0 state)
+//! wtl list | rm ENV           the labs and environments; delete an environment
 //! wtl doctor | check-iso | home | init
 //! wtl build-image OS ...      install Windows into a base image (what `run` does for a
 //!                             missing one)

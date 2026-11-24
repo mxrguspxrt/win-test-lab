@@ -13,6 +13,7 @@
 //! barrier *between* different steps across machines — the simple model the user asked for.
 
 use crate::assets;
+use crate::envs::{self, EnvFile, Instance};
 use crate::home::Home;
 use crate::lab::{bound_vnc_display, build_base_images, indent_file, pick_vnc_display, read_trim, sock_path, write_file, BaseBuild};
 use crate::labdef::{self, Lab, Role, Run, RunStep, StepAs};
@@ -86,6 +87,18 @@ struct LabJson<'a> {
     setup: Vec<LabSetup<'a>>,
     /// the per-machine run (null during the 0-state build and for `up`)
     run: Option<LabRun<'a>>,
+    /// who this machine is (lab, environment, id, machine, note, run id), for programs inside
+    /// it: the guest writes `json` to C:\WTL\instance.json and imports `reg` (a .reg file) into
+    /// HKLM\SOFTWARE\WinTestLab at every `up` / `run` (null during the 0-state build)
+    instance: Option<LabInstance>,
+}
+
+#[derive(Serialize)]
+struct LabInstance {
+    environment: String,
+    id: String,
+    json: String,
+    reg: String,
 }
 
 #[derive(Serialize)]
@@ -138,8 +151,9 @@ struct LabRun<'a> {
     mounts: Vec<LabMount<'a>>,
     steps: Vec<LabStep<'a>>,
     wait: i64,
-    /// the run's variables, set in every step's environment (`WTL_NAME` -> value)
-    env: IndexMap<&'a str, &'a str>,
+    /// set in every step's environment (`WTL_NAME` -> value): the run's variables, then
+    /// WTL_ENVIRONMENT, WTL_ENVIRONMENT_ID, WTL_MACHINE, WTL_RUN_ID
+    env: IndexMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -205,6 +219,10 @@ struct ZeroState {
     /// state built by an older `wtl`
     #[serde(default)]
     guest: Vec<String>,
+    /// random, made with the 0 state (an environment's: its own id); empty in one built by an
+    /// older `wtl` until something needs it ([`MultiLab::zero_id`])
+    #[serde(default)]
+    id: String,
 }
 
 /// What this program's guest scripts can do once baked into a 0 state: `step-env` = the
@@ -231,6 +249,9 @@ struct StepResult {
 #[derive(Serialize)]
 struct RunResult {
     lab: String,
+    /// the environment it ran in (the lab's own name for the lab itself) and its id
+    environment: String,
+    id: String,
     config: String,
     run_id: String,
     /// the run's variables and the values used (a secret one as `***`)
@@ -258,6 +279,12 @@ pub struct MultiLab {
     config: Option<PathBuf>,
     /// the run's variables with their values (empty without a run)
     run_vars: Vec<labdef::RunVar>,
+    /// set when this is an environment (`wtl up LAB --new`), not the lab itself
+    envf: Option<EnvFile>,
+    /// `status LAB/MACHINE`: the one machine to show
+    only: Option<String>,
+    /// this run's id (`<time>-<id>`); empty outside `wtl run`
+    run_id: String,
     show: bool,
     wait_s: i64,
     timeout_min: i64,
@@ -323,10 +350,27 @@ pub fn state_name(home: &Home, lab_file: &Path, lab: &Lab) -> String {
     format!("{}-{:08x}", stem, h)
 }
 
+/// An environment to act on instead of the lab itself: its name and `env.json`.
+pub type EnvTarget = (String, EnvFile);
+
 /// Build a [`MultiLab`] and dispatch CMD; returns the exit code. `lab_file` is the lab JSON;
-/// `config`/`run` are set for `run`.
-pub fn run(cmd: &'static str, lab_file: &Path, config: Option<PathBuf>, run: Option<Run>, lab: Lab, opts: &RunOpts) -> i32 {
-    match MultiLab::new(cmd, lab_file, config, run, lab, opts).and_then(|mut l| l.dispatch()) {
+/// `config`/`run` are set for `run`; `env` is set to act on one of the lab's environments.
+pub fn run(
+    cmd: &'static str,
+    lab_file: &Path,
+    config: Option<PathBuf>,
+    run: Option<Run>,
+    lab: Lab,
+    opts: &RunOpts,
+    env: Option<EnvTarget>,
+) -> i32 {
+    exit_code(MultiLab::new(cmd, lab_file, config, run, lab, opts, env).and_then(|mut l| l.dispatch()))
+}
+
+/// The exit code of a command's result: an error that is a known exit code carries it (the
+/// reason was printed already), any other error is printed and is 2.
+pub fn exit_code(r: Result<i32>) -> i32 {
+    match r {
         Ok(code) => code,
         Err(e) => match e.downcast_ref::<Exit>() {
             Some(Exit(code)) => *code,
@@ -339,6 +383,7 @@ pub fn run(cmd: &'static str, lab_file: &Path, config: Option<PathBuf>, run: Opt
 }
 
 /// Command-line options that apply to a JSON lab.
+#[derive(Default, Clone)]
 pub struct RunOpts {
     /// open the VM windows instead of VNC
     pub show: bool,
@@ -348,13 +393,161 @@ pub struct RunOpts {
     pub wait: Option<i64>,
     /// --timeout-min: overrides the run's `timeout_min`
     pub timeout_min: Option<i64>,
+    /// `status LAB/MACHINE`: only this machine
+    pub machine: Option<String>,
+}
+
+// --------------------------------------------------------------- environments
+
+/// The environment `name` (`wtl up LAB --new`), with its lab file and its lab (whose LAN port is
+/// the environment's own); None if there is no such environment.
+pub fn open_env(home: &Home, name: &str) -> Result<Option<(PathBuf, Lab, EnvTarget)>> {
+    let Some(f) = envs::load(home, name)? else { return Ok(None) };
+    if !f.lab_file.is_file() {
+        bail!("environment {}: its lab file {} is gone (wtl rm {} deletes the environment)", name, f.lab_file.display(), name);
+    }
+    let mut lab = load_lab(&f.lab_file)?;
+    if let (Some(n), Some(p)) = (lab.network.as_mut(), f.lan_port) {
+        n.lan_port = p;
+    }
+    Ok(Some((f.lab_file.clone(), lab, (name.to_string(), f))))
+}
+
+/// `wtl up LAB --new`, `wtl run --new`: build the lab's 0 state if it has none, then make a new
+/// environment of it (named `<lab>-<name>`, or `<lab>-<4 random>`). Returns it, ready to boot.
+pub fn spawn(lab_file: &Path, lab: Lab, opts: &RunOpts, name: Option<&str>, note: &str) -> Result<(PathBuf, Lab, EnvTarget)> {
+    envs::check_note(note)?;
+    let mut parent = MultiLab::new("prepare", lab_file, None, None, lab, opts, None)?;
+    let code = parent.dispatch()?;
+    if code != 0 {
+        return Err(Exit(code).into());
+    }
+    let (env_name, _) = parent.spawn_env(name, note)?;
+    open_env(&parent.env.home, &env_name)?.ok_or_else(|| anyhow!("environment {} was not saved", env_name))
+}
+
+/// `wtl rm ENV`: stop an environment's VMs and delete its folder (disks, results). The lab's
+/// frozen 0 state goes with the last environment that uses it.
+pub fn remove_env(name: &str) -> i32 {
+    exit_code((|| {
+        let home = Home::resolve()?;
+        let f = match envs::load(&home, name)? {
+            Some(f) => f,
+            None if home.state_dir.join(name).join("0-state.json").is_file() => {
+                bail!(
+                    "{} is a lab, not an environment: wtl rm deletes only environments (wtl rebuild {} deletes a lab's 0 state)",
+                    name,
+                    name
+                )
+            }
+            None => bail!("no environment {} (wtl list shows them)", name),
+        };
+        let state = home.state_dir.join(name);
+        match open_env(&home, name) {
+            Ok(Some((lab_file, lab, target))) => {
+                MultiLab::new("restore", &lab_file, None, None, lab, &RunOpts::default(), Some(target))?.restore()?
+            }
+            Ok(None) => {}
+            Err(e) => warn(&format!("{:#}; deleting it without stopping its VMs", e)),
+        }
+        std::fs::remove_dir_all(&state).with_context(|| format!("cannot delete {}", state.display()))?;
+        envs::gc_frozen(&home, &home.state_dir.join(&f.lab));
+        ok(&format!("environment {} deleted (lab {} and its other environments untouched)", name, f.lab));
+        Ok(0)
+    })())
+}
+
+/// `wtl list`: every lab with a 0 state and every environment, with its id, whether it is
+/// running, and its note.
+pub fn list() -> i32 {
+    exit_code((|| {
+        let home = Home::resolve()?;
+        let running = |state: &Path, machines: &[String]| {
+            machines.iter().any(|m| read_trim(&state.join(format!("{}.pid", m))).and_then(|p| p.parse().ok()).is_some_and(sys::pid_alive))
+        };
+        let envs = envs::all(&home);
+        let mut labs: Vec<String> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&home.state_dir) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if e.path().join("0-state.json").is_file() && !envs.iter().any(|(en, _)| *en == n) {
+                    labs.push(n);
+                }
+            }
+        }
+        labs.sort();
+        // environments of a lab without a 0 state of its own (rebuilt and not built since) too
+        for (_, f) in &envs {
+            if !labs.contains(&f.lab) {
+                labs.push(f.lab.clone());
+            }
+        }
+        if labs.is_empty() {
+            println!("no labs with a 0 state yet (wtl prepare LAB, or wtl run CONFIG)");
+            return Ok(0);
+        }
+        println!("{:<24} {:<16} {:<9} {:<8} NOTE", "NAME", "FROM", "ID", "STATE");
+        for lab in &labs {
+            let state = home.state_dir.join(lab);
+            let zero = state.join("0-state.json");
+            if zero.is_file() {
+                let z: ZeroState = std::fs::read_to_string(&zero).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+                let st = if running(&state, &z.machines) { "running" } else { "off" };
+                println!("{:<24} {:<16} {:<9} {:<8}", lab, "-", zero_id_at(&zero), st);
+            }
+            for (name, f) in envs.iter().filter(|(_, f)| &f.lab == lab) {
+                let es = home.state_dir.join(name);
+                let z: ZeroState =
+                    std::fs::read_to_string(es.join("0-state.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+                let st = if running(&es, &z.machines) { "running" } else { "off" };
+                println!("{:<24} {:<16} {:<9} {:<8} {}", name, f.lab, f.id, st, f.note);
+            }
+        }
+        Ok(0)
+    })())
+}
+
+/// The id in a 0-state.json; one built by an older `wtl` gets one now, saved in the file.
+/// Empty when there is no such file.
+fn zero_id_at(zero_done: &Path) -> String {
+    let Ok(text) = std::fs::read_to_string(zero_done) else { return String::new() };
+    let mut z: ZeroState = serde_json::from_str(&text).unwrap_or_default();
+    if z.id.is_empty() {
+        z.id = envs::random_hex(8);
+        let _ = write_file(zero_done, pyjson::dumps(&z));
+    }
+    z.id
+}
+
+/// Every lab LAN port the home's own and the built-in labs use.
+fn lab_ports(home: &Home) -> Vec<u16> {
+    let mut out = Vec::new();
+    for name in assets::lab_names(home) {
+        if let Ok(Some(f)) = assets::lab_file(home, &name) {
+            if let Ok(l) = load_lab(&f) {
+                out.extend(l.network.map(|n| n.lan_port));
+            }
+        }
+    }
+    out
 }
 
 impl MultiLab {
-    fn new(cmd: &'static str, lab_file: &Path, config: Option<PathBuf>, run: Option<Run>, lab: Lab, opts: &RunOpts) -> Result<MultiLab> {
+    fn new(
+        cmd: &'static str,
+        lab_file: &Path,
+        config: Option<PathBuf>,
+        run: Option<Run>,
+        lab: Lab,
+        opts: &RunOpts,
+        target: Option<EnvTarget>,
+    ) -> Result<MultiLab> {
         let (show, updates, wait_override, timeout_override) = (opts.show, opts.updates, opts.wait, opts.timeout_min);
         let home = Home::resolve()?;
-        let name = state_name(&home, lab_file, &lab);
+        let name = match &target {
+            Some((n, _)) => n.clone(),
+            None => state_name(&home, lab_file, &lab),
+        };
         if !util::is_safe_name(&name) {
             bail!("bad lab name {:?} (from {}; set \"name\" in the lab file)", name, lab_file.display());
         }
@@ -452,6 +645,12 @@ impl MultiLab {
                 mounts: Vec::new(),
             });
         }
+        if let Some(m) = &opts.machine {
+            if !vms.iter().any(|v| v.name.eq_ignore_ascii_case(m)) {
+                let names: Vec<&str> = vms.iter().map(|v| v.name.as_str()).collect();
+                bail!("{} has no machine {} (machines: {})", name, m, names.join(" "));
+            }
+        }
         // distribute the run's steps to the machines they target (keeping per-machine order)
         if let Some(r) = &run {
             let mut counter: HashMap<String, i64> = HashMap::new();
@@ -472,7 +671,10 @@ impl MultiLab {
             }
         }
 
-        let arg = named_lab(&home, lab_file).unwrap_or_else(|| util::canon(lab_file).to_string_lossy().into_owned());
+        let arg = match &target {
+            Some((n, _)) => n.clone(),
+            None => named_lab(&home, lab_file).unwrap_or_else(|| util::canon(lab_file).to_string_lossy().into_owned()),
+        };
         let now = Instant::now();
         let limit = Duration::from_secs((timeout_min.max(0) as u64).saturating_mul(60));
         Ok(MultiLab {
@@ -487,6 +689,9 @@ impl MultiLab {
             lab,
             config,
             run_vars: run.as_ref().map(|r| r.vars.clone()).unwrap_or_default(),
+            envf: target.map(|(_, f)| f),
+            only: opts.machine.clone(),
+            run_id: String::new(),
             show,
             wait_s,
             timeout_min,
@@ -702,24 +907,195 @@ impl MultiLab {
         Ok(true)
     }
 
-    /// A run with vars on a 0 state whose SYSTEM worker predates them: its `system` and
-    /// other-user steps run without the vars in their environment (`${...}` still works).
+    /// A run on a 0 state whose SYSTEM worker predates step variables: its `system` and
+    /// other-user steps run without the run's vars and WTL_ENVIRONMENT... in their environment
+    /// (`${...}`, C:\WTL\instance.json and the registry still work).
     fn warn_old_worker(&self) {
         let runs_by_worker = self.vms.iter().any(|v| v.steps.iter().any(|(_, s)| s.as_ != StepAs::Logon));
-        if self.run_vars.is_empty() || !runs_by_worker {
+        if !runs_by_worker {
             return;
         }
         let z: ZeroState = std::fs::read_to_string(&self.zero_done).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         if !z.guest.iter().any(|f| f == "step-env") {
+            let fix = match &self.envf {
+                Some(f) => format!("wtl rebuild {}, then wtl rebuild {}, fixes it", f.lab, self.name),
+                None => format!("wtl rebuild {} fixes it", self.arg),
+            };
             warn(&format!(
-                "lab {}'s 0 state was built before run vars: steps run as \"system\" or another user will not see them as environment variables (${{...}} in the config still works); wtl rebuild {} fixes it",
-                self.name, self.arg
+                "{}'s 0 state was built before step variables: steps run as \"system\" or another user will not see the run's vars or WTL_ENVIRONMENT, WTL_MACHINE... as environment variables (${{...}} in the config, C:\\WTL\\instance.json and the registry still work); {}",
+                self.what(),
+                fix
             ));
         }
     }
 
+    /// This 0 state's id, made with it. A 0 state built by an older `wtl` gets one now, saved in
+    /// its 0-state.json. Empty while there is no 0 state.
+    fn zero_id(&self) -> String {
+        zero_id_at(&self.zero_done)
+    }
+
+    /// Make a new environment of this lab from its 0 state (which must exist): its own state
+    /// folder with thin overlays on the lab's 0-state disks, a random id, its own LAN port.
+    fn spawn_env(&self, name: Option<&str>, note: &str) -> Result<EnvTarget> {
+        let home = &self.env.home;
+        if self.envf.is_some() {
+            bail!("{} is an environment; make new ones from its lab ({})", self.name, self.instance().lab);
+        }
+        let free = |n: &str| -> Result<bool> { Ok(!home.state_dir.join(n).exists() && assets::lab_file(home, n)?.is_none()) };
+        let env_name = match name {
+            Some(n) => {
+                let e = format!("{}-{}", self.name, n);
+                if !util::is_safe_name(n) || !util::is_safe_name(&e) {
+                    bail!("--name {:?} must be A-Z a-z 0-9 . _ -", n);
+                }
+                if !free(&e)? {
+                    bail!("{} already exists (wtl list; wtl rm {} first, or pick another --name)", e, e);
+                }
+                e
+            }
+            None => {
+                let mut pick = None;
+                for _ in 0..50 {
+                    let e = format!("{}-{}", self.name, envs::random_suffix());
+                    if free(&e)? {
+                        pick = Some(e);
+                        break;
+                    }
+                }
+                pick.ok_or_else(|| anyhow!("no free environment name for {}", self.name))?
+            }
+        };
+        let state = home.state_dir.join(&env_name);
+        std::fs::create_dir_all(&state).with_context(|| format!("cannot create {}", state.display()))?;
+        let made = (|| {
+            let (zero_id, frozen) = self.fill_env(&state)?;
+            let lan_port = match &self.lab.network {
+                Some(_) => Some(envs::pick_lan_port(home, &lab_ports(home))?),
+                None => None,
+            };
+            let f = EnvFile {
+                lab: self.name.clone(),
+                lab_file: util::canon(&self.lab_file),
+                id: envs::random_hex(8),
+                note: note.to_string(),
+                created_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
+                zero_id,
+                frozen,
+                lan_port,
+            };
+            envs::save(&state, &f)?;
+            self.write_env_zero(&state, &env_name, &f.id)?;
+            Ok::<_, anyhow::Error>(f)
+        })();
+        match made {
+            Ok(f) => {
+                ok(&format!("environment {} (id {}) made from lab {}'s 0 state", env_name, f.id, self.name));
+                Ok((env_name, f))
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&state);
+                Err(e)
+            }
+        }
+    }
+
+    /// Point an environment's state folder at this lab's current 0 state: hard-link the lab's
+    /// 0-state disks into `frozen/<0-state id>/` (once per 0 state), make the environment's
+    /// 0-state disks thin overlays on those, and copy each UEFI machine's variables (its boot
+    /// entries). Returns the 0 state's id and the frozen folder.
+    fn fill_env(&self, env_state: &Path) -> Result<(String, PathBuf)> {
+        if !self.zero_done.is_file() {
+            bail!("lab {} has no 0 state (wtl prepare {})", self.name, self.arg);
+        }
+        let zero_id = self.zero_id();
+        let frozen = self.state.join("frozen").join(&zero_id);
+        std::fs::create_dir_all(&frozen).with_context(|| format!("cannot create {}", frozen.display()))?;
+        let frozen = util::canon(&frozen);
+        for vm in self.vm_names() {
+            let link = frozen.join(format!("{}-0.qcow2", vm));
+            if !link.is_file() {
+                std::fs::hard_link(self.zero_disk(&vm), &link)
+                    .with_context(|| format!("cannot link {} to {}", self.zero_disk(&vm).display(), link.display()))?;
+            }
+            let disk = env_state.join(format!("{}-0.qcow2", vm));
+            let _ = std::fs::remove_file(&disk);
+            self.qemu_img_create(&link, &disk)?;
+            for fw in ["OVMF_VARS", "AAVMF_VARS"] {
+                let src = self.st(&format!("{}-{}.fd", vm, fw));
+                if src.is_file() {
+                    let dst = env_state.join(format!("{}-{}.fd", vm, fw));
+                    std::fs::copy(&src, &dst).with_context(|| format!("cannot copy {} to {}", src.display(), dst.display()))?;
+                }
+            }
+        }
+        Ok((zero_id, frozen))
+    }
+
+    /// An environment's own 0-state.json: the lab's (when built, which machines, what its guest
+    /// scripts can do) with the environment's name and id.
+    fn write_env_zero(&self, env_state: &Path, env_name: &str, id: &str) -> Result<()> {
+        let z: ZeroState = std::fs::read_to_string(&self.zero_done).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let ez = ZeroState { lab: env_name.to_string(), built_at: z.built_at, machines: z.machines, guest: z.guest, id: id.to_string() };
+        write_file(&env_state.join("0-state.json"), pyjson::dumps(&ez))
+    }
+
+    /// `wtl rebuild ENV`: this environment fresh again from its lab's current 0 state, keeping
+    /// its name, id, note and LAN port.
+    fn refresh_env(&mut self) -> Result<()> {
+        let Some(mut f) = self.envf.clone() else { bail!("not an environment") };
+        self.restore()?;
+        let lab = load_lab(&f.lab_file)?;
+        let parent = MultiLab::new("prepare", &f.lab_file, None, None, lab, &RunOpts::default(), None)?;
+        let (zero_id, frozen) = parent.fill_env(&self.state)?;
+        f.zero_id = zero_id;
+        f.frozen = frozen;
+        envs::save(&self.state, &f)?;
+        parent.write_env_zero(&self.state, &self.name, &f.id)?;
+        envs::gc_frozen(&self.env.home, &parent.state);
+        let built =
+            std::fs::read_to_string(&self.zero_done).ok().and_then(|t| serde_json::from_str::<ZeroState>(&t).ok()).unwrap_or_default();
+        ok(&format!("environment {} is fresh again from lab {}'s 0 state (built {})", self.name, f.lab, built.built_at));
+        self.envf = Some(f);
+        Ok(())
+    }
+
+    /// "lab school" or "environment school-k7q3", for messages.
+    fn what(&self) -> String {
+        format!("{} {}", if self.envf.is_some() { "environment" } else { "lab" }, self.name)
+    }
+
+    /// Who this lab or environment is, for the machines inside it and for the results.
+    fn instance(&self) -> Instance {
+        match &self.envf {
+            Some(e) => Instance { lab: e.lab.clone(), environment: self.name.clone(), id: e.id.clone(), note: e.note.clone() },
+            None => Instance { lab: self.name.clone(), environment: self.name.clone(), id: self.zero_id(), note: String::new() },
+        }
+    }
+
     fn status(&self) {
-        println!("lab {} ({}): {}, {} machines", self.name, self.lab_file.display(), self.mode_text(), self.vms.len());
+        let inst = self.instance();
+        match &self.envf {
+            Some(f) => {
+                println!(
+                    "environment {} (id {}) of lab {} ({}): {}, {} machines",
+                    self.name,
+                    f.id,
+                    f.lab,
+                    self.lab_file.display(),
+                    self.mode_text(),
+                    self.vms.len()
+                );
+                if !f.note.is_empty() {
+                    println!("  note: {}", f.note);
+                }
+                println!("  made {}{}", f.created_at, f.lan_port.map(|p| format!(", lab LAN port {}", p)).unwrap_or_default());
+            }
+            None => {
+                let id = if inst.id.is_empty() { String::new() } else { format!(" (id {})", inst.id) };
+                println!("lab {}{} ({}): {}, {} machines", self.name, id, self.lab_file.display(), self.mode_text(), self.vms.len());
+            }
+        }
         if self.zero_done.is_file() {
             let z: ZeroState =
                 std::fs::read_to_string(&self.zero_done).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
@@ -727,7 +1103,7 @@ impl MultiLab {
         } else {
             println!("  0 state: not built yet (wtl prepare {}, or just wtl run ...)", self.arg);
         }
-        for v in &self.vms {
+        for v in self.vms.iter().filter(|v| self.only.as_ref().is_none_or(|m| m.eq_ignore_ascii_case(&v.name))) {
             let role = match (v.role, self.lab.is_ad()) {
                 (Role::Dc, _) => "dc",
                 (Role::Member, true) => "member",
@@ -742,6 +1118,13 @@ impl MultiLab {
         }
         if let Some(last) = self.last_run() {
             println!("  last run: {}", last.display());
+        }
+        if self.envf.is_none() {
+            let envs = envs::of_lab(&self.env.home, &self.name);
+            if !envs.is_empty() {
+                let names: Vec<String> = envs.iter().map(|(n, f)| format!("{} ({})", n, f.id)).collect();
+                println!("  environments: {}", names.join(", "));
+            }
         }
     }
 
@@ -772,16 +1155,20 @@ impl MultiLab {
         match self.cmd {
             "stop" => {
                 self.stop_vms(false)?;
-                ok(&format!("lab {} is off", self.name));
+                ok(&format!("{} is off", self.what()));
                 return Ok(0);
             }
             "restore" => {
                 self.restore()?;
-                ok(&format!("lab {} is back at its 0 state (VMs off; next run/up starts clean)", self.name));
+                ok(&format!("{} is back at its 0 state (VMs off; next run/up starts clean)", self.what()));
                 return Ok(0);
             }
             "status" => {
                 self.status();
+                return Ok(0);
+            }
+            "rebuild" if self.envf.is_some() => {
+                self.refresh_env()?;
                 return Ok(0);
             }
             "rebuild" => {
@@ -790,7 +1177,12 @@ impl MultiLab {
                     let _ = std::fs::remove_file(self.zero_disk(&vm));
                 }
                 let _ = std::fs::remove_file(&self.zero_done);
-                ok(&format!("lab {}: 0 state deleted; the next run builds a new domain (Windows installs kept)", self.name));
+                // the environments' frozen copies of this 0 state stay (hard links), the rest go
+                envs::gc_frozen(&self.env.home, &self.state);
+                let kept = envs::of_lab(&self.env.home, &self.name).len();
+                let also =
+                    if kept > 0 { format!("; its {} environment(s) keep the 0 state they were made from", kept) } else { String::new() };
+                ok(&format!("lab {}: 0 state deleted; the next run builds a new domain (Windows installs kept){}", self.name, also));
                 return Ok(0);
             }
             _ => {}
@@ -877,6 +1269,8 @@ impl MultiLab {
             .map(|u| LabUser { name: &u.name, password: &u.password, groups: u.groups.iter().map(String::as_str).collect() })
             .collect();
 
+        // who this machine is: on every disc but the build's (the 0 state stays anonymous)
+        let inst = if build { None } else { Some(self.instance()) };
         // the run block (only on a real run, never during the build or `up`)
         let run = if !build && self.cmd == "run" && vm.has_steps() {
             let mounts = vm.mounts.iter().map(|(l, h)| LabMount { host: h, letter: l }).collect();
@@ -897,7 +1291,13 @@ impl MultiLab {
                     }
                 })
                 .collect();
-            let env = self.run_vars.iter().map(|v| (v.name.as_str(), v.value.as_str())).collect();
+            let mut env: IndexMap<String, String> = self.run_vars.iter().map(|v| (v.name.clone(), v.value.clone())).collect();
+            if let Some(i) = &inst {
+                env.insert("WTL_ENVIRONMENT".into(), i.environment.clone());
+                env.insert("WTL_ENVIRONMENT_ID".into(), i.id.clone());
+                env.insert("WTL_MACHINE".into(), vm.name.clone());
+                env.insert("WTL_RUN_ID".into(), self.run_id.clone());
+            }
             Some(LabRun { mounts, steps, wait: self.wait_s, env })
         } else {
             None
@@ -958,6 +1358,11 @@ impl MultiLab {
             iis,
             setup,
             run,
+            instance: inst.map(|i| {
+                // Server 2003 is 32-bit only: no 32-bit registry view to fill as well
+                let (json, reg) = envs::instance_files(&i, &vm.name, &self.run_id, vm.os.key != "2003");
+                LabInstance { environment: i.environment, id: i.id, json, reg }
+            }),
         };
         write_file(&labdir.join("lab.json"), pyjson::dumps_indent(&j, 1))?;
         mkiso::make_iso(&stage, out, "WTL_LAB").with_context(|| format!("mkiso {} failed", vm.name))?;
@@ -1267,6 +1672,7 @@ impl MultiLab {
             built_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
             machines: self.vm_names(),
             guest: GUEST_FEATURES.iter().map(|f| f.to_string()).collect(),
+            id: envs::random_hex(8),
         };
         write_file(&self.zero_done, pyjson::dumps(&done))?;
         ok(&format!("0 state saved for lab {} ({} machines)", self.name, self.vms.len()));
@@ -1277,7 +1683,10 @@ impl MultiLab {
 
     fn summary(&self) {
         eprintln!();
-        eprintln!("  lab {}: {}", self.name, self.mode_text());
+        match &self.envf {
+            Some(f) => eprintln!("  environment {} (id {}) of lab {}: {}", self.name, f.id, f.lab, self.mode_text()),
+            None => eprintln!("  lab {}: {}", self.name, self.mode_text()),
+        }
         for v in &self.vms {
             // who is logged on: DOMAIN\user in AD mode, MACHINE\user (a local account) otherwise
             let realm = if self.lab.is_ad() { self.lab.netbios().to_string() } else { v.name.clone() };
@@ -1309,6 +1718,9 @@ impl MultiLab {
         if self.cmd == "prepare" {
             return Ok(0);
         }
+        if self.cmd == "run" {
+            self.run_id = format!("{}-{}", run_id, self.instance().id);
+        }
         let res = self.state.join("runs").join(&run_id);
         if self.cmd == "run" {
             std::fs::create_dir_all(&res).with_context(|| format!("cannot create {}", res.display()))?;
@@ -1327,7 +1739,7 @@ impl MultiLab {
                 }
             }
         }
-        log(&format!("lab {}: booting {} machines from the 0 state", self.name, self.vms.len()));
+        log(&format!("{}: booting {} machines from the 0 state", self.what(), self.vms.len()));
         self.boot_lab(false)?;
         if let Some(dc) = self.dc_name() {
             self.wait_ev(&dc, "LAB_DC_READY", "LAB_FAIL,ERROR", "domain controller")?;
@@ -1367,10 +1779,13 @@ impl MultiLab {
             let _ = std::fs::copy(&config, res.join("config.json"));
         }
         // runs/<id>/result.json: every step with machine, user, exit, expect, duration
+        let inst = self.instance();
         let summary = RunResult {
-            lab: self.name.clone(),
+            lab: inst.lab,
+            environment: inst.environment,
+            id: inst.id,
             config: config_name.clone(),
-            run_id: run_id.clone(),
+            run_id: self.run_id.clone(),
             vars: self.run_vars.iter().map(|v| (v.name.clone(), if v.secret { "***".to_string() } else { v.value.clone() })).collect(),
             status: if status == 0 { "ok" } else { "failed" }.to_string(),
             steps: step_results,
@@ -1466,20 +1881,25 @@ pub fn load_lab(path: &Path) -> Result<Lab> {
 
 /// Resolve the run file against its lab: `"lab": "school"` is `labs/school.json` in the home
 /// (else the built-in lab `school`), `"lab": "./lab.json"` (anything with a `/` or `\`, or
-/// ending in `.json`) is a lab file relative to the run file. `extends`, `vars` and
-/// `${WTL_NAME}` are applied first ([`crate::runconf`]). Returns the lab file path, the
-/// resolved lab, and the resolved run.
-pub fn load_run(config: &Path) -> Result<(PathBuf, Lab, Run)> {
+/// ending in `.json`) is a lab file relative to the run file; a name may also be an
+/// environment (`school-k7q3`). `lab_override` (`wtl run --lab`) replaces the file's `lab` (a
+/// path in it is relative to the current folder). `extends`, `vars` and `${WTL_NAME}` are
+/// applied first ([`crate::runconf`]). Returns the lab file path, the resolved lab, the resolved
+/// run, and the environment when the lab is one.
+pub fn load_run(config: &Path, lab_override: Option<&str>) -> Result<(PathBuf, Lab, Run, Option<EnvTarget>)> {
     let (value, vars) = crate::runconf::load(config, |k| std::env::var(k).ok())?;
     // a secret's value never shows in an error message
-    let (lab_file, lab, mut run) =
-        resolve_run(config, value).map_err(|e| anyhow!("{}", labdef::mask_secrets(&vars, &format!("{:#}", e))))?;
+    let (lab_file, lab, mut run, target) =
+        resolve_run(config, value, lab_override).map_err(|e| anyhow!("{}", labdef::mask_secrets(&vars, &format!("{:#}", e))))?;
     run.vars = vars;
-    Ok((lab_file, lab, run))
+    Ok((lab_file, lab, run, target))
 }
 
-fn resolve_run(config: &Path, value: serde_json::Value) -> Result<(PathBuf, Lab, Run)> {
-    let def = labdef::RunDef::from_value(value, &config.display().to_string())?;
+fn resolve_run(config: &Path, value: serde_json::Value, lab_override: Option<&str>) -> Result<(PathBuf, Lab, Run, Option<EnvTarget>)> {
+    let mut def = labdef::RunDef::from_value(value, &config.display().to_string())?;
+    if let Some(o) = lab_override {
+        def.lab = if labdef::lab_is_path(o) { util::abspath(Path::new(o)).to_string_lossy().into_owned() } else { o.to_string() };
+    }
     if def.lab.trim().is_empty() {
         bail!("{}: no lab (set \"lab\", here or in the file it extends)", config.display());
     }
@@ -1495,13 +1915,28 @@ fn resolve_run(config: &Path, value: serde_json::Value) -> Result<(PathBuf, Lab,
         let home = Home::resolve()?;
         match assets::lab_file(&home, &def.lab)? {
             Some(f) => f,
-            None => home.labs_dir().join(format!("{}.json", def.lab)),
+            None => match open_env(&home, &def.lab)? {
+                Some((lab_file, lab, target)) => return finish_run(config, def, lab_file, lab, Some(target)),
+                None => home.labs_dir().join(format!("{}.json", def.lab)),
+            },
         }
     };
     if !lab_file.is_file() {
         bail!("{}: lab {:?} not found ({} missing)", config.display(), def.lab, lab_file.display());
     }
     let lab = labdef::LabDef::load(&lab_file)?;
+    finish_run(config, def, lab_file, lab, None)
+}
+
+/// Resolve a run file's steps and mounts against the lab it boots.
+fn finish_run(
+    config: &Path,
+    def: labdef::RunDef,
+    lab_file: PathBuf,
+    lab: Lab,
+    target: Option<EnvTarget>,
+) -> Result<(PathBuf, Lab, Run, Option<EnvTarget>)> {
+    let base_dir = util::abspath(config).parent().unwrap_or(Path::new(".")).to_path_buf();
     let host_resolve = |h: &str| {
         let p = Path::new(h);
         if p.is_absolute() {
@@ -1512,7 +1947,7 @@ fn resolve_run(config: &Path, value: serde_json::Value) -> Result<(PathBuf, Lab,
     };
     let default_name = util::stem(util::basename(&config.to_string_lossy())).to_string();
     let run = def.resolve(&config.display().to_string(), &default_name, &lab, host_resolve)?;
-    Ok((lab_file, lab, run))
+    Ok((lab_file, lab, run, target))
 }
 
 #[cfg(test)]

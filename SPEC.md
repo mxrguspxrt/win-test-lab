@@ -175,13 +175,34 @@ built once (`wtl prepare`, or the first `wtl run`) by booting the overlays thems
    logged on -> `LAB_CLIENT_READY`; `LAB_IDLE`.
 4. The host powers every machine off with ACPI (members first, then the DC; a second press
    after 60 s if a user session delays it) and writes `0-state.json` (`lab`, `built_at`,
-   `machines`, and `guest`: what the baked guest scripts can do, `["step-env"]` = the SYSTEM
-   worker sets the run's vars; a run with vars on a 0 state without it warns).
+   `machines`, `id`: random, made with the 0 state, and `guest`: what the baked guest scripts
+   can do, `["step-env"]` = the SYSTEM worker sets the run's vars; a run with vars on a 0 state
+   without it warns). A 0 state from an older `wtl` gets its `id` the first time one is needed.
 
 The guest keeps its progress in `C:\WTL\lab-state.json` (`phase`: new, promoted, ready,
 joined, configure), so every reboot continues where it stopped. Roles, features and setup
 scripts (below) are applied here and frozen into the 0 state. `wtl rebuild` deletes the
 `-0.qcow2` files and `0-state.json`; the base images stay.
+
+## Environments
+
+`wtl up LAB --new [--name N] [--note TEXT]` (and `wtl run CONFIG --new`) makes an
+**environment**: a copy of a lab, named `<lab>-<N>` (default `<lab>-<4 random a-z0-9>`), with
+a state folder of its own. In it, `env.json` (`lab`, `lab_file`, `id`: 8 random hex digits,
+`note`, `created_at`, `zero_id` and `frozen`: the lab's 0 state it was made from, `lan_port`),
+a `0-state.json` (the lab's, with the environment's name and id), each machine's
+`<machine>-0.qcow2`: a thin overlay on the lab's 0-state disk, and a copy of each UEFI
+machine's variables. Its VMs are `lab-<environment>-<machine>`; its lab LAN port is a free one
+no lab or environment of the home uses (47100-47999), so its private LAN is its own, while the
+machines keep the lab's names, domain, IPs and CA. Every command takes the environment's name
+in place of a lab's (`status` also `NAME/MACHINE`), and a run file's `lab` may name one.
+
+The overlays do not point at the lab's `<machine>-0.qcow2` but at hard links to them in
+`<lab state>/frozen/<0-state id>/`, made by the first environment of that 0 state. `wtl
+rebuild LAB` deletes the lab's own files; the links keep the data for the environments, and a
+frozen folder is deleted with the last environment that uses it (`wtl rm`, or `wtl rebuild
+ENV`, which points the environment at the lab's current 0 state with the same name, id and
+note). `wtl list` shows the labs with a 0 state and the environments.
 
 ## A run
 
@@ -228,7 +249,10 @@ Pure ASCII (PowerShell 4 reads it without a BOM), one per machine:
    "steps": [{"n": 1, "as_": "system|logon|user", "user": "", "password": "",
               "path": "X:\\setup.bat", "args": "", "keep_running": false, "wait": 120}],
    "wait": 120,
-   "env": {"WTL_OS": "2019"} }
+   "env": {"WTL_OS": "2019", "WTL_ENVIRONMENT": "school-k7q3", "WTL_ENVIRONMENT_ID": "4b91d07c",
+           "WTL_MACHINE": "CL1", "WTL_RUN_ID": "20261124-101500-4b91d07c"} },
+ "instance": null | {"environment": "school-k7q3", "id": "4b91d07c",
+                     "json": "<C:\\WTL\\instance.json, as text>", "reg": "<a .reg file, as text>"}
 }
 ```
 
@@ -243,7 +267,19 @@ own process for the `logon` steps and sends them with every request to the SYSTE
 which sets them for `system` steps and merges them into the user's environment block for
 `user` steps. lab.ps1 (lab.vbs) comes from the control disc on every run, but the worker and
 the agent are baked into the 0 state, so lab.ps1 must work with an older worker (it ignores
-`env`). lab.ps1 refuses a disc whose `fmt` is not `multi`.
+`env`). `wtl` adds `WTL_ENVIRONMENT`, `WTL_ENVIRONMENT_ID`, `WTL_MACHINE` and `WTL_RUN_ID` to
+`run.env` (`WTL_RUN_ID` is `<time>-<id>`).
+
+`instance` is on every disc of an `up` or `run` (not the build's): who the machine is (lab,
+environment, id, machine, note, run id; for the lab itself, `environment` is the lab's name and
+`id` its 0 state's). When the machine is ready, lab.ps1 (lab.vbs on 2003) writes `json` as is
+to `C:\WTL\instance.json` and `reg` as UTF-16 to `C:\WTL\run\instance.reg`, then imports it into
+`HKLM\SOFTWARE\WinTestLab` (values Lab, Environment, Id, Machine, Note, RunId; on 64-bit
+Windows also under `Wow6432Node`, for 32-bit programs): itself when it runs as an
+administrator, else through the SYSTEM worker's `run` action (`reg.exe import`), which every
+worker has. It reports `LAB_INSTANCE`; a failure is only a `LAB_PHASE` line.
+
+lab.ps1 refuses a disc whose `fmt` is not `multi`.
 
 `roles`, `features`, `ad_cs`/`dhcp`/`iis` and `setup` are present only on the **build** disc
 (they are baked into the 0 state; the guest acts on them in the `configure` phase) and absent
@@ -312,6 +348,7 @@ Values with characters outside `A-Za-z0-9._~:\/+,@()-` are URL-escaped. Lines wi
 | `LAB_CONFIGURED machine= autologon=` | member | 0-state build: configure done, rebooting into the logon user |
 | `LAB_POLICY machine= state=refreshed` | lab.ps1 | run start (AD): gpupdate + certutil -pulse done |
 | `LAB_CLIENT_READY user= domain=\|workgroup= computer= [dc=] ip=` | member | logged on as its logon user |
+| `LAB_INSTANCE machine= environment= id=` | lab.ps1 | `C:\WTL\instance.json` and `HKLM\SOFTWARE\WinTestLab` written |
 | `LAB_IDLE` | member | 0-state build: ready to be powered off |
 | `LAB_MOUNT letter= host=` | lab.ps1 | a mount disc has its drive letter |
 | `OUTPUT stream=stepNout\|stepNerr seq=N \| base64` | lab.ps1 | step output, 768-byte chunks (max 256 KiB per stream) |

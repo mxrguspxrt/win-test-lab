@@ -1044,7 +1044,7 @@ fn driver(args: &[String]) -> i32 {
         c.has(&outs[i].1, "no lab ");
         // the home's own labs and the built-in ones
         c.has(&outs[i].1, "armmix fresh mixed pki roles school single-2003 single-2008 single-2012");
-        c.has(&outs[i].1, "solo solo2003 solo2008 tri win10 win11)");
+        c.has(&outs[i].1, "solo solo2003 solo2008 tri win10 win11; environments: wtl list)");
         // usage errors: clap's wording, exit 2
         let i = run(cx, outs, &["frobnicate", "tri"], &[]);
         c.code(&outs[i].1, 2);
@@ -1560,13 +1560,21 @@ fn driver(args: &[String]) -> i32 {
         c.code(o, 0);
         c.has(o, "[WS1 system] X:\\setup.bat -> exit 0");
         c.lacks(o, "s3cr3t-value");
-        c.lacks(o, "built before run vars");
+        c.lacks(o, "built before step variables");
         let st = cx.state("solo");
         let iso = IsoReader::open(&st.join("WS1.iso"), true).unwrap();
         let j: Value = serde_json::from_slice(iso.read("LAB/lab.json").unwrap()).unwrap();
         // the guest gets every var with its real value, in declaration order
+        // ... then wtl's own: who and where the step runs
+        let run_env = j["run"]["env"].as_object().cloned().unwrap_or_default();
+        let names: Vec<&str> = run_env.keys().map(String::as_str).collect();
         c.ok(
-            j["run"]["env"] == json!({ "WTL_DIR": "../../app", "WTL_KEY": "s3cr3t-value", "WTL_TAG": "fromenv" }),
+            names == ["WTL_DIR", "WTL_KEY", "WTL_TAG", "WTL_ENVIRONMENT", "WTL_ENVIRONMENT_ID", "WTL_MACHINE", "WTL_RUN_ID"]
+                && run_env["WTL_DIR"] == json!("../../app")
+                && run_env["WTL_KEY"] == json!("s3cr3t-value")
+                && run_env["WTL_TAG"] == json!("fromenv")
+                && run_env["WTL_ENVIRONMENT"] == json!("solo")
+                && run_env["WTL_MACHINE"] == json!("WS1"),
             format!("lab.json run.env {}", j["run"]["env"]),
         );
         let step1 = j["run"]["steps"][0].clone();
@@ -1604,7 +1612,7 @@ fn driver(args: &[String]) -> i32 {
         std::fs::write(&zp, z.to_string()).unwrap();
         let i = run(cx, outs, &["run", &conf], &env);
         c.code(&outs[i].1, 0);
-        c.has(&outs[i].1, "built before run vars");
+        c.has(&outs[i].1, "built before step variables");
         std::fs::write(&zp, zero).unwrap();
         let i = run(cx, outs, &["restore", "solo"], &[]);
         c.code(&outs[i].1, 0);
@@ -1834,6 +1842,167 @@ fn driver(args: &[String]) -> i32 {
         std::fs::write(cx.root.join("labs/setup/second.bat"), "@echo off\r\necho step two\r\n").unwrap();
         let _ = run(cx, outs, &["restore", "roles"], &[]);
         c.no_file(&cx.state("roles").join("0-state.json"));
+    });
+
+    scenario(&mut cx, "environments: up --new, address, list, run --lab, rebuild keeps theirs, rm", &|cx, c, outs| {
+        // "environment <name> (id <id>) made from lab ..." -> (name, id)
+        let made = |o: &Out| -> (String, String) {
+            let l = o.text.lines().find_map(|l| l.split("environment ").nth(1).filter(|r| r.contains(" made from lab "))).unwrap_or("");
+            let name = l.split(' ').next().unwrap_or("").to_string();
+            let id = l.split("(id ").nth(1).and_then(|r| r.split(')').next()).unwrap_or("").to_string();
+            (name, id)
+        };
+        let env_json = |name: &str| -> Value {
+            serde_json::from_slice(&std::fs::read(cx.state(name).join("env.json")).unwrap_or_default()).unwrap_or(Value::Null)
+        };
+        let i = run(cx, outs, &["up", "solo", "--new", "--name", "exp42", "--note", "first try: new installer"], &[]);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        let (name, id) = made(o);
+        c.ok(name == "solo-exp42" && id.len() == 8, format!("made {:?} {:?}", name, id));
+        c.has(o, "environment solo-exp42 (id ");
+        c.has(o, "WS1 ready");
+        let ej = env_json("solo-exp42");
+        c.ok(
+            ej["lab"] == json!("solo") && ej["id"] == json!(id) && ej["note"] == json!("first try: new installer"),
+            format!("env.json {}", ej),
+        );
+        // its 0-state disk is an overlay on the lab's, through the frozen hard link
+        let frozen = PathBuf::from(s(&ej, "frozen"));
+        let overlay = std::fs::read_to_string(cx.state("solo-exp42").join("WS1-0.qcow2")).unwrap_or_default();
+        c.ok(overlay.contains(&format!("backing={}", frozen.join("WS1-0.qcow2").display())), format!("WS1-0.qcow2: {}", overlay));
+        c.file(&frozen.join("WS1-0.qcow2"));
+        // the VM is the environment's, and its control disc says who it is
+        let argv = std::fs::read_to_string(&cx.fake_log).unwrap_or_default();
+        c.ok(argv.contains("lab-solo-exp42-WS1"), "the VM is named after the environment");
+        let iso = IsoReader::open(&cx.state("solo-exp42").join("WS1.iso"), true).unwrap();
+        let lj: Value = serde_json::from_slice(iso.read("LAB/lab.json").unwrap()).unwrap();
+        let inst: Value = serde_json::from_str(lj["instance"]["json"].as_str().unwrap_or("null")).unwrap_or(Value::Null);
+        c.ok(
+            inst == json!({ "lab": "solo", "environment": "solo-exp42", "id": id, "machine": "WS1", "note": "first try: new installer", "run_id": "" }),
+            format!("instance.json {}", inst),
+        );
+        let reg = lj["instance"]["reg"].as_str().unwrap_or("");
+        c.ok(
+            reg.contains("[HKEY_LOCAL_MACHINE\\SOFTWARE\\WinTestLab]") && reg.contains("\"Environment\"=\"solo-exp42\""),
+            format!("reg {}", reg),
+        );
+        // the lab itself is untouched and has an id of its own
+        let i = run(cx, outs, &["up", "solo"], &[]);
+        c.code(&outs[i].1, 0);
+        let iso = IsoReader::open(&cx.state("solo").join("WS1.iso"), true).unwrap();
+        let lj: Value = serde_json::from_slice(iso.read("LAB/lab.json").unwrap()).unwrap();
+        c.ok(
+            lj["instance"]["environment"] == json!("solo") && lj["instance"]["id"] != json!(id),
+            format!("solo instance {}", lj["instance"]),
+        );
+        // a second, random-named one runs next to both
+        let i = run(cx, outs, &["up", "solo", "--new"], &[]);
+        c.code(&outs[i].1, 0);
+        let (rnd, rnd_id) = made(&outs[i].1);
+        c.ok(rnd.starts_with("solo-") && rnd.len() == 9 && rnd_id != id, format!("random environment {:?}", rnd));
+        c.ok(cx.live_fakes().len() == 3, format!("solo + 2 environments running: {:?}", cx.live_fakes()));
+        let i = run(cx, outs, &["list"], &[]);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        for needle in ["NAME", "solo-exp42", &id, "first try: new installer", &rnd] {
+            c.has(o, needle);
+        }
+        c.ok(o.text.lines().any(|l| l.starts_with("solo-exp42 ") && l.contains("running")), "solo-exp42 is listed running");
+        // one machine
+        let i = run(cx, outs, &["status", "solo-exp42/WS1"], &[]);
+        c.code(&outs[i].1, 0);
+        c.has(&outs[i].1, "environment solo-exp42 (id ");
+        c.has(&outs[i].1, "note: first try: new installer");
+        let i = run(cx, outs, &["status", "solo-exp42/NOPE"], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "has no machine NOPE");
+        let i = run(cx, outs, &["status", "solo"], &[]);
+        c.has(&outs[i].1, "environments: ");
+        c.has(&outs[i].1, "solo-exp42");
+        // run in one: the steps get its identity, result.json carries it
+        let conf = cx.cfg(
+            "env-run.json",
+            "{ \"lab\": \"solo\", \"mount\": { \"X\": \"../app\" }, \"steps\": [ { \"as\": \"system\", \"run\": \"X:/setup.bat\" } ] }\n",
+        );
+        let i = run(cx, outs, &["run", &conf, "--lab", "solo-exp42"], &[]);
+        c.code(&outs[i].1, 0);
+        let res = std::fs::canonicalize(cx.state("solo-exp42").join("last")).unwrap_or_default();
+        let rj: Value = serde_json::from_slice(&std::fs::read(res.join("result.json")).unwrap_or_default()).unwrap_or(Value::Null);
+        c.ok(
+            rj["lab"] == json!("solo")
+                && rj["environment"] == json!("solo-exp42")
+                && rj["id"] == json!(id)
+                && s(&rj, "run_id").ends_with(&format!("-{}", id)),
+            format!("result.json {} {} {} {}", rj["lab"], rj["environment"], rj["id"], rj["run_id"]),
+        );
+        let iso = IsoReader::open(&cx.state("solo-exp42").join("WS1.iso"), true).unwrap();
+        let lj: Value = serde_json::from_slice(iso.read("LAB/lab.json").unwrap()).unwrap();
+        let env = &lj["run"]["env"];
+        c.ok(
+            env["WTL_ENVIRONMENT"] == json!("solo-exp42")
+                && env["WTL_ENVIRONMENT_ID"] == json!(id)
+                && env["WTL_MACHINE"] == json!("WS1")
+                && env["WTL_RUN_ID"] == rj["run_id"],
+            format!("step env {}", env),
+        );
+        // --new and --lab are refused where they make no sense
+        let i = run(cx, outs, &["up", "solo-exp42", "--new"], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "is an environment (of lab solo)");
+        let i = run(cx, outs, &["status", "solo", "--name", "x"], &[]);
+        c.code(&outs[i].1, 2);
+        let i = run(cx, outs, &["rm", "solo"], &[]);
+        c.code(&outs[i].1, 2);
+        c.has(&outs[i].1, "is a lab, not an environment");
+        // rebuilding the lab keeps the environments' 0 state; a run --new builds a new one first
+        let i = run(cx, outs, &["rebuild", "solo"], &[]);
+        c.code(&outs[i].1, 0);
+        c.has(&outs[i].1, "its 2 environment(s) keep the 0 state they were made from");
+        c.no_file(&cx.state("solo").join("WS1-0.qcow2"));
+        c.file(&frozen.join("WS1-0.qcow2"));
+        let i = run(cx, outs, &["up", "solo-exp42"], &[]);
+        c.code(&outs[i].1, 0);
+        let i = run(cx, outs, &["run", &conf, "--new"], &[]);
+        let o = &outs[i].1;
+        c.code(o, 0);
+        c.has(o, "=== building the 0 state of lab solo");
+        let (third, _) = made(o);
+        c.ok(third.starts_with("solo-"), format!("run --new made {:?}", third));
+        // an environment made fresh again: from the lab's new 0 state, same id
+        let i = run(cx, outs, &["rebuild", "solo-exp42"], &[]);
+        c.code(&outs[i].1, 0);
+        c.has(&outs[i].1, "environment solo-exp42 is fresh again from lab solo's 0 state");
+        let ej2 = env_json("solo-exp42");
+        c.ok(ej2["id"] == json!(id) && ej2["frozen"] != ej["frozen"], format!("refreshed env.json {}", ej2));
+        // the old frozen 0 state goes with the last environment that uses it
+        c.file(&frozen.join("WS1-0.qcow2"));
+        let i = run(cx, outs, &["rm", &rnd], &[]);
+        c.code(&outs[i].1, 0);
+        c.ok(!frozen.exists(), format!("{} should be gone", frozen.display()));
+        for e in ["solo-exp42", third.as_str()] {
+            let i = run(cx, outs, &["rm", e], &[]);
+            c.code(&outs[i].1, 0);
+            c.ok(!cx.state(e).exists(), format!("{} deleted", e));
+        }
+        let i = run(cx, outs, &["restore", "solo"], &[]);
+        c.code(&outs[i].1, 0);
+        // an AD lab's environment gets its own lab LAN port
+        let i = run(cx, outs, &["up", "tri", "--new", "--name", "lan"], &[]);
+        c.code(&outs[i].1, 0);
+        let argv = std::fs::read_to_string(&cx.fake_log).unwrap_or_default();
+        let port_of = |vm: &str| -> String {
+            let line = argv.lines().map(|l| l.replace('\u{1f}', " ")).rfind(|l| l.contains(vm)).unwrap_or_default();
+            line.split("local.port=").nth(1).map(|r| r.chars().take_while(|ch| ch.is_ascii_digit()).collect()).unwrap_or_default()
+        };
+        let (lab_port, env_port) = (port_of("lab-tri-DC "), port_of("lab-tri-lan-DC "));
+        c.ok(!env_port.is_empty() && env_port != lab_port, format!("tri port {:?}, tri-lan port {:?}", lab_port, env_port));
+        c.ok(
+            env_json("tri-lan")["lan_port"] == json!(env_port.parse::<u16>().unwrap_or(0)),
+            format!("env.json lan_port {}", env_json("tri-lan")["lan_port"]),
+        );
+        let i = run(cx, outs, &["rm", "tri-lan"], &[]);
+        c.code(&outs[i].1, 0);
     });
 
     let leaks = cx.live_fakes();

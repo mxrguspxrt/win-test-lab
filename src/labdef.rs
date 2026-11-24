@@ -1308,6 +1308,16 @@ mod tests {
             }
         }
         assert!(runs >= 4, "{} example runs", runs);
+        // the environments examples need the environment they expect
+        let mut env_runs = 0;
+        for e in std::fs::read_dir(root.join("examples/envs")).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "json") {
+                resolve(&p, &|k| (k == "WTL_EXPECT_ENV").then(|| "single-2019-demo".to_string()));
+                env_runs += 1;
+            }
+        }
+        assert!(env_runs >= 3, "{} examples/envs runs", env_runs);
         // single-smoke.json serves every single-<os> lab through WTL_OS
         let single = root.join("examples/configs/single-smoke.json");
         for os in labs.keys().filter_map(|k| k.strip_prefix("single-")) {

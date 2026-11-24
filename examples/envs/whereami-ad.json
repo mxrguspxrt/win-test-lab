@@ -1,0 +1,10 @@
+{
+  "$schema": "../../schema/run.schema.json",
+  "extends": "./whereami.json",
+  "lab": "2019",
+  "steps": [
+    { "on": "CL2019", "run": "X:/whereami.exe", "args": "--env ${WTL_EXPECT_ENV} --id \"${WTL_EXPECT_ID}\" --machine CL2019 --vars" },
+    { "on": "CL2019", "as": "system", "run": "X:/whereami.exe", "args": "--env ${WTL_EXPECT_ENV} --id \"${WTL_EXPECT_ID}\" --machine CL2019 ${WTL_SYSTEM_VARS}" },
+    { "on": "DC2019", "as": "system", "run": "X:/whereami.exe", "args": "--env ${WTL_EXPECT_ENV} --id \"${WTL_EXPECT_ID}\" --machine DC2019 ${WTL_SYSTEM_VARS}" }
+  ]
+}

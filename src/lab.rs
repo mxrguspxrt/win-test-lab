@@ -28,6 +28,11 @@ logging on automatically, all shut down cleanly. It is built once (by the first 
 `wtl prepare LAB`) and frozen in the state folder; every run writes only to throwaway disks
 on top of it, so a run starts from the 0 state and `wtl restore` takes a second.
 
+`wtl up LAB --new` spawns an environment: a copy of the lab's 0 state, made in seconds, on
+its own private network, so copies of one lab run side by side. It is addressed by its name
+like a lab (`wtl status school-k7q3`, `wtl run CONFIG --lab school-k7q3`; LAB/MACHINE for one
+machine); `wtl list` shows them, `wtl rm` deletes one.
+
 The data (ISOs, base images, 0 states) lives in the home: `wtl home` shows where, and how
 to move it (--home, WTL_HOME, a wtl.json, the user config file).
 
@@ -50,9 +55,15 @@ pub enum Cmd {
     Status(Target),
     /// build the 0 state (run does this automatically the first time)
     Prepare(Target),
-    /// delete the 0 state; the next run builds a new domain (the Windows installs stay)
+    /// delete the 0 state; the next run builds a new domain (the Windows installs stay). An
+    /// environment: make it fresh again from its lab's current 0 state
     #[command(visible_alias = "reset")]
     Rebuild(Target),
+    /// list every lab with a 0 state and every environment: id, running or off, note
+    #[command(visible_alias = "ls")]
+    List,
+    /// delete an environment (`wtl up LAB --new`): its VMs, disks and results
+    Rm(Rm),
     /// check this host: QEMU and acceleration per CPU, UEFI firmware, disk space, and which
     /// ISO serves which OS (by the Windows build and CPU inside it)
     Doctor,
@@ -65,6 +76,14 @@ pub enum Cmd {
     /// make DIR (default: the current folder) a home: writes DIR/wtl.json, so `wtl` run in
     /// DIR or below keeps its ISOs, images and 0 states there
     Init(Init),
+}
+
+/// `wtl rm ENV`
+#[derive(clap::Args, Debug)]
+pub struct Rm {
+    /// the environment, e.g. school-k7q3 (`wtl list` shows them)
+    #[arg(value_name = "ENV")]
+    pub name: String,
 }
 
 /// `wtl init [DIR]`
@@ -87,9 +106,25 @@ pub struct CheckIso {
 /// What a command acts on, and its options.
 #[derive(clap::Args, Debug)]
 pub struct Target {
-    /// LAB (a lab name, e.g. school, or a lab file) or a CONFIG run file; `run` needs a CONFIG
+    /// LAB (a lab name, e.g. school, a lab file, or an environment, e.g. school-k7q3) or a
+    /// CONFIG run file; `run` needs a CONFIG. `status` also takes LAB/MACHINE
     #[arg(value_name = "LAB|CONFIG")]
     pub target: String,
+    /// `up`, `run`: make a new environment of the lab, a copy of its 0 state on its own private
+    /// network, and boot that (`wtl list` shows it, `wtl rm` deletes it)
+    #[arg(long)]
+    pub new: bool,
+    /// with --new: the environment's name after the lab's (exp42 -> school-exp42; default: 4
+    /// random characters)
+    #[arg(long, value_name = "NAME", requires = "new")]
+    pub name: Option<String>,
+    /// with --new: a one-line description, shown by `wtl list` and `wtl status`, and inside its
+    /// machines (C:\WTL\instance.json)
+    #[arg(long, value_name = "TEXT", requires = "new")]
+    pub note: Option<String>,
+    /// `run`: run in this lab or environment instead of the one the run file names
+    #[arg(long, value_name = "LAB", conflicts_with = "new")]
+    pub lab: Option<String>,
     /// open the VM windows (default: headless, VNC addresses printed)
     #[arg(long)]
     pub show: bool,
@@ -144,6 +179,8 @@ fn run_cli(cmd: &Cmd) -> Result<i32> {
             ok(&format!("wrote {}: wtl run in {} or below keeps its data there", p.display(), util::canon(&dir).display()));
             return Ok(0);
         }
+        Cmd::List => return Ok(labrun::list()),
+        Cmd::Rm(r) => return Ok(labrun::remove_env(&r.name)),
         Cmd::Run(t) => ("run", t),
         Cmd::Restore(t) => ("restore", t),
         Cmd::Up(t) => ("up", t),
@@ -152,8 +189,15 @@ fn run_cli(cmd: &Cmd) -> Result<i32> {
         Cmd::Prepare(t) => ("prepare", t),
         Cmd::Rebuild(t) => ("rebuild", t),
     };
-    let opts = RunOpts { show: t.show, updates: t.updates, wait: t.wait, timeout_min: t.timeout_min };
+    let mut opts = RunOpts { show: t.show, updates: t.updates, wait: t.wait, timeout_min: t.timeout_min, machine: None };
     let target = t.target.as_str();
+    if t.new && cmd != "up" && cmd != "run" {
+        bail!("--new works with wtl up and wtl run");
+    }
+    if t.lab.is_some() && cmd != "run" {
+        bail!("--lab works with wtl run (the other commands take the lab or environment itself)");
+    }
+    let note = t.note.as_deref().unwrap_or("");
     // a run config: an existing .json file that is not itself a lab
     let is_file = Path::new(target).is_file();
     if cmd == "run" {
@@ -161,34 +205,74 @@ fn run_cli(cmd: &Cmd) -> Result<i32> {
             bail!("usage: wtl run CONFIG  (a run .json file, e.g. examples/configs/school-smoke.json; not found: {})", target);
         }
         let config = util::canon(Path::new(target));
-        let (lab_file, lab, run) = labrun::load_run(&config).context("config error")?;
-        return Ok(labrun::run(cmd, &lab_file, Some(config), Some(run), lab, &opts));
+        let (lab_file, lab, run, env) = labrun::load_run(&config, t.lab.as_deref()).context("config error")?;
+        let (lab_file, lab, env) = if t.new {
+            if let Some((n, f)) = &env {
+                bail!("--new makes a new environment of a lab, but {} is an environment (of lab {})", n, f.lab);
+            }
+            match labrun::spawn(&lab_file, lab, &opts, t.name.as_deref(), note) {
+                Ok((lf, l, e)) => (lf, l, Some(e)),
+                Err(e) => return Ok(labrun::exit_code(Err(e))),
+            }
+        } else {
+            (lab_file, lab, env)
+        };
+        return Ok(labrun::run(cmd, &lab_file, Some(config), Some(run), lab, &opts, env));
     }
-    // the other commands take a LAB name, a lab .json file, or a run config (which names its lab)
-    let lab_file = if is_file {
+    // the other commands take a LAB name, an environment, a lab .json file, or a run config
+    // (which names its lab); `status` also LAB/MACHINE
+    let (lab_file, lab, env) = if is_file {
         let p = util::canon(Path::new(target));
-        match labrun::load_run(&p) {
-            Ok((lab_file, _, _)) => lab_file,
+        match labrun::load_run(&p, None) {
+            Ok((lab_file, lab, _, env)) => (lab_file, Some(lab), env),
             // a run config that does not load (e.g. a required var is not set): say why
             Err(e) if is_run_config(&p) => return Err(e.context("config error")),
-            Err(_) => p, // not a run config: treat it as a lab file
+            Err(_) => (p, None, None), // not a run config: treat it as a lab file
         }
     } else {
-        if !util::is_safe_name(target) {
-            bail!("bad lab name {:?}", target);
+        let (name, machine) = match target.rsplit_once('/') {
+            Some((n, m)) if !n.is_empty() && !m.is_empty() => (n, Some(m)),
+            _ => (target, None),
+        };
+        if machine.is_some() && cmd != "status" {
+            bail!("{}: LAB/MACHINE works with wtl status; wtl {} acts on the whole lab ({})", target, cmd, name);
+        }
+        opts.machine = machine.map(str::to_string);
+        if !util::is_safe_name(name) {
+            bail!("bad lab name {:?}", name);
         }
         let home = Home::resolve()?;
-        match assets::lab_file(&home, target)? {
-            Some(f) => f,
-            None => bail!("no lab {} in {} or built in (labs: {})", target, home.labs_dir().display(), assets::lab_names(&home).join(" ")),
+        match assets::lab_file(&home, name)? {
+            Some(f) => (f, None, None),
+            None => match labrun::open_env(&home, name)? {
+                Some((lab_file, lab, env)) => (lab_file, Some(lab), Some(env)),
+                None => bail!(
+                    "no lab or environment {} (labs in {} or built in: {}; environments: wtl list)",
+                    name,
+                    home.labs_dir().display(),
+                    assets::lab_names(&home).join(" ")
+                ),
+            },
         }
     };
-    let lab = labrun::load_lab(&lab_file).context("lab error")?;
-    Ok(labrun::run(cmd, &lab_file, None, None, lab, &opts))
+    let lab = match lab {
+        Some(l) => l,
+        None => labrun::load_lab(&lab_file).context("lab error")?,
+    };
+    let (lab_file, lab, env) = if t.new {
+        if let Some((n, f)) = &env {
+            bail!("--new makes a new environment of a lab, but {} is an environment (of lab {}): wtl up {} --new", n, f.lab, f.lab);
+        }
+        match labrun::spawn(&lab_file, lab, &opts, t.name.as_deref(), note) {
+            Ok((lf, l, e)) => (lf, l, Some(e)),
+            Err(e) => return Ok(labrun::exit_code(Err(e))),
+        }
+    } else {
+        (lab_file, lab, env)
+    };
+    Ok(labrun::run(cmd, &lab_file, None, None, lab, &opts, env))
 }
 
-/// `wtl doctor`: what this host can run, and which ISO serves which OS. Exit 0 if the host
-/// can run at least one OS it has an ISO for, else 1.
 /// Does this JSON file look like a run config (a `lab` or `extends` key, no `machines`)?
 fn is_run_config(p: &Path) -> bool {
     let v: Option<serde_json::Value> = std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str(&t).ok());
@@ -197,6 +281,8 @@ fn is_run_config(p: &Path) -> bool {
         .is_some_and(|m| (m.contains_key("lab") || m.contains_key("extends")) && !m.contains_key("machines"))
 }
 
+/// `wtl doctor`: what this host can run, and which ISO serves which OS. Exit 0 if the host
+/// can run at least one OS it has an ISO for, else 1.
 fn doctor() -> Result<i32> {
     use crate::qemu::{Accel, Arch, Env};
     let home = Home::resolve()?;
