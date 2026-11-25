@@ -1,0 +1,17 @@
+{
+  "$schema": "../../schema/lab.schema.json",
+  "name": "win11-nested",
+  "machines": {
+    "WSWIN11": {
+      "os": "win11",
+      "logon": "tester",
+      "setup": [
+        { "run": "./prepare.ps1" },
+        { "run": "./out/qemu-w64-setup.exe", "args": "/S" }
+      ]
+    }
+  },
+  "users": {
+    "tester": { "password": "Test!2026" }
+  }
+}

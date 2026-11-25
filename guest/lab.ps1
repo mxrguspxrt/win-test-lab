@@ -696,7 +696,7 @@ function Invoke-LabClient($Cfg, [string]$LabDir) {
     # phase 'configure' (build only): logged on as the Administrator, apply roles/features/setup,
     # then switch autologon to the final logon user and reboot into 'joined'
     if ($phase -eq 'configure') {
-        Wait-LabDc $Cfg
+        if ($ad) { Wait-LabDc $Cfg }
         Send-WtlEvent 'LAB_CONFIGURE' @('machine', $env:COMPUTERNAME, 'role', 'member')
         Invoke-LabConfigure $Cfg $LabDir
         Set-LabAutoLogon $realm $user $pass

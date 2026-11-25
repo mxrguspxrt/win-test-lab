@@ -248,6 +248,25 @@ inside each machine that the computer name and the step variables say what you e
 `run-all.sh`, which runs the whole walkthrough with every result checked (on one machine,
 Server 2003, or an AD lab running next to its own copy), with or without `--rename`.
 
+## Virtual machines inside Windows
+
+A lab machine can run virtual machines of its own. `wtl` starts Windows with `-cpu host`, so it
+gets the CPU's AMD-V / VT-x (on Linux when KVM's `nested` option is on, the default): with the
+Windows Hypervisor Platform turned on, QEMU for Windows runs VMs inside on the hardware,
+`-accel whpx`; QEMU's software CPU, `-accel tcg`, works in any lab machine.
+[examples/nested](https://github.com/mxrguspxrt/win-test-lab/tree/main/examples/nested) builds
+such a Windows 11 lab (the feature and QEMU baked into its 0 state by two setup items) and boots a
+tiny VM inside it with each:
+
+```
+examples/nested/build.sh               # once: the tiny VM and QEMU for Windows
+wtl run examples/nested/nested.json    # the first time it also builds the lab
+```
+
+Under whpx the tiny VM runs on Windows' Hyper-V on the host's KVM, three hypervisors deep, and
+still at the hardware's speed: it counts to 2^30 in about a second (6-8 s under tcg), and the
+whole VM boots and exits in 1-2 s.
+
 ## Which host runs what
 
 `wtl` runs on Linux, macOS and Windows. Windows runs fast only where its CPU matches the
