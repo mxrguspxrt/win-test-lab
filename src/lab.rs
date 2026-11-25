@@ -118,8 +118,7 @@ pub struct Target {
     /// random characters)
     #[arg(long, value_name = "NAME", requires = "new")]
     pub name: Option<String>,
-    /// with --new: a one-line description, shown by `wtl list` and `wtl status`, and inside its
-    /// machines (C:\WTL\instance.json)
+    /// with --new: a one-line description, shown by `wtl list` and `wtl status`
     #[arg(long, value_name = "TEXT", requires = "new")]
     pub note: Option<String>,
     /// with --new: give machines new Windows computer names (renamed for real, a few minutes):

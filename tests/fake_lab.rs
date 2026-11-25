@@ -1939,30 +1939,16 @@ fn driver(args: &[String]) -> i32 {
         let overlay = std::fs::read_to_string(cx.state("solo-exp42").join("WS1-0.qcow2")).unwrap_or_default();
         c.ok(overlay.contains(&format!("backing={}", frozen.join("WS1-0.qcow2").display())), format!("WS1-0.qcow2: {}", overlay));
         c.file(&frozen.join("WS1-0.qcow2"));
-        // the VM is the environment's, and its control disc says who it is
+        // the VM is the environment's; its control disc has no instance record (steps get who
+        // they are as variables)
         let argv = std::fs::read_to_string(&cx.fake_log).unwrap_or_default();
         c.ok(argv.contains("lab-solo-exp42-WS1"), "the VM is named after the environment");
         let iso = IsoReader::open(&cx.state("solo-exp42").join("WS1.iso"), true).unwrap();
         let lj: Value = serde_json::from_slice(iso.read("LAB/lab.json").unwrap()).unwrap();
-        let inst: Value = serde_json::from_str(lj["instance"]["json"].as_str().unwrap_or("null")).unwrap_or(Value::Null);
-        c.ok(
-            inst == json!({ "lab": "solo", "environment": "solo-exp42", "id": id, "machine": "WS1", "hostname": "WS1", "hostnames": { "WS1": "WS1" }, "note": "first try: new installer", "run_id": "" }),
-            format!("instance.json {}", inst),
-        );
-        let reg = lj["instance"]["reg"].as_str().unwrap_or("");
-        c.ok(
-            reg.contains("[HKEY_LOCAL_MACHINE\\SOFTWARE\\WinTestLab]") && reg.contains("\"Environment\"=\"solo-exp42\""),
-            format!("reg {}", reg),
-        );
-        // the lab itself is untouched and has an id of its own
+        c.ok(lj["machine"] == json!("WS1") && lj.get("instance").is_none(), format!("up disc {}", lj));
+        // the lab itself is untouched
         let i = run(cx, outs, &["up", "solo"], &[]);
         c.code(&outs[i].1, 0);
-        let iso = IsoReader::open(&cx.state("solo").join("WS1.iso"), true).unwrap();
-        let lj: Value = serde_json::from_slice(iso.read("LAB/lab.json").unwrap()).unwrap();
-        c.ok(
-            lj["instance"]["environment"] == json!("solo") && lj["instance"]["id"] != json!(id),
-            format!("solo instance {}", lj["instance"]),
-        );
         // a second, random-named one runs next to both
         let i = run(cx, outs, &["up", "solo", "--new"], &[]);
         c.code(&outs[i].1, 0);
@@ -1976,6 +1962,9 @@ fn driver(args: &[String]) -> i32 {
             c.has(o, needle);
         }
         c.ok(o.text.lines().any(|l| l.starts_with("solo-exp42 ") && l.contains("running")), "solo-exp42 is listed running");
+        // the lab itself has an id of its own
+        let lab_id = o.text.lines().find(|l| l.starts_with("solo ")).and_then(|l| l.split_whitespace().nth(2)).unwrap_or("");
+        c.ok(lab_id.len() == 8 && lab_id != id, format!("solo's id {:?}", lab_id));
         // one machine
         let i = run(cx, outs, &["status", "solo-exp42/WS1"], &[]);
         c.code(&outs[i].1, 0);
@@ -2114,11 +2103,7 @@ fn driver(args: &[String]) -> i32 {
         c.no_file(&cx.state("solo-rn").join("0-state.json.pending"));
         let iso = IsoReader::open(&cx.state("solo-rn").join("WS1.iso"), true).unwrap();
         let lj: Value = serde_json::from_slice(iso.read("LAB/lab.json").unwrap()).unwrap();
-        let inst: Value = serde_json::from_str(lj["instance"]["json"].as_str().unwrap_or("null")).unwrap_or(Value::Null);
-        c.ok(
-            lj["hostname"] == json!("WS1-RN") && inst["hostname"] == json!("WS1-RN") && lj["rename"].is_null(),
-            format!("up disc {} {}", lj["hostname"], inst),
-        );
+        c.ok(lj["hostname"] == json!("WS1-RN") && lj["rename"].is_null(), format!("up disc {} {}", lj["hostname"], lj["rename"]));
         let i = run(cx, outs, &["status", "solo-rn"], &[]);
         c.has(&outs[i].1, "hostname WS1-RN");
         c.has(&outs[i].1, "renamed (done): WS1 -> WS1-RN");

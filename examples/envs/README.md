@@ -1,10 +1,9 @@
 # envs: environments, and a program that knows where it runs
 
 `whereami.exe` runs inside a lab machine and checks that it knows which lab, environment and
-machine it is: the computer name, `C:\WTL\instance.json`, the registry
-(`HKLM\SOFTWARE\WinTestLab`, both views on 64-bit Windows) and the step's `WTL_*` variables must
-all agree, and match what you expect. It ends with `RESULT OK` (exit 0) or `RESULT FAIL` (exit
-1), so a `wtl run` passes only if every machine knows where it is.
+machine it is: the computer name and the step's `WTL_*` variables must agree, and match what you
+expect. It ends with `RESULT OK` (exit 0) or `RESULT FAIL` (exit 1), so a `wtl run` passes only
+if every machine knows where it is.
 
 Below, line by line, with what each command should show. `run-all.sh` does all of it with every
 result checked, and stops at the first one that is wrong:
@@ -51,16 +50,12 @@ second one: only `WS2019`).
 the results are, `<machine>/step1out.txt`) looks like:
 
     computer name   WS2019
-    instance.json   lab=single-2019 environment=single-2019-demo id=1a2b3c4d machine=WS2019 run_id=20261124-101500-1a2b3c4d
-                    note: whereami demo
-    registry 64-bit  environment=single-2019-demo id=1a2b3c4d machine=WS2019 run_id=20261124-101500-1a2b3c4d
-    registry 32-bit  environment=single-2019-demo id=1a2b3c4d machine=WS2019 run_id=20261124-101500-1a2b3c4d
-    step variables  WTL_ENVIRONMENT=single-2019-demo WTL_ENVIRONMENT_ID=1a2b3c4d WTL_MACHINE=WS2019 WTL_RUN_ID=20261124-101500-1a2b3c4d
-    RESULT OK: this is WS2019 of single-2019-demo (id 1a2b3c4d)
+    step variables  WTL_ENVIRONMENT=single-2019-demo WTL_ENVIRONMENT_ID=1a2b3c4d WTL_MACHINE=WS2019 WTL_HOSTNAME=WS2019 WTL_RUN_ID=20261124-101500-1a2b3c4d
+    RESULT OK: this is WS2019 (WS2019) of single-2019-demo (id 1a2b3c4d)
 
-Step 1 runs as the logged-on user and checks the step variables too; step 2 runs as SYSTEM.
-(A SYSTEM step sees the variables only on a 0 state built by `wtl` 0.3 or newer: there,
-`WTL_SYSTEM_VARS=--vars` checks them as well.)
+Step 1 runs as the logged-on user; step 2 runs as SYSTEM. (A SYSTEM step sees the variables
+only on a 0 state built by `wtl` 0.3 or newer: there, `WTL_SYSTEM_VARS=--vars` checks them as
+well; without it, step 2 checks only the computer name.)
 
 The lab itself, at the same time if you like (its id from `wtl list`): the computer is still
 `WS2019`, but `environment=single-2019`:
@@ -83,8 +78,8 @@ saved`. `wtl status single-2019-ren/WS2019` shows `hostname WS2019-REN`. Then:
 
     WTL_EXPECT_ENV=single-2019-ren WTL_EXPECT_ID=<its id> WTL_EXPECT_HOST=WS2019-REN wtl run examples/envs/whereami.json --lab single-2019-ren
 
-prints `computer name   WS2019-REN`, `hostname=WS2019-REN` in `instance.json` and the registry,
-`WTL_HOSTNAME=WS2019-REN`, and `RESULT OK: this is WS2019 (WS2019-REN) of single-2019-ren`. The
+prints `computer name   WS2019-REN`, `WTL_HOSTNAME=WS2019-REN`, and `RESULT OK: this is WS2019
+(WS2019-REN) of single-2019-ren (id ...)`. The
 lab itself, at the same time, still says `WS2019`.
 
 ## 5. Fresh again, then gone

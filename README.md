@@ -15,7 +15,7 @@ win-test-lab (the `wtl` command) does the boring part for you:
 - **Run your program** inside Windows, as SYSTEM or as any lab user, and get every step's exit
   code and output back.
 - **Many environments from one lab.** `wtl up school --new` spawns a fresh copy of a whole lab
-  in seconds, on its own private network; every machine in it knows which copy it is.
+  in seconds, on its own private network; every step run in it knows which copy it is in.
 - **One run file for every case.** Variables (`WTL_OS=2022 wtl run smoke.json`) choose the
   Windows, the folders and the arguments; `extends` shares one file between many; secrets stay
   out of the results.
@@ -230,45 +230,23 @@ environment renames it again from the lab's current 0 state.
 
 ### Where am I? Inside Windows
 
-Every machine of every environment can tell which lab, environment, machine and run it is, so
-your program or test knows where it is running. At every boot `wtl` writes it to
-`C:\WTL\instance.json`:
-
-```json
-{
-  "lab": "school",
-  "environment": "school-exp42",
-  "id": "c2e5a813",
-  "machine": "CL1",
-  "hostname": "CL1-EXP42",
-  "hostnames": { "DC1": "DC1-EXP42", "CL1": "CL1-EXP42", "CL2": "CL2-EXP42" },
-  "note": "new installer on the 2016 client",
-  "run_id": "20261124-101500-c2e5a813"
-}
-```
-
-and the same values to the registry (`HKLM\SOFTWARE\WinTestLab`) and to every step's environment
-(`WTL_ENVIRONMENT`, `WTL_ENVIRONMENT_ID`, `WTL_MACHINE`, `WTL_HOSTNAME`, `WTL_HOST_<KEY>`,
-`WTL_RUN_ID`):
-
-```powershell
-$me = Get-Content C:\WTL\instance.json | ConvertFrom-Json
-"I am $($me.machine) in $($me.environment) ($($me.id))"
-```
+Every step of a `wtl run` can tell which lab, environment, machine and run it is in, so your
+program or test knows where it is running. `wtl` sets it in every step's environment:
+`WTL_ENVIRONMENT` (the environment's name; the lab's own name for the lab itself),
+`WTL_ENVIRONMENT_ID`, `WTL_MACHINE` (the machine's key in the lab file), `WTL_HOSTNAME` (its
+computer name), `WTL_HOST_<KEY>` (every machine's) and `WTL_RUN_ID` (`<time>-<id>`):
 
 ```bat
-reg query HKLM\SOFTWARE\WinTestLab /v Environment
+echo I am %WTL_MACHINE% (%COMPUTERNAME%) in %WTL_ENVIRONMENT% (%WTL_ENVIRONMENT_ID%)
 ```
 
-`run_id` is empty outside `wtl run` (after `wtl up`). On the host, `result.json` carries the same
-`environment`, `id` and `run_id`.
+On the host, `result.json` carries the same `environment`, `id` and `run_id`.
 
 [examples/envs](https://github.com/mxrguspxrt/win-test-lab/tree/main/examples/envs) walks
 through all of it, one command at a time, with `whereami.exe`: a small program that checks
-inside each machine that the computer name, `instance.json`, the registry and the step
-variables all say the same, and `run-all.sh`, which runs the whole walkthrough with every
-result checked (on one machine, Server 2003, or an AD lab running next to its own copy), with
-or without `--rename`.
+inside each machine that the computer name and the step variables say what you expect, and
+`run-all.sh`, which runs the whole walkthrough with every result checked (on one machine,
+Server 2003, or an AD lab running next to its own copy), with or without `--rename`.
 
 ## Which host runs what
 

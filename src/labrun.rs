@@ -91,10 +91,6 @@ struct LabJson<'a> {
     setup: Vec<LabSetup<'a>>,
     /// the per-machine run (null during the 0-state build and for `up`)
     run: Option<LabRun<'a>>,
-    /// who this machine is (lab, environment, id, machine, note, run id), for programs inside
-    /// it: the guest writes `json` to C:\WTL\instance.json and imports `reg` (a .reg file) into
-    /// HKLM\SOFTWARE\WinTestLab at every `up` / `run` (null during the 0-state build)
-    instance: Option<LabInstance>,
     /// the boot that renames an environment's machines (null otherwise)
     rename: Option<LabRename<'a>>,
 }
@@ -124,14 +120,6 @@ struct LabRename<'a> {
     /// the DC only: the members being renamed (old -> new computer name), whose old DNS
     /// records it deletes once their new ones are registered
     peers: IndexMap<&'a str, &'a str>,
-}
-
-#[derive(Serialize)]
-struct LabInstance {
-    environment: String,
-    id: String,
-    json: String,
-    reg: String,
 }
 
 #[derive(Serialize)]
@@ -1008,7 +996,7 @@ impl MultiLab {
 
     /// A run on a 0 state whose SYSTEM worker predates step variables: its `system` and
     /// other-user steps run without the run's vars and WTL_ENVIRONMENT... in their environment
-    /// (`${...}`, C:\WTL\instance.json and the registry still work).
+    /// (`${...}` still works).
     fn warn_old_worker(&self) {
         let runs_by_worker = self.vms.iter().any(|v| v.steps.iter().any(|(_, s)| s.as_ != StepAs::Logon));
         if !runs_by_worker {
@@ -1021,7 +1009,7 @@ impl MultiLab {
                 None => format!("wtl rebuild {} fixes it", self.arg),
             };
             warn(&format!(
-                "{}'s 0 state was built before step variables: steps run as \"system\" or another user will not see the run's vars or WTL_ENVIRONMENT, WTL_MACHINE... as environment variables (${{...}} in the config, C:\\WTL\\instance.json and the registry still work); {}",
+                "{}'s 0 state was built before step variables: steps run as \"system\" or another user will not see the run's vars or WTL_ENVIRONMENT, WTL_MACHINE... as environment variables (${{...}} in the config still works); {}",
                 self.what(),
                 fix
             ));
@@ -1306,8 +1294,8 @@ impl MultiLab {
     fn instance(&self) -> Instance {
         let hostnames: IndexMap<String, String> = self.vms.iter().map(|v| (v.name.clone(), v.hostname.clone())).collect();
         match &self.envf {
-            Some(e) => Instance { lab: e.lab.clone(), environment: self.name.clone(), id: e.id.clone(), note: e.note.clone(), hostnames },
-            None => Instance { lab: self.name.clone(), environment: self.name.clone(), id: self.zero_id(), note: String::new(), hostnames },
+            Some(e) => Instance { lab: e.lab.clone(), environment: self.name.clone(), id: e.id.clone(), hostnames },
+            None => Instance { lab: self.name.clone(), environment: self.name.clone(), id: self.zero_id(), hostnames },
         }
     }
 
@@ -1569,8 +1557,8 @@ impl MultiLab {
             .map(|u| LabUser { name: &u.name, password: &u.password, groups: u.groups.iter().map(String::as_str).collect() })
             .collect();
 
-        // who this machine is: on every disc but the build's and the rename's (a 0 state stays
-        // anonymous)
+        // who this machine is, for the step variables: on every disc but the build's and the
+        // rename's (a 0 state stays anonymous)
         let inst = if build || self.renaming { None } else { Some(self.instance()) };
         let rename = self.rename_block(vm);
         // the run block (only on a real run, never during the build or `up`)
@@ -1666,11 +1654,6 @@ impl MultiLab {
             iis,
             setup,
             run,
-            instance: inst.map(|i| {
-                // Server 2003 is 32-bit only: no 32-bit registry view to fill as well
-                let (json, reg) = envs::instance_files(&i, &vm.name, &self.run_id, vm.os.key != "2003");
-                LabInstance { environment: i.environment, id: i.id, json, reg }
-            }),
             rename,
         };
         write_file(&labdir.join("lab.json"), pyjson::dumps_indent(&j, 1))?;

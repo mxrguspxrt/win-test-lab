@@ -295,8 +295,6 @@ Pure ASCII (PowerShell 4 reads it without a BOM), one per machine:
    "wait": 120,
    "env": {"WTL_OS": "2019", "WTL_ENVIRONMENT": "school-k7q3", "WTL_ENVIRONMENT_ID": "4b91d07c",
            "WTL_MACHINE": "CL1", "WTL_RUN_ID": "20261124-101500-4b91d07c"} },
- "instance": null | {"environment": "school-k7q3", "id": "4b91d07c",
-                     "json": "<C:\\WTL\\instance.json, as text>", "reg": "<a .reg file, as text>"},
  "rename": null | {"from": "CL1", "to": "CL1-EXP42", "ca": false, "ca_name": "LAB-ROOT-CA", "admin": false,
                    "dhcp": false, "iis_site_path": "", "reenroll": true, "reenroll_user": false,
                    "peers": {"CL1": "CL1-EXP42"}}
@@ -316,15 +314,6 @@ which sets them for `system` steps and merges them into the user's environment b
 the agent are baked into the 0 state, so lab.ps1 must work with an older worker (it ignores
 `env`). `wtl` adds `WTL_ENVIRONMENT`, `WTL_ENVIRONMENT_ID`, `WTL_MACHINE` and `WTL_RUN_ID` to
 `run.env` (`WTL_RUN_ID` is `<time>-<id>`).
-
-`instance` is on every disc of an `up` or `run` (not the build's): who the machine is (lab,
-environment, id, machine, note, run id; for the lab itself, `environment` is the lab's name and
-`id` its 0 state's). When the machine is ready, lab.ps1 (lab.vbs on 2003) writes `json` as is
-to `C:\WTL\instance.json` and `reg` as UTF-16 to `C:\WTL\run\instance.reg`, then imports it into
-`HKLM\SOFTWARE\WinTestLab` (values Lab, Environment, Id, Machine, Note, RunId; on 64-bit
-Windows also under `Wow6432Node`, for 32-bit programs): itself when it runs as an
-administrator, else through the SYSTEM worker's `run` action (`reg.exe import`), which every
-worker has. It reports `LAB_INSTANCE`; a failure is only a `LAB_PHASE` line.
 
 lab.ps1 refuses a disc whose `fmt` is not `multi`.
 
@@ -395,7 +384,6 @@ Values with characters outside `A-Za-z0-9._~:\/+,@()-` are URL-escaped. Lines wi
 | `LAB_CONFIGURED machine= autologon=` | member | 0-state build: configure done, rebooting into the logon user |
 | `LAB_POLICY machine= state=refreshed` | lab.ps1 | run start (AD): gpupdate + certutil -pulse done |
 | `LAB_CLIENT_READY user= domain=\|workgroup= computer= [dc=] ip=` | member | logged on as its logon user |
-| `LAB_INSTANCE machine= environment= id=` | lab.ps1 | `C:\WTL\instance.json` and `HKLM\SOFTWARE\WinTestLab` written |
 | `LAB_RENAMED machine= from= to=` | lab.ps1 | the rename of an environment's machine is done (see Renames) |
 | `LAB_DNS_CLEAN removed=` | DC | the renamed members' old DNS records are deleted |
 | `LAB_IDLE` | member | 0-state build: ready to be powered off |

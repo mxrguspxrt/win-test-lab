@@ -315,8 +315,7 @@ A run file may build on another with `extends`:
 and steps run as the logged-on user get the variables (and `WTL_ENVIRONMENT`...) in their
 environment. Steps run as `"system"` or as another user do not, because the SYSTEM worker is
 baked into the 0 state; `wtl run` warns, and `wtl rebuild LAB` fixes it (for an environment:
-`wtl rebuild LAB`, then `wtl rebuild ENV`). `C:\WTL\instance.json` and the registry are written
-on any 0 state.
+`wtl rebuild LAB`, then `wtl rebuild ENV`).
 
 ## What a run produces
 

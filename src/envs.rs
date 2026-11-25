@@ -213,7 +213,7 @@ pub fn plan_renames(lab: &str, machines: &[(String, String)], suffix: &str, item
     Ok(out)
 }
 
-/// A note is one line (it goes into the registry, JSON and the status table).
+/// A note is one line (it goes into env.json and the status table).
 pub fn check_note(note: &str) -> Result<()> {
     if note.chars().any(|c| c.is_control()) {
         bail!("--note must be a single line (no line breaks or control characters)");
@@ -249,51 +249,13 @@ pub fn of_lab(home: &Home, lab_state_name: &str) -> Vec<(String, EnvFile)> {
     all(home).into_iter().filter(|(_, e)| e.lab == lab_state_name).collect()
 }
 
-/// `C:\WTL\instance.json` and the `.reg` file for `HKLM\SOFTWARE\WinTestLab`: who a machine is.
-/// Both are written by the guest exactly as given (the JSON is pure ASCII; the .reg file is
-/// written as UTF-16). `wow64` adds the 32-bit registry view, for 32-bit programs on 64-bit
-/// Windows.
-pub fn instance_files(i: &Instance, machine: &str, run_id: &str, wow64: bool) -> (String, String) {
-    let hostname = i.hostnames.get(machine).map(String::as_str).unwrap_or(machine);
-    let json = crate::pyjson::dumps_indent(
-        &serde_json::json!({
-            "lab": i.lab,
-            "environment": i.environment,
-            "id": i.id,
-            "machine": machine,
-            "hostname": hostname,
-            "hostnames": i.hostnames,
-            "note": i.note,
-            "run_id": run_id,
-        }),
-        2,
-    );
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-    let values = format!(
-        "\"Lab\"=\"{}\"\r\n\"Environment\"=\"{}\"\r\n\"Id\"=\"{}\"\r\n\"Machine\"=\"{}\"\r\n\"Hostname\"=\"{}\"\r\n\"Note\"=\"{}\"\r\n\"RunId\"=\"{}\"\r\n",
-        esc(&i.lab),
-        esc(&i.environment),
-        esc(&i.id),
-        esc(machine),
-        esc(hostname),
-        esc(&i.note),
-        esc(run_id)
-    );
-    let mut reg = format!("Windows Registry Editor Version 5.00\r\n\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\WinTestLab]\r\n{}", values);
-    if wow64 {
-        reg.push_str(&format!("\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\Wow6432Node\\WinTestLab]\r\n{}", values));
-    }
-    (format!("{}\r\n", json.replace('\n', "\r\n")), reg)
-}
-
 /// Who a running lab or environment is: the lab, the environment's name (the lab's own name for
-/// the lab itself), its id and note, and every machine's computer name (key -> hostname).
+/// the lab itself), its id, and every machine's computer name (key -> hostname).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Instance {
     pub lab: String,
     pub environment: String,
     pub id: String,
-    pub note: String,
     pub hostnames: IndexMap<String, String>,
 }
 
@@ -339,33 +301,5 @@ mod tests {
             assert!(check_computer_name(bad).is_err(), "{}", bad);
         }
         assert!(check_computer_name("CL1-EXP42").is_ok());
-    }
-
-    #[test]
-    fn instance_files_escape_and_views() {
-        let hostnames: IndexMap<String, String> =
-            [("DC1", "DC1-EXP42"), ("CL1", "CL1-EXP42")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        let i = Instance {
-            lab: "school".into(),
-            environment: "school-exp42".into(),
-            id: "c2e5a813".into(),
-            note: "a \"q\" \\ Ünï".into(),
-            hostnames,
-        };
-        let (json, reg) = instance_files(&i, "CL1", "20261124-101500-c2e5a813", true);
-        assert!(json.is_ascii(), "{}", json);
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["environment"], "school-exp42");
-        assert_eq!(v["note"], "a \"q\" \\ Ünï");
-        assert_eq!(v["machine"], "CL1");
-        assert_eq!(v["hostname"], "CL1-EXP42");
-        assert_eq!(v["hostnames"]["DC1"], "DC1-EXP42");
-        assert!(reg.contains("\"Hostname\"=\"CL1-EXP42\"\r\n"), "{}", reg);
-        assert!(reg.starts_with("Windows Registry Editor Version 5.00\r\n"));
-        assert!(reg.contains("\"Note\"=\"a \\\"q\\\" \\\\ Ünï\"\r\n"), "{}", reg);
-        assert!(reg.contains("[HKEY_LOCAL_MACHINE\\SOFTWARE\\Wow6432Node\\WinTestLab]"));
-        let (_, reg32) = instance_files(&i, "WS2003", "", false);
-        assert!(reg32.contains("\"Hostname\"=\"WS2003\"\r\n"), "{}", reg32);
-        assert!(!reg32.contains("Wow6432Node"));
     }
 }
