@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# build.sh - what the nested example needs on the host, once: out/hello.img, the tiny VM (needs
-# nasm), and out/qemu-w64-setup.exe, QEMU for Windows from https://qemu.weilnetz.de/w64/ (Stefan
-# Weil's builds), checked against its SHA-512. The lab's setup installs it into the 0 state.
+# build.sh - what the nested example needs on the host, once:
+#   out/vm/hello.img        the tiny VM (needs nasm)
+#   out/qemu-w64-setup.exe  QEMU for Windows from https://qemu.weilnetz.de/w64/ (Stefan Weil's
+#                           builds), checked against its SHA-512; the lab's setup installs it
 #
-#   QEMU_W64=<date> QEMU_W64_SHA512=<its .sha512> build.sh    another build than QEMU 11.1.0
+#   QEMU_W64=<date> QEMU_W64_SHA512=<its .sha512> build.sh     another build than QEMU 11.1.0
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 od="$here/out"
-mkdir -p "$od"
-nasm -f bin -o "$od/hello.img" "$here/hello.asm"
-echo "built $od/hello.img"
+mkdir -p "$od/vm"
+nasm -f bin -o "$od/vm/hello.img" "$here/hello.asm"
+echo "built $od/vm/hello.img"
 
 ver=${QEMU_W64:-20260811}
 sha=${QEMU_W64_SHA512:-5bcf9eed634e8575a37b74f445af41a2fe4106da512d0c30c368301d4c105037fdfab40a5287367a28a957624cddebbc8c07e16c88ab6634f554cdf3d16bf543}
@@ -26,3 +27,4 @@ if ! echo "$sha  $exe.part" | sha512sum -c --status -; then
 fi
 mv "$exe.part" "$exe"
 echo "downloaded $exe (QEMU for Windows $ver)"
+

@@ -1,7 +1,7 @@
 {
   "$schema": "../../schema/run.schema.json",
   "lab": "./lab.json",
-  "mount": { "X": "." },
+  "mount": { "X": "./guest", "Y": "./out/vm" },
   "wait": 300,
   "steps": [
     { "run": "X:/run-vm.ps1", "args": "-Accel whpx" },

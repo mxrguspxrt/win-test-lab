@@ -214,7 +214,7 @@ Another lab: copy one, change the machine names (and for a LAN `network.subnet` 
 |-------|---------|---------|
 | `extends` | none | A run file this one builds on, relative to this file: see [Variables and extends](#variables-and-extends). |
 | `vars` | `{}` | Variables for `${WTL_NAME}` in the file and for the steps' environment: see [Variables and extends](#variables-and-extends). |
-| `lab` | (required, here or in the file it extends) | The lab to boot: a name (`"school"` = `labs/school.json` in the home, else the lab `school` built into `wtl`; or an environment of a lab, `"school-k7q3"`, see the README's *Environments*) or a path to a lab file, relative to this run file (`"./lab.json"`, `"../labs/ad.json"`). Anything with a `/` or `\`, or ending in `.json`, is a path. `wtl run CONFIG --lab NAME` overrides it; `wtl run CONFIG --new` runs in a new environment of it. |
+| `lab` | (required, here or in the file it extends) | The lab to boot: a name (`"school"` = `labs/school.json` in the home, else the lab `school` built into `wtl`; or an environment of a lab, `"school-k7q3"`, see [ENVIRONMENTS.md](ENVIRONMENTS.md)) or a path to a lab file, relative to this run file (`"./lab.json"`, `"../labs/ad.json"`). Anything with a `/` or `\`, or ending in `.json`, is a path. `wtl run CONFIG --lab NAME` overrides it; `wtl run CONFIG --new` runs in a new environment of it. |
 | `name` | the file name without `.json` | A label for the run. |
 | `wait` | 60 | Seconds a step may run before it counts as "still running" (see `keep_running`). `wtl run --wait S` overrides it. |
 | `timeout_min` | 60 | Give up on the whole run after this many minutes. `wtl run --timeout-min M` overrides it. |

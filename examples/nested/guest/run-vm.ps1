@@ -1,5 +1,5 @@
-# run-vm.ps1 - a run step inside Windows: boot out\hello.img (next to this script) in the QEMU
-# for Windows the lab installed, with one accelerator, and check what the tiny VM says.
+# run-vm.ps1 - a run step inside Windows: boot the tiny VM (Y:\hello.img, from build.sh) in the
+# QEMU for Windows the lab installed, with one accelerator, and check what it says.
 #
 #   -Accel whpx   hardware virtualization through the Windows Hypervisor Platform: inside a lab
 #                 machine that is nested virtualization (the host's AMD-V / VT-x, passed on by KVM)
@@ -8,7 +8,7 @@
 #
 # Prints the VM's serial output and how long it took; ends with RESULT OK (exit 0) or
 # RESULT FAIL (exit 1).
-param([string]$Accel = 'whpx')
+param([string]$Accel = 'whpx', [string]$Image = 'Y:\hello.img')
 $ErrorActionPreference = 'Stop'
 
 $cs = Get-CimInstance Win32_ComputerSystem
@@ -18,7 +18,7 @@ $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
 
 $qemu = Join-Path $env:ProgramFiles 'qemu\qemu-system-x86_64.exe'
 if (-not (Test-Path $qemu)) { "PROBLEM: no $qemu (the lab's setup installs QEMU for Windows)"; "RESULT FAIL"; exit 1 }
-$img = Join-Path $PSScriptRoot 'out\hello.img'
+$img = $Image
 if (-not (Test-Path $img)) { "PROBLEM: no $img (run examples/nested/build.sh)"; "RESULT FAIL"; exit 1 }
 # QEMU's first start after Windows boots takes 15-45 s (Windows loads and checks its ~100
 # DLLs): do it once here, so the time below is just the VM's
